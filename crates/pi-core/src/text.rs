@@ -15,6 +15,23 @@ pub fn strip_bom(content: &str) -> &str {
     split_bom(content).1
 }
 
+/// Sanitize binary output for display/storage. Port of
+/// `sanitizeBinaryOutput` in `src/utils/shell.ts`: removes control
+/// characters (except tab, newline, carriage return) and the Unicode
+/// interlinear annotation characters U+FFF9..U+FFFB.
+pub fn sanitize_binary_output(s: &str) -> String {
+    s.chars()
+        .filter(|&c| {
+            let u = c as u32;
+            !((0x00..=0x08).contains(&u)
+                || u == 0x0B
+                || u == 0x0C
+                || (0x0E..=0x1F).contains(&u)
+                || (0xFFF9..=0xFFFB).contains(&u))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

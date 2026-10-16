@@ -89,6 +89,14 @@ fn run_harness(args: &[String]) -> Result<Value, String> {
 
 fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
     let input = read_stdin_json()?;
+    // Module-level harness entries (not AgentTools): the bash executor and
+    // the output accumulator, driven directly.
+    match name {
+        "bash-executor" => return run_bash_executor_harness(&input, cwd),
+        "output-accumulator" => return run_output_accumulator_harness(&input),
+        "messages" => return run_messages_harness(&input),
+        _ => {}
+    }
     let result: Result<pi_tools::ToolOutput, String> = match name {
         "read" => serde_json::from_value::<pi_tools::read::ReadToolInput>(input)
             .map_err(|e| e.to_string())
@@ -122,6 +130,103 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
         Ok(output) => Ok(serde_json::to_value(&output).map_err(|e| e.to_string())?),
         Err(err) => Ok(serde_json::json!({ "error": err })),
     }
+}
+
+/// Drive pi-core `messages.rs` functions (mirrors dist/core/messages.js).
+fn run_messages_harness(input: &Value) -> Result<Value, String> {
+    use pi_core::messages;
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    match fn_name {
+        "bashExecutionToText" => {
+            let msg: messages::BashExecutionMessage =
+                serde_json::from_value(input["message"].clone()).map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "text": messages::bash_execution_to_text(&msg) }))
+        }
+        "convertToLlm" => {
+            let list = input["messages"].as_array().ok_or("missing messages array")?;
+            let mut parsed = Vec::new();
+            for value in list {
+                parsed.push(
+                    serde_json::from_value::<messages::AgentMessage>(value.clone())
+                        .map_err(|e| e.to_string())?,
+                );
+            }
+            Ok(serde_json::json!({ "messages": messages::convert_to_llm(&parsed) }))
+        }
+        "createBranchSummaryMessage" => {
+            let summary = input["summary"].as_str().ok_or("missing summary")?;
+            let from_id = input["fromId"].as_str();
+            let timestamp = input["timestamp"].as_str().ok_or("missing timestamp")?;
+            let msg = messages::create_branch_summary_message(summary, from_id, timestamp);
+            serde_json::to_value(messages::AgentMessage::BranchSummary(msg)).map_err(|e| e.to_string())
+        }
+        "createCompactionSummaryMessage" => {
+            let summary = input["summary"].as_str().ok_or("missing summary")?;
+            let tokens_before = input["tokensBefore"].as_u64().ok_or("missing tokensBefore")?;
+            let timestamp = input["timestamp"].as_str().ok_or("missing timestamp")?;
+            let msg = messages::create_compaction_summary_message(summary, tokens_before, timestamp);
+            serde_json::to_value(messages::AgentMessage::CompactionSummary(msg)).map_err(|e| e.to_string())
+        }
+        "createCustomMessage" => {
+            let custom_type = input["customType"].as_str().ok_or("missing customType")?;
+            let content: messages::CustomContent =
+                serde_json::from_value(input["content"].clone()).map_err(|e| e.to_string())?;
+            let display = input["display"].as_bool().ok_or("missing display")?;
+            let details = input.get("details").filter(|v| !v.is_null()).cloned();
+            let timestamp = input["timestamp"].as_str().ok_or("missing timestamp")?;
+            let msg = messages::create_custom_message(custom_type, content, display, details, timestamp);
+            serde_json::to_value(messages::AgentMessage::Custom(msg)).map_err(|e| e.to_string())
+        }
+        other => Err(format!("unknown messages fn: {}", other)),
+    }
+}
+
+/// Run `executeBashWithOperations` with local shell operations.
+fn run_bash_executor_harness(input: &Value, cwd: &str) -> Result<Value, String> {
+    let command = input["command"].as_str().ok_or("missing command")?;
+    let ops = pi_tools::shell::create_local_bash_operations(None);
+    match pi_tools::bash_executor::execute_bash_with_operations(command, cwd, &ops, None) {
+        Ok(result) => serde_json::to_value(&result).map_err(|e| e.to_string()),
+        Err(err) => Ok(serde_json::json!({ "error": err.message() })),
+    }
+}
+
+/// Drive `OutputAccumulator` through the same sequence the bash tool uses:
+/// append chunks, finish, snapshot, close the temp file, optionally read the
+/// full output.
+fn run_output_accumulator_harness(input: &Value) -> Result<Value, String> {
+    use pi_tools::output_accumulator::{OutputAccumulator, OutputAccumulatorOptions};
+
+    let options = OutputAccumulatorOptions {
+        max_lines: input["maxLines"].as_u64(),
+        max_bytes: input["maxBytes"].as_u64(),
+        temp_file_prefix: input["tempFilePrefix"].as_str().map(str::to_string),
+    };
+    let mut acc = OutputAccumulator::new(options);
+    if let Some(chunks) = input["chunks"].as_array() {
+        for chunk in chunks {
+            let b64 = chunk.as_str().ok_or("chunk must be a base64 string")?;
+            let data = base64_decode(b64).ok_or("invalid base64")?;
+            acc.append(&data).map_err(|e| e.to_string())?;
+        }
+    }
+    let mut result = serde_json::Map::new();
+    if input["finish"].as_bool().unwrap_or(true) {
+        acc.finish().map_err(|e| e.to_string())?;
+    }
+    if input["snapshot"].as_bool().unwrap_or(true) {
+        let snapshot = acc
+            .snapshot(input["persistIfTruncated"].as_bool().unwrap_or(true))
+            .map_err(|e| e.to_string())?;
+        result.insert("snapshot".to_string(), serde_json::to_value(&snapshot).map_err(|e| e.to_string())?);
+    }
+    acc.close_temp_file().map_err(|e| e.to_string())?;
+    if let Some(max_bytes) = input["readFullOutputMaxBytes"].as_u64() {
+        let full = acc.read_full_output(max_bytes).map_err(|e| e.to_string())?;
+        result.insert("full".to_string(), serde_json::to_value(&full).map_err(|e| e.to_string())?);
+    }
+    result.insert("lastLineBytes".to_string(), serde_json::json!(acc.get_last_line_bytes()));
+    Ok(Value::Object(result))
 }
 
 fn run_pure(name: &str, cwd: &str) -> Result<Value, String> {

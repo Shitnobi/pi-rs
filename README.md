@@ -14,7 +14,13 @@ differential parity suite against the original TS implementation.
 photon wasm binary under wasmtime, producing **byte-identical** resized /
 converted output to the original's V8 execution (see [PARITY.md](PARITY.md)).
 
-The parity suite is now 73 cases, all passing.
+**Phase 3 in progress: core runtime.** The process-runtime layer (shell
+config/env, process groups, `waitForChildProcess` grace semantics), streaming
+bash execution (`bash-executor`), `OutputAccumulator`, and the custom
+message model (`messages.ts`) are ported with differential parity coverage;
+the bash tool was rebuilt on these layers with behavior verified unchanged.
+
+The parity suite is now 103 cases, all passing.
 
 Upstream layers (agent loop, providers, extensions, TUI) are not yet ported —
 see [TRACKING.md](TRACKING.md) for the roadmap and known gaps.
@@ -24,9 +30,12 @@ see [TRACKING.md](TRACKING.md) for the roadmap and known gaps.
 ```
 crates/
   pi-core/   Pure logic: jsdiff port, edit-diff/truncation, Unicode
-             normalization, JS string semantics, path handling
+             normalization, JS string semantics, path handling, streaming
+             UTF-8 decoding, ANSI handling, the custom message model
   pi-tools/  The built-in tools (incl. the image-processing pipeline),
-             plus Node.js fs/path semantics shims
+             Node.js fs/path semantics shims, and the process-runtime layer
+             (shell config/env, process groups, bash executor,
+             output accumulator)
   pi-photon/ Executes the exact @silvia-odwyer/photon-node wasm binary
              under wasmtime (byte-identical image resize/convert)
   pi-cli/    CLI entry point (`harness tool|pure` subcommands used by parity)

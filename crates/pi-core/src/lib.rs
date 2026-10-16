@@ -5,10 +5,13 @@
 //! Behavior is validated against the original TypeScript implementation with
 //! the differential parity harness in `parity/` (see PARITY.md).
 
+pub mod ansi;
 pub mod edit_diff;
 pub mod js_string;
+pub mod messages;
 pub mod jsdiff;
 pub mod normalize;
 pub mod paths;
 pub mod text;
+pub mod text_decoder;
 pub mod truncate;

@@ -6,12 +6,16 @@
 //! `parity/` (see PARITY.md).
 
 pub mod bash;
+pub mod bash_executor;
 pub mod edit;
 pub mod find;
 pub mod grep;
 pub mod image;
 pub mod ls;
 pub mod node_fs;
+pub mod output_accumulator;
+pub mod output_files;
+pub mod shell;
 pub mod read;
 pub mod write;
 

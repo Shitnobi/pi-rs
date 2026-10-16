@@ -44,6 +44,23 @@ build is the ground truth.
   from stdin and prints the `ToolOutput` JSON on stdout. Any tool error is
   printed as `{"error": "<message>"}` with exit code 1.
 
+### Module-level entries
+
+Tools are the main surface, but some ported functionality lives in plain
+modules rather than `AgentTool` factories. Both harnesses expose matching
+module-level entries under the same `tool` dispatch, so they get identical
+differential coverage:
+
+| `tool` name | Original module (under `dist/`) | Rust module |
+|---|---|---|
+| `bash-executor` | `core/bash-executor.js` (`executeBashWithOperations`, driven with `createLocalBashOperations` from `core/tools/bash.js`) | `pi_tools::bash_executor` |
+| `output-accumulator` | `core/tools/output-accumulator.js` (`OutputAccumulator`: append / finish / snapshot / closeTempFile / readFullOutput / getLastLineBytes) | `pi_tools::output_accumulator` |
+| `messages` | `core/messages.js` (`bashExecutionToText`, `convertToLlm`, `create*Message`) | `pi_core::messages` |
+
+For these entries `args` is module-specific JSON — e.g. base64-encoded
+`chunks` for the accumulator and `{fn, ...}` for messages — and each entry
+mirrors the call sequence the real agent performs.
+
 ### Case model (`parity/cases.mjs`)
 
 ```js
@@ -71,7 +88,8 @@ and `parity/out/rs/<case>`). After execution both directories are snapshotted
    so key order never matters.
 2. **Normalization** of values that are legitimately volatile:
    - the absolute fixture directory path → `<DIR>`
-   - bash spill-file paths (`/tmp/pi-bash-<16 hex>.log`) → `<SPILL>`
+   - temp spill-file paths (`/tmp/pi-bash-<16 hex>.log`,
+     `/tmp/pi-output-<16 hex>.log`) → `<SPILL>`
    - `wall_time_seconds` → `0`
 3. **`sortLines: true`** (per case): sorts the text lines of every content
    block and of bash `structuredContent.output`. Used when output ordering is
@@ -119,6 +137,17 @@ by reading source:
 - **Bash process management**: children are spawned in their own process
   group (like the original's detached spawn) and killed with
   `kill(-pgid, SIGKILL)` so descendants don't outlive the timeout.
+- **`waitForChildProcess` grace semantics**: after the shell exits, the
+  100 ms grace timer is re-armed on every stdout/stderr chunk, so a
+  detached descendant still writing to the inherited pipes keeps the
+  reader alive; the Rust port reproduces this with pump threads feeding
+  an event loop over an mpsc channel.
+- **`new Date(ts).getTime()` semantics** (`messages.rs`): timestamps are
+  parsed with a strict ISO-8601 parser (Howard Hinnant days-from-civil),
+  verified differentially against Node for fraction edge cases
+  (`.5Z` → 500 ms, `.1234Z` → 123 ms truncation). Pre-epoch dates are
+  negative milliseconds; invalid dates become `null`, matching
+  `JSON.stringify(NaN)`.
 - **Photon wasm under wasmtime** (`pi-photon`): the original's image
   pipeline runs the `@silvia-odwyer/photon-node@0.3.4` wasm module under
   V8. Rather than reimplementing (or natively recompiling) photon, the Rust
@@ -134,8 +163,9 @@ by reading source:
 
 ## Current coverage
 
-73 cases across `read` (22, incl. 9 image cases), `write` (5), `edit` (16),
-`ls` (5), `grep` (10), `find` (5), `bash` (10). See `parity/cases.mjs` for
+103 cases across `read` (22, incl. 9 image cases), `write` (5), `edit` (16),
+`ls` (5), `grep` (10), `find` (5), `bash` (10), `bash-executor` (8),
+`output-accumulator` (9), `messages` (13). See `parity/cases.mjs` for
 the full list. Adding a case is a single entry in `cases.mjs`.
 
 The Rust side runs `target/release/pi-cli` when present (image cases with

@@ -11,6 +11,13 @@
 const nLines = (n, prefix = "line") =>
 	Array.from({ length: n }, (_, i) => `${prefix} ${i + 1}`).join("\n") + "\n";
 
+/** Base64 of a string, so chunk fixtures stay text-only. */
+const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
+
+/** Base64 of a byte range of a string's UTF-8 encoding, for splitting
+ * multi-byte characters across chunks. */
+const b64range = (s, from, to) => Buffer.from(s, "utf8").subarray(from, to).toString("base64");
+
 export const cases = [
 	// ---------------------------------------------------------------- read
 	{ name: "read/missing", tool: "read", args: { path: "nope.txt" } },
@@ -527,5 +534,300 @@ export const cases = [
 		tool: "read",
 		args: { path: "animated.png" },
 		setup: { "animated.png": { fixture: "animated.png" } },
+	},
+	// ------------------------------------------------- bash-executor (module)
+	{ name: "bash-executor/echo", tool: "bash-executor", args: { command: "echo hello" } },
+	{
+		name: "bash-executor/exit-code",
+		tool: "bash-executor",
+		args: { command: "echo out; exit 3" },
+	},
+	{
+		name: "bash-executor/stderr",
+		tool: "bash-executor",
+		args: { command: "echo err >&2" },
+	},
+	{
+		name: "bash-executor/ansi-strip",
+		tool: "bash-executor",
+		args: { command: "printf '\\033[31mred\\033[0m plain\\n'" },
+	},
+	{
+		name: "bash-executor/carriage-return",
+		tool: "bash-executor",
+		args: { command: "printf 'a\\r\\nb\\r\\n'" },
+	},
+	{
+		name: "bash-executor/utf8",
+		tool: "bash-executor",
+		args: { command: "printf 'h\\xc3\\xa9llo w\\xc3\\xb6rld\\n'" },
+	},
+	{
+		name: "bash-executor/cwd",
+		tool: "bash-executor",
+		args: { command: "echo written > wrote.txt && cat wrote.txt" },
+	},
+	{
+		name: "bash-executor/big-output",
+		tool: "bash-executor",
+		args: { command: "seq 1 20000" },
+	},
+
+	// --------------------------------------------- output-accumulator (module)
+	{
+		name: "output-accumulator/basic",
+		tool: "output-accumulator",
+		args: { chunks: [b64("hello\nworld\n")] },
+	},
+	{
+		name: "output-accumulator/max-lines",
+		tool: "output-accumulator",
+		args: { chunks: [b64(nLines(100))], maxLines: 10 },
+	},
+	{
+		name: "output-accumulator/max-bytes-temp-file",
+		tool: "output-accumulator",
+		args: {
+			chunks: [b64(nLines(2000, "0123456789"))],
+			maxBytes: 1000,
+			tempFilePrefix: "pi-bash",
+			readFullOutputMaxBytes: 500,
+		},
+	},
+	{
+		name: "output-accumulator/persist-false",
+		tool: "output-accumulator",
+		args: {
+			chunks: [b64(nLines(2000, "0123456789"))],
+			maxBytes: 1000,
+			tempFilePrefix: "pi-bash",
+			persistIfTruncated: false,
+		},
+	},
+	{
+		name: "output-accumulator/utf8-split",
+		tool: "output-accumulator",
+		args: { chunks: [b64range("h\u00e9llo w\u00f6rld", 0, 2), b64range("h\u00e9llo w\u00f6rld", 2, 13)] },
+	},
+	{
+		name: "output-accumulator/last-line-bytes",
+		tool: "output-accumulator",
+		args: { chunks: [b64("first\nsecond\npartial li")] },
+	},
+	{
+		name: "output-accumulator/first-line-exceeds",
+		tool: "output-accumulator",
+		args: {
+			chunks: [b64("x".repeat(5000) + "\n" + "tail")],
+			maxBytes: 1000,
+			tempFilePrefix: "pi-bash",
+		},
+	},
+	{
+		name: "output-accumulator/no-finish",
+		tool: "output-accumulator",
+		args: { chunks: [b64("unterminated")], finish: false },
+	},
+	{
+		name: "output-accumulator/read-full-small",
+		tool: "output-accumulator",
+		args: { chunks: [b64(nLines(50))], readFullOutputMaxBytes: 100000 },
+	},
+
+	// ------------------------------------------------------ messages (module)
+	{
+		name: "messages/to-text-basic",
+		tool: "messages",
+		args: {
+			fn: "bashExecutionToText",
+			message: {
+				role: "bashExecution",
+				command: "ls -la",
+				output: "total 0\ndrwxr-xr-x",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				timestamp: 1700000000000,
+			},
+		},
+	},
+	{
+		name: "messages/to-text-no-output",
+		tool: "messages",
+		args: {
+			fn: "bashExecutionToText",
+			message: {
+				role: "bashExecution",
+				command: "true",
+				output: "",
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				timestamp: 1,
+			},
+		},
+	},
+	{
+		name: "messages/to-text-cancelled",
+		tool: "messages",
+		args: {
+			fn: "bashExecutionToText",
+			message: {
+				role: "bashExecution",
+				command: "sleep 100",
+				output: "",
+				exitCode: 1,
+				cancelled: true,
+				truncated: false,
+				timestamp: 1,
+			},
+		},
+	},
+	{
+		name: "messages/to-text-nonzero-exit",
+		tool: "messages",
+		args: {
+			fn: "bashExecutionToText",
+			message: {
+				role: "bashExecution",
+				command: "make",
+				output: "error: no target",
+				exitCode: 2,
+				cancelled: false,
+				truncated: false,
+				timestamp: 1,
+			},
+		},
+	},
+	{
+		name: "messages/to-text-null-exit",
+		tool: "messages",
+		args: {
+			fn: "bashExecutionToText",
+			message: {
+				role: "bashExecution",
+				command: "kill -9 $$",
+				output: "gone",
+				exitCode: null,
+				cancelled: false,
+				truncated: false,
+				timestamp: 1,
+			},
+		},
+	},
+	{
+		name: "messages/to-text-truncated",
+		tool: "messages",
+		args: {
+			fn: "bashExecutionToText",
+			message: {
+				role: "bashExecution",
+				command: "seq 1 100000",
+				output: "1\n2\n3",
+				exitCode: 0,
+				cancelled: false,
+				truncated: true,
+				fullOutputPath: "/tmp/pi-bash-0123456789abcdef.log",
+				timestamp: 1,
+			},
+		},
+	},
+	{
+		name: "messages/convert-to-llm",
+		tool: "messages",
+		args: {
+			fn: "convertToLlm",
+			messages: [
+				{ role: "user", content: "plain question", timestamp: 1 },
+				{
+					role: "bashExecution",
+					command: "echo hi",
+					output: "hi\n",
+					exitCode: 0,
+					cancelled: false,
+					truncated: false,
+					timestamp: 2,
+				},
+				{
+					role: "bashExecution",
+					command: "secret",
+					output: "o",
+					exitCode: 0,
+					cancelled: false,
+					truncated: false,
+					timestamp: 3,
+					excludeFromContext: true,
+				},
+				{
+					role: "custom",
+					customType: "myExtension",
+					content: "hello from extension",
+					display: true,
+					timestamp: 4,
+				},
+				{
+					role: "custom",
+					customType: "img",
+					content: [{ type: "text", text: "caption" }, { type: "image", data: "abcd", mimeType: "image/png" }],
+					display: false,
+					timestamp: 5,
+				},
+				{
+					role: "custom",
+					customType: "detailed",
+					content: "with details",
+					display: true,
+					details: { nested: [1, 2, { deep: true }] },
+					timestamp: 6,
+				},
+				{ role: "branchSummary", summary: "did things", fromId: "id-1", timestamp: 7 },
+				{ role: "branchSummary", summary: "no id", fromId: null, timestamp: 8 },
+				{ role: "compactionSummary", summary: "compacted", tokensBefore: 1234, timestamp: 9 },
+				{ role: "assistant", content: [{ type: "text", text: "answer" }] },
+			],
+		},
+	},
+	{
+		name: "messages/create-branch-summary",
+		tool: "messages",
+		args: { fn: "createBranchSummaryMessage", summary: "branched", fromId: "sess-42", timestamp: "2026-01-02T03:04:05Z" },
+	},
+	{
+		name: "messages/create-branch-summary-null-and-invalid-date",
+		tool: "messages",
+		args: { fn: "createBranchSummaryMessage", summary: "s", fromId: null, timestamp: "bogus" },
+	},
+	{
+		name: "messages/create-compaction-summary",
+		tool: "messages",
+		args: { fn: "createCompactionSummaryMessage", summary: "compacted", tokensBefore: 9999, timestamp: "2026-01-02T03:04:05.123Z" },
+	},
+	{
+		name: "messages/create-compaction-summary-pre-epoch",
+		tool: "messages",
+		args: { fn: "createCompactionSummaryMessage", summary: "s", tokensBefore: 1, timestamp: "1969-12-31T23:59:59Z" },
+	},
+	{
+		name: "messages/create-custom",
+		tool: "messages",
+		args: {
+			fn: "createCustomMessage",
+			customType: "ext",
+			content: "hello",
+			display: true,
+			details: { a: 1 },
+			timestamp: "2026-01-02T03:04:05.5Z",
+		},
+	},
+	{
+		name: "messages/create-custom-blocks",
+		tool: "messages",
+		args: {
+			fn: "createCustomMessage",
+			customType: "img",
+			content: [{ type: "image", data: "eHg=", mimeType: "image/png" }],
+			display: false,
+			timestamp: "2026-01-02T03:04:05+02:00",
+		},
 	},
 ];

@@ -87,12 +87,12 @@ function normalize(value, dir) {
 	// The spill regexes have an unbounded leading character class; on multi-MB
 	// base64 image payloads that backtracks quadratically. Guard with a
 	// cheap literal scan so the regexes only run when a spill path exists.
-	if (s.includes("pi-bash-")) {
+	if (s.includes("pi-bash-") || s.includes("pi-output-")) {
 		s = s
-			// bash temp spill files: <tmpdir>/pi-bash-<16 hex chars>.log
-			.replace(/[^\s"']*pi-bash-[0-9a-f]+\.log/g, "<SPILL>")
+			// temp spill files: <tmpdir>/pi-bash-|pi-output-<16 hex chars>.log
+			.replace(/[^\s"']*pi-(?:bash|output)-[0-9a-f]+\.log/g, "<SPILL>")
 			// node/rust temp dirs occasionally appear in messages
-			.replace(/\/tmp\/pi-bash-[^\s"']*/g, "<SPILL>");
+			.replace(/\/tmp\/pi-(?:bash|output)-[^\s"']*/g, "<SPILL>");
 	}
 	return JSON.parse(
 		s
