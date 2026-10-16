@@ -106,6 +106,41 @@ pub fn is_emoji(cp: u32) -> bool {
     in_ranges(PROP_EMOJI, cp)
 }
 
+// --- Script_Extensions (utils.ts cjkBreakRegex / cjkPunctuationRegex) --------
+
+/// `\p{Script_Extensions=Han}`
+pub fn is_script_han(cp: u32) -> bool {
+    in_ranges(SCRIPT_HAN, cp)
+}
+/// `\p{Script_Extensions=Hiragana}`
+pub fn is_script_hiragana(cp: u32) -> bool {
+    in_ranges(SCRIPT_HIRAGANA, cp)
+}
+/// `\p{Script_Extensions=Katakana}`
+pub fn is_script_katakana(cp: u32) -> bool {
+    in_ranges(SCRIPT_KATAKANA, cp)
+}
+/// `\p{Script_Extensions=Hangul}`
+pub fn is_script_hangul(cp: u32) -> bool {
+    in_ranges(SCRIPT_HANGUL, cp)
+}
+/// `\p{Script_Extensions=Bopomofo}`
+pub fn is_script_bopomofo(cp: u32) -> bool {
+    in_ranges(SCRIPT_BOPOMOFO, cp)
+}
+/// The `cjkBreakRegex` character class (any of the five CJK scripts).
+pub fn is_cjk_script(cp: u32) -> bool {
+    is_script_han(cp)
+        || is_script_hiragana(cp)
+        || is_script_katakana(cp)
+        || is_script_hangul(cp)
+        || is_script_bopomofo(cp)
+}
+/// `\p{Punctuation}` (general category P*)
+pub fn is_punctuation(cp: u32) -> bool {
+    in_ranges(PROP_PUNCTUATION, cp)
+}
+
 /// `/^\p{RGI_Emoji}$/v` — V8's RGI emoji **string** set (ZWJ families, flags,
 /// keycaps, tag sequences, skin-tone variants, …). The table only contains
 /// sequences the live V8 regex accepted.
@@ -160,7 +195,7 @@ fn gcb_class(cp: u32) -> Gcb {
                 Gcb::T
             } else if (0xac00..=0xd7a3).contains(&cp) {
                 // Hangul syllable: LV if the final consonant index is 0.
-                if (cp - 0xac00) % 28 == 0 {
+                if (cp - 0xac00).is_multiple_of(28) {
                     Gcb::Lv
                 } else {
                     Gcb::Lvt

@@ -212,6 +212,23 @@ process.stderr.write(
 );
 parts.push(rustStrings("RGI_EMOJI_SEQUENCES", rgi.verified));
 
+// Script_Extensions classes used by utils.ts cjkBreakRegex / cjkPunctuationRegex
+const SCRIPTS = ["Han", "Hiragana", "Katakana", "Hangul", "Bopomofo"];
+for (const script of SCRIPTS) {
+	const re = new RegExp(`^\\p{Script_Extensions=${script}}$`, "u");
+	const ranges = scanRanges(re);
+	process.stderr.write(`Script_Extensions=${script}: ${ranges.length} ranges\n`);
+	parts.push(rustRanges(`SCRIPT_${script.toUpperCase()}`, ranges));
+}
+
+// \p{Punctuation} (P*) — used by cjkPunctuationRegex
+{
+	const re = /^\p{Punctuation}$/u;
+	const ranges = scanRanges(re);
+	process.stderr.write(`Punctuation: ${ranges.length} ranges\n`);
+	parts.push(rustRanges("PROP_PUNCTUATION", ranges));
+}
+
 const gcb = ucdGcbClasses();
 const gcbNames = {
 	Prepend: "GCB_PREPEND",

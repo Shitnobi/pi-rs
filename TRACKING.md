@@ -180,9 +180,10 @@ Remaining, roughly in dependency order:
 | G8 | async | `NestedToolCallRunner` (drives the agent tool pipeline) and `file-mutation-queue.ts` (global registration queue + per-realpath mutation queues) need an async runtime and the agent session layer; deferred with the agent-loop tranche. `NestedCallRecorder` — the persisted half — is ported | 3+ |
 ## Parity suite status
 
-- 239/239 cases pass (stable across repeated runs)
-- 174 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli; plus fuzz
-  corpora: ansi 2010 cases, decoder 800 cases, pi-photon byte-parity)
+- 292/292 cases pass (stable across repeated runs)
+- 225 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
+  plus fuzz corpora: ansi 2010 cases, decoder 800 cases, pi-photon
+  byte-parity, segmenter corpus 1208 cases)
 - `cargo clippy --all-targets` clean
 
 ## Changelog
@@ -226,3 +227,22 @@ Remaining, roughly in dependency order:
   spacing-mark set, grapheme widths, `visibleWidth`) with the upstream
   visible-width tests ported. 11 unit tests pass. See
   `docs/TUI_PORT_PLAN.md` for the full tranche plan (T1–T7).
+- TUI tranche 1b: rest of `utils.ts` (~1400 LOC) ported — OSC 8
+  hyperlink parsing/formatting (BEL and ST terminators, tri-state
+  undefined/closed/open), `AnsiCodeTracker` (full SGR attribute state
+  with raw parameter strings for 38/48 colors, hyperlink state
+  surviving SGR resets, line-end reset closing underline + hyperlink),
+  `truncateToWidth` (contiguous-prefix ANSI/tabs handling, wide
+  ellipsis clipping, padding), `sliceByColumn`/`sliceWithWidth`
+  (pending-ANSI ordering preserved), `extractSegments`
+  (style-inheritance via tracker, APC markers), `wrapTextWithAnsi`
+  with CJK token breaking via new Script_Extensions tables
+  (Han/Hiragana/Katakana/Hangul/Bopomofo + Punctuation added to the
+  generator, now 34 statics), `normalizeTerminalOutput` (Thai/Lao AM
+  decomposition, tab expansion), `getGraphemeCellRange`,
+  `getOsc8LinkAtColumn`, `getActiveBackgroundAnsi`. 50 pi-tui unit
+  tests (upstream truncate-to-width, wrap-ansi, tab-width,
+  slice-by-column-ansi-order tests ported). New `tui-utils` parity
+  harness entry on both sides (TS side dynamic-imports the TS source
+  via Node 24 type-stripping, `PI_TUI_SRC` env) with 53 cases. Suite:
+  292/292 parity, 225 Rust unit tests, clippy clean.

@@ -421,6 +421,7 @@ dependencies = [
  "pi-core",
  "pi-session",
  "pi-tools",
+ "pi-tui",
  "serde",
  "serde_json",
 ]

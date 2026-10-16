@@ -20,7 +20,6 @@ const path = require("path");
 const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
 const distDir = path.dirname(DIST);
 const m = require(DIST);
-
 const FACTORIES = {
 	read: m.createReadTool,
 	write: m.createWriteTool,
@@ -33,6 +32,60 @@ const FACTORIES = {
 
 /** Drive module-level APIs (mirrors pi-cli's module harness entries). */
 async function runModule(tool, args, cwd) {
+	if (tool === "tui-utils") {
+		// The TUI package has no dist build; import the TS source directly
+		// (Node 24 type-stripping) so we always test the original source.
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src/utils.ts";
+		const u = await import(pathToFileURL(TUI_SRC).href);
+		switch (args.fn) {
+			case "visibleWidth":
+				return { result: u.visibleWidth(args.text) };
+			case "stripTerminalSequences":
+				return { result: u.stripTerminalSequences(args.text) };
+			case "normalizeTerminalOutput":
+				return { result: u.normalizeTerminalOutput(args.text) };
+			case "getActiveBackgroundAnsi":
+				return { result: u.getActiveBackgroundAnsi(args.text) };
+			case "getGraphemeCellRange": {
+				const range = u.getGraphemeCellRange(args.line, args.column);
+				return { result: range === undefined ? null : range };
+			}
+			case "getOsc8LinkAtColumn": {
+				const link = u.getOsc8LinkAtColumn(args.line, args.column);
+				return { result: link === undefined ? null : link };
+			}
+			case "truncateToWidth":
+				return {
+					result: u.truncateToWidth(args.text, args.maxWidth, args.ellipsis ?? "...", args.pad ?? false),
+				};
+			case "sliceByColumn":
+				return { result: u.sliceByColumn(args.line, args.startCol, args.length, args.strict ?? false) };
+			case "sliceWithWidth": {
+				const r = u.sliceWithWidth(args.line, args.startCol, args.length, args.strict ?? false);
+				return { result: { text: r.text, width: r.width } };
+			}
+			case "extractSegments": {
+				const r = u.extractSegments(args.line, args.beforeEnd, args.afterStart, args.afterLen, args.strictAfter ?? false);
+				return {
+					result: {
+						before: r.before,
+						beforeWidth: r.beforeWidth,
+						after: r.after,
+						afterWidth: r.afterWidth,
+					},
+				};
+			}
+			case "wrapTextWithAnsi":
+				return { result: u.wrapTextWithAnsi(args.text, args.width) };
+			case "isWhitespaceChar":
+				return { result: u.isWhitespaceChar(args.char) };
+			case "isPunctuationChar":
+				return { result: u.isPunctuationChar(args.char) };
+			default:
+				throw new Error("unknown tui-utils fn: " + args.fn);
+		}
+	}
 	if (tool === "bash-executor") {
 		const { executeBashWithOperations } = require(path.join(distDir, "core", "bash-executor.js"));
 		const { createLocalBashOperations } = require(path.join(distDir, "core", "tools", "bash.js"));

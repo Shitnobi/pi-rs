@@ -99,6 +99,7 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
         "compaction-utils" => return run_compaction_utils_harness(&input),
         "compaction" => return run_compaction_harness(&input),
         "nested-calls" => return run_nested_calls_harness(&input),
+        "tui-utils" => return run_tui_utils_harness(&input),
         _ => {}
     }
     let result: Result<pi_tools::ToolOutput, String> = match name {
@@ -137,6 +138,90 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
 }
 
 /// Drive pi-core `messages.rs` functions (mirrors dist/core/messages.js).
+/// `tui-utils` module-level harness entry: drives the pure functions of
+/// `packages/tui/src/utils.ts` (mirrored on the TS side by ts-harness.js).
+fn run_tui_utils_harness(input: &Value) -> Result<Value, String> {
+    use pi_tui::utils;
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    let text = |key: &str| -> Result<&str, String> {
+        input[key]
+            .as_str()
+            .ok_or_else(|| format!("missing {key}"))
+    };
+    let num = |key: &str| -> Result<usize, String> {
+        input[key]
+            .as_u64()
+            .map(|v| v as usize)
+            .ok_or_else(|| format!("missing {key}"))
+    };
+    let opt_bool = |key: &str, default: bool| -> bool {
+        input[key].as_bool().unwrap_or(default)
+    };
+    match fn_name {
+        "visibleWidth" => Ok(serde_json::json!({ "result": utils::visible_width(text("text")?) })),
+        "stripTerminalSequences" => Ok(serde_json::json!({ "result": utils::strip_terminal_sequences(text("text")?) })),
+        "normalizeTerminalOutput" => Ok(serde_json::json!({ "result": utils::normalize_terminal_output(text("text")?) })),
+        "getActiveBackgroundAnsi" => Ok(serde_json::json!({ "result": utils::get_active_background_ansi(text("text")?) })),
+        "getGraphemeCellRange" => {
+            let range = utils::get_grapheme_cell_range(text("line")?, num("column")?);
+            Ok(match range {
+                Some(r) => serde_json::json!({ "result": { "start": r.start, "end": r.end } }),
+                None => serde_json::json!({ "result": null }),
+            })
+        }
+        "getOsc8LinkAtColumn" => {
+            let link = utils::get_osc8_link_at_column(text("line")?, num("column")?);
+            Ok(serde_json::json!({ "result": link }))
+        }
+        "truncateToWidth" => {
+            let ellipsis = input["ellipsis"].as_str().unwrap_or("...");
+            let pad = opt_bool("pad", false);
+            Ok(serde_json::json!({
+                "result": utils::truncate_to_width(text("text")?, num("maxWidth")?, ellipsis, pad)
+            }))
+        }
+        "sliceByColumn" => {
+            let strict = opt_bool("strict", false);
+            Ok(serde_json::json!({
+                "result": utils::slice_by_column(text("line")?, num("startCol")?, num("length")?, strict)
+            }))
+        }
+        "sliceWithWidth" => {
+            let strict = opt_bool("strict", false);
+            let r = utils::slice_with_width(text("line")?, num("startCol")?, num("length")?, strict);
+            Ok(serde_json::json!({ "result": { "text": r.text, "width": r.width } }))
+        }
+        "extractSegments" => {
+            let strict_after = opt_bool("strictAfter", false);
+            let r = utils::extract_segments(
+                text("line")?,
+                num("beforeEnd")?,
+                num("afterStart")?,
+                num("afterLen")?,
+                strict_after,
+            );
+            Ok(serde_json::json!({
+                "result": {
+                    "before": r.before, "beforeWidth": r.before_width,
+                    "after": r.after, "afterWidth": r.after_width
+                }
+            }))
+        }
+        "wrapTextWithAnsi" => {
+            Ok(serde_json::json!({ "result": utils::wrap_text_with_ansi(text("text")?, num("width")?) }))
+        }
+        "isWhitespaceChar" => {
+            let c = text("char")?.chars().next().ok_or("empty char")?;
+            Ok(serde_json::json!({ "result": utils::is_whitespace_char(c) }))
+        }
+        "isPunctuationChar" => {
+            let c = text("char")?.chars().next().ok_or("empty char")?;
+            Ok(serde_json::json!({ "result": utils::is_punctuation_char(c) }))
+        }
+        other => Err(format!("unknown tui-utils fn: {}", other)),
+    }
+}
+
 fn run_messages_harness(input: &Value) -> Result<Value, String> {
     use pi_core::messages;
     let fn_name = input["fn"].as_str().ok_or("missing fn")?;

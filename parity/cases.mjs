@@ -2274,4 +2274,381 @@ export const cases = [
 			],
 		},
 	},
+
+	// ------------------------------------------------------------- tui-utils
+	// Differential parity for the pure width-engine functions of the TUI
+	// package (layer 1 of the TUI parity plan; see docs/TUI_PORT_PLAN.md).
+	{
+		name: "tui-utils/visible-width-styled-ascii",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "\x1b[38;5;4mhello\x1b[39m world" },
+	},
+	{
+		name: "tui-utils/visible-width-osc8-link",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "\x1b]8;;https://example.com\x07link\x1b]8;;\x07" },
+	},
+	{
+		name: "tui-utils/visible-width-osc133-st",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "\x1b]133;A\x1b\\prompt\x1b]133;B\x1b\\" },
+	},
+	{
+		name: "tui-utils/visible-width-apc-cursor",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "\x1b_pi:c\x07cursor" },
+	},
+	{
+		name: "tui-utils/visible-width-tab-styled",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "\x1b[1ma\tb\x1b[22m" },
+	},
+	{
+		name: "tui-utils/visible-width-cjk",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "\x1b[31m日本\x1b[39m ok" },
+	},
+	{
+		name: "tui-utils/visible-width-unterminated-escapes",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "a\x1b[31" },
+	},
+	{
+		name: "tui-utils/visible-width-emoji-clusters",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "a😀b👨‍👩‍👧‍👦🇺🇸🇺🇸한국어" },
+	},
+	{
+		name: "tui-utils/visible-width-indic-conjuncts",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "र्क नेटवर्क র্ক ર્ક ର୍କ ర్క ര്‍ക सर्वाधिकार सुरक्षित।" },
+	},
+	{
+		name: "tui-utils/visible-width-combining-marks",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "é čřžůú שָׁ بّ རྐ ᜠ᜴ 가〮 가〯 が" },
+	},
+	{
+		name: "tui-utils/visible-width-myanmar",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "ကာ ကေ ကျ ကြ ကဳ ကဴ ကဵ ကး ကို က္" },
+	},
+	{
+		name: "tui-utils/visible-width-thai-lao-am",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "ำ ຳ กำ ກຳ" },
+	},
+	{
+		name: "tui-utils/visible-width-regional-indicators",
+		tool: "tui-utils",
+		args: { fn: "visibleWidth", text: "🇨🇳🇨 🇺🇸🇬🇧" },
+	},
+	{
+		name: "tui-utils/normalize-terminal-output-thai-lao-am",
+		tool: "tui-utils",
+		args: { fn: "normalizeTerminalOutput", text: "ำabc ຳxyz กำ" },
+	},
+	{
+		name: "tui-utils/normalize-terminal-output-tabs",
+		tool: "tui-utils",
+		args: {
+			fn: "normalizeTerminalOutput",
+			text: "\x1b]8;;https://example.test/a\tb\x07label\ttext\x1b]0;win\t dow\x1b\\\x1b_pay\tload\x1b\\",
+		},
+	},
+	{
+		name: "tui-utils/strip-terminal-sequences",
+		tool: "tui-utils",
+		args: {
+			fn: "stripTerminalSequences",
+			text: "\x1b[1mhi\x1b[22m there \x1b]8;;https://x\x07link\x1b]8;;\x07 \x1b_pi:c\x07cur",
+		},
+	},
+	{
+		name: "tui-utils/get-active-background-ansi",
+		tool: "tui-utils",
+		args: {
+			fn: "getActiveBackgroundAnsi",
+			text: "\x1b[1m\x1b[44mhi\x1b[39m there \x1b[48;5;240mcolored\x1b[0mtail",
+		},
+	},
+	{
+		name: "tui-utils/get-grapheme-cell-range",
+		tool: "tui-utils",
+		args: { fn: "getGraphemeCellRange", line: "a🙂b界", column: 1 },
+	},
+	{
+		name: "tui-utils/get-grapheme-cell-range-boundary",
+		tool: "tui-utils",
+		args: { fn: "getGraphemeCellRange", line: "\x1b[31ma🙂b\x1b[0m", column: 2 },
+	},
+	{
+		name: "tui-utils/get-grapheme-cell-range-past-end",
+		tool: "tui-utils",
+		args: { fn: "getGraphemeCellRange", line: "ab", column: 5 },
+	},
+	{
+		name: "tui-utils/get-osc8-link-at-column",
+		tool: "tui-utils",
+		args: {
+			fn: "getOsc8LinkAtColumn",
+			line: "see \x1b]8;;https://example.com\x07the link\x1b]8;;\x07 and more",
+			column: 10,
+		},
+	},
+	{
+		name: "tui-utils/get-osc8-link-at-column-outside",
+		tool: "tui-utils",
+		args: {
+			fn: "getOsc8LinkAtColumn",
+			line: "see \x1b]8;;https://example.com\x07the link\x1b]8;;\x07 and more",
+			column: 1,
+		},
+	},
+	{
+		name: "tui-utils/truncate-basic",
+		tool: "tui-utils",
+		args: { fn: "truncateToWidth", text: "hello world this is long", maxWidth: 15 },
+	},
+	{
+		name: "tui-utils/truncate-osc8-bel",
+		tool: "tui-utils",
+		args: {
+			fn: "truncateToWidth",
+			text: "\x1b]8;;https://example.com\x07some-longer-label-here\x1b]8;;\x07",
+			maxWidth: 15,
+		},
+	},
+	{
+		name: "tui-utils/truncate-osc8-st",
+		tool: "tui-utils",
+		args: {
+			fn: "truncateToWidth",
+			text: "\x1b]8;;https://example.com\x1b\\some-longer-label-here\x1b]8;;\x1b\\",
+			maxWidth: 15,
+		},
+	},
+	{
+		name: "tui-utils/truncate-ansi-reset-ellipsis",
+		tool: "tui-utils",
+		args: {
+			fn: "truncateToWidth",
+			text: `\x1b[31m${"hello ".repeat(100)}\x1b[0m`,
+			maxWidth: 20,
+			ellipsis: "…",
+		},
+	},
+	{
+		name: "tui-utils/truncate-wide-ellipsis",
+		tool: "tui-utils",
+		args: { fn: "truncateToWidth", text: "abcdef", maxWidth: 2, ellipsis: "🙂" },
+	},
+	{
+		name: "tui-utils/truncate-pad-unicode",
+		tool: "tui-utils",
+		args: { fn: "truncateToWidth", text: "🙂界🙂界🙂界", maxWidth: 8, ellipsis: "…", pad: true },
+	},
+	{
+		name: "tui-utils/truncate-contiguous-prefix-tab-apc",
+		tool: "tui-utils",
+		args: { fn: "truncateToWidth", text: "🙂\t界 \x1b_abc\x07", maxWidth: 7, ellipsis: "…", pad: true },
+	},
+	{
+		name: "tui-utils/truncate-malformed-escape",
+		tool: "tui-utils",
+		args: {
+			fn: "truncateToWidth",
+			text: `abc\x1bnot-ansi ${"🙂".repeat(50)}`,
+			maxWidth: 20,
+			ellipsis: "…",
+		},
+	},
+	{
+		name: "tui-utils/truncate-empty-ellipsis",
+		tool: "tui-utils",
+		args: {
+			fn: "truncateToWidth",
+			text: `\x1b[31m${"hello".repeat(50)}`,
+			maxWidth: 10,
+			ellipsis: "",
+		},
+	},
+	{
+		name: "tui-utils/truncate-fits-with-wide-ellipsis",
+		tool: "tui-utils",
+		args: { fn: "truncateToWidth", text: "界", maxWidth: 2, ellipsis: "🙂" },
+	},
+	{
+		name: "tui-utils/slice-by-column-ansi-order",
+		tool: "tui-utils",
+		args: { fn: "sliceByColumn", line: "\x1b[32mfoo\x1b[39m bar", startCol: 3, length: 4, strict: true },
+	},
+	{
+		name: "tui-utils/slice-by-column-no-leak",
+		tool: "tui-utils",
+		args: {
+			fn: "sliceByColumn",
+			line: "Another \x1b[35malpha\x1b[39m line with \x1b[35mbeta\x1b[39m later.",
+			startCol: 13,
+			length: 100,
+			strict: true,
+		},
+	},
+	{
+		name: "tui-utils/slice-with-width-tab",
+		tool: "tui-utils",
+		args: {
+			fn: "sliceWithWidth",
+			line: "out 192M\t.pi/skill-tests/results-ha",
+			startCol: 0,
+			length: 10,
+			strict: true,
+		},
+	},
+	{
+		name: "tui-utils/slice-with-width-wide-strict",
+		tool: "tui-utils",
+		args: { fn: "sliceWithWidth", line: "ab🙂cd界ef", startCol: 2, length: 3, strict: true },
+	},
+	{
+		name: "tui-utils/slice-with-width-wide-loose",
+		tool: "tui-utils",
+		args: { fn: "sliceWithWidth", line: "ab🙂cd界ef", startCol: 2, length: 3, strict: false },
+	},
+	{
+		name: "tui-utils/extract-segments-tab",
+		tool: "tui-utils",
+		args: {
+			fn: "extractSegments",
+			line: "out 192M\t.pi/skill-tests/results-ha",
+			beforeEnd: 10,
+			afterStart: 13,
+			afterLen: 10,
+			strictAfter: true,
+		},
+	},
+	{
+		name: "tui-utils/extract-segments-tab-fits",
+		tool: "tui-utils",
+		args: {
+			fn: "extractSegments",
+			line: "out 192M\t.pi/skill-tests/results-ha",
+			beforeEnd: 11,
+			afterStart: 13,
+			afterLen: 10,
+			strictAfter: true,
+		},
+	},
+	{
+		name: "tui-utils/extract-segments-style-inherit",
+		tool: "tui-utils",
+		args: {
+			fn: "extractSegments",
+			line: "\x1b[31mred \x1b[44mbg tail\x1b[0m more",
+			beforeEnd: 4,
+			afterStart: 8,
+			afterLen: 5,
+			strictAfter: false,
+		},
+	},
+	{
+		name: "tui-utils/extract-segments-after-len-zero",
+		tool: "tui-utils",
+		args: {
+			fn: "extractSegments",
+			line: "abcdefghijk",
+			beforeEnd: 3,
+			afterStart: 5,
+			afterLen: 0,
+			strictAfter: false,
+		},
+	},
+	{
+		name: "tui-utils/wrap-cjk-breaks",
+		tool: "tui-utils",
+		args: {
+			fn: "wrapTextWithAnsi",
+			text: "This is an example 中文汉字测试段落内容中文汉字测试段落内容.",
+			width: 40,
+		},
+	},
+	{
+		name: "tui-utils/wrap-cjk-color",
+		tool: "tui-utils",
+		args: {
+			fn: "wrapTextWithAnsi",
+			text: "\x1b[31mThis is an example 中文汉字测试段落内容中文汉字测试段落内容.\x1b[0m",
+			width: 40,
+		},
+	},
+	{
+		name: "tui-utils/wrap-background-preserved",
+		tool: "tui-utils",
+		args: {
+			fn: "wrapTextWithAnsi",
+			text: "\x1b[44mhello world this is blue background text\x1b[0m",
+			width: 15,
+		},
+	},
+	{
+		name: "tui-utils/wrap-underline-bg",
+		tool: "tui-utils",
+		args: {
+			fn: "wrapTextWithAnsi",
+			text: "\x1b[41mprefix \x1b[4mUNDERLINED_CONTENT_THAT_WRAPS\x1b[24m suffix\x1b[0m",
+			width: 20,
+		},
+	},
+	{
+		name: "tui-utils/wrap-line-endings",
+		tool: "tui-utils",
+		args: { fn: "wrapTextWithAnsi", text: "\x1b[31mfirst\r\nsecond\rthird\x1b[0m", width: 80 },
+	},
+	{
+		name: "tui-utils/wrap-osc8-bel-oauth",
+		tool: "tui-utils",
+		args: {
+			fn: "wrapTextWithAnsi",
+			text: `\x1b]8;;https://example.com/oauth/${"a".repeat(32)}\x07https://example.com/oauth/${"a".repeat(32)}\x1b]8;;\x07`,
+			width: 20,
+		},
+	},
+	{
+		name: "tui-utils/wrap-osc8-st",
+		tool: "tui-utils",
+		args: {
+			fn: "wrapTextWithAnsi",
+			text: "\x1b]8;;https://example.com\x1b\\0123456789\x1b]8;;\x1b\\",
+			width: 6,
+		},
+	},
+	{
+		name: "tui-utils/wrap-long-word-break",
+		tool: "tui-utils",
+		args: {
+			fn: "wrapTextWithAnsi",
+			text: "short \x1b[32maveryveryverylongwordthatmustbebroken\x1b[0m end",
+			width: 12,
+		},
+	},
+	{
+		name: "tui-utils/wrap-trailing-whitespace",
+		tool: "tui-utils",
+		args: { fn: "wrapTextWithAnsi", text: "  ", width: 1 },
+	},
+	{
+		name: "tui-utils/is-whitespace-char",
+		tool: "tui-utils",
+		args: { fn: "isWhitespaceChar", char: " " },
+	},
+	{
+		name: "tui-utils/is-whitespace-char-nbsp",
+		tool: "tui-utils",
+		args: { fn: "isWhitespaceChar", char: " " },
+	},
+	{
+		name: "tui-utils/is-punctuation-char",
+		tool: "tui-utils",
+		args: { fn: "isPunctuationChar", char: "~" },
+	},
 ];
