@@ -101,12 +101,69 @@ and the custom-message model.
   `output-accumulator`, `messages`) on both sides; the TS harness now drives
   the original dist per-module files directly. 30 new parity cases.
 
+Second tranche complete: session persistence, compaction, and nested-call
+recording.
+
+- [x] `session_manager.rs` (new `pi-session` crate) — full port of
+  `session-manager.ts`: append-only JSONL session trees (`CURRENT_SESSION_VERSION=3`),
+  `LeafSpec` tri-state leaf selection, entry projection
+  (`sessionEntryToContextMessages`, `buildContextEntries`,
+  `buildSessionProjection` with context-edit replay and compaction
+  boundaries), v1→v2/v2→v3 migrations, 4 KB header scan with 1 MB limit,
+  `forkFrom` `wx` semantics, `createBranchedSession` label re-chaining,
+  `_persist` deferral until `hasConversation()`, and
+  `getDefaultSessionDir`/`loadEntriesFromFile`/`findMostRecentSession`.
+  Supporting pi-core additions: `ai.rs` (`uuidv7`, `js_number`, `Usage`,
+  `contentText`, `getCurrentSystemMessage` with TS `??=` timestamp
+  semantics) and `usage_totals.rs` (`combineUsage`).
+- [x] `compaction_utils.rs` (pi-session) — port of `compaction/utils.ts`:
+  `FileOperations` (insertion-ordered sets), `extractFileOpsFromMessage`
+  (assistant tool calls + tool-result `nestedCalls`), `computeFileLists`,
+  `formatFileOperations`, `serializeConversation` (tool results truncated at
+  `TOOL_RESULT_MAX_CHARS=2000`, thinking omitted),
+  `SUMMARIZATION_SYSTEM_PROMPT`. JS `.length` semantics are UTF-16 code
+  units (`js_str_len`), and `Object.entries` argument formatting matches
+  `JSON.stringify` output.
+- [x] `compaction.rs` (pi-session) — port of the pure logic in
+  `compaction.ts`: `DEFAULT_COMPACTION_SETTINGS`,
+  `calculateContextTokens` (JS `||` + `undefined + number → NaN`
+  semantics: a usage missing components is invalid, exactly like TS),
+  `getLastAssistantUsage` (skips aborted/error/zero),
+  `estimateTokens` (chars/4 per role, `ESTIMATED_IMAGE_CHARS=4800`;
+  assistant string content estimates to 0 because TS `for..of` iterates
+  chars), `estimateContextTokens`/`estimateProjectedContextTokens`
+  (usage invalidation by later context edits/compaction), `shouldCompact`,
+  `findCutPoint`/`findTurnStartIndex` (backwards budget walk, cut-point
+  selection, metadata backtracking, split-turn detection), the projected
+  variants with the recovery-omission-suffix rule, `getSummarizationFailure`,
+  and `prepareCompaction` (full `CompactionPreparation` JSON form). The
+  LLM-dependent tail (`compact`, `generateSummary*`, `completeSummarization`,
+  `generateTurnPrefixSummary`) is deferred until the provider layer exists
+  (G7).
+- [x] `nested_tool_calls.rs` (pi-session) — port of `NestedCallRecorder`
+  from `nested-tool-calls.ts`: `NESTED_CALL_LIMITS`
+  (256 calls / 8 KB per-call / 32 KB total / 500 error chars), record key
+  growth matching TS object-literal order, byte-budgeted argument retention,
+  `combineUsage` usage sums, and `snapshot` completion semantics.
+  `NestedToolCallRunner` is deferred until the agent tool pipeline exists
+  (G8).
+- [x] Harness + parity: new module-level harness entries (`session-manager`,
+  `compaction-utils`, `compaction`, `nested-calls`) on both sides; the
+  nested-calls entry drives an op script (start/finish/addUsage/totalUsage/
+  snapshot) against a fresh recorder, with `durationMs` normalized to 0 on
+  both sides (wall clock). New `normalizeSessionIds` case option rewrites
+  randomly generated 8-hex-char linkage ids (`id`/`parentId`/
+  `firstKeptEntryId`) to `<ID0>`, `<ID1>`, … in first-appearance order, so
+  the v1→v2 migration (which generates random ids) can be compared
+  graph-isomorphically. 136 new parity cases (62 session-manager,
+  18 compaction-utils, 44 compaction, 12 nested-calls).
+
 Remaining, roughly in dependency order:
 
+- [ ] `file-mutation-queue.ts` (deferred with the async runtime decision — G8)
 - [ ] `mcp-servers.ts`, `extensions/` (extension + MCP loading)
 - [ ] `agent-session*.ts` (agent loop, tool-call orchestration)
 - [ ] `provider-*`, `model-*`, `http-dispatcher.ts` (LLM providers)
-- [ ] `compaction/`, `nested-tool-calls.ts`, `file-mutation-queue.ts`
 - [ ] CLI/TUI layer
 
 ## Gaps register
@@ -119,12 +176,13 @@ Remaining, roughly in dependency order:
 | G4 | packaging | `powershell.ts` (Windows shell support) intentionally not ported; Linux/macOS only for now | 3+ |
 | G5 | messages | `parseDateMillis` accepts only strict ISO-8601 (session-file format); Node's `new Date()` also parses looser formats ("March 5, 2024"). Unparseable strings → `null` on both sides, so this only affects inputs Node would accept | 3 |
 | G6 | messages | `CustomMessage.details` cannot represent an explicit JSON `null` (Rust `Option` omits the key); TS emits `"details": null` when passed null. Callers pass `undefined`/absent in practice | 3 |
-
+| G7 | compaction | LLM-dependent summarization functions (`compact`, `generateSummaryWithUsage`, `completeSummarization`, `generateTurnPrefixSummary` and the summarization prompts) are deferred until the provider/agent layer exists; all pure logic (estimation, cut points, `prepareCompaction`, `getSummarizationFailure`) is ported and parity-tested | 3+ |
+| G8 | async | `NestedToolCallRunner` (drives the agent tool pipeline) and `file-mutation-queue.ts` (global registration queue + per-realpath mutation queues) need an async runtime and the agent session layer; deferred with the agent-loop tranche. `NestedCallRecorder` — the persisted half — is ported | 3+ |
 ## Parity suite status
 
-- 103/103 cases pass (stable across repeated runs)
-- 115 Rust unit tests pass (61 pi-core, 45 pi-tools, plus fuzz corpora:
-  ansi 2010 cases, decoder 800 cases, pi-photon byte-parity)
+- 239/239 cases pass (stable across repeated runs)
+- 174 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli; plus fuzz
+  corpora: ansi 2010 cases, decoder 800 cases, pi-photon byte-parity)
 - `cargo clippy --all-targets` clean
 
 ## Changelog
@@ -144,3 +202,12 @@ Remaining, roughly in dependency order:
   (`bash-executor`, `output-accumulator`, `messages`) drive the original
   dist modules directly for differential coverage; parity suite at 103
   cases.
+- Phase 3 second tranche: new `pi-session` crate with the full
+  `session-manager.ts` port (JSONL session trees, projection, migrations,
+  forking/branching) plus `ai.rs`/`usage_totals.rs` support in pi-core;
+  compaction pure logic (`compaction_utils.rs`, `compaction.rs`) and the
+  `NestedCallRecorder` (`nested_tool_calls.rs`). Four new module-level
+  harness entries and a `normalizeSessionIds` comparison option for
+  random-id-generating code paths; parity suite at 239 cases. LLM-dependent
+  summarization and the nested-call runner are deferred to later tranches
+  (G7/G8).

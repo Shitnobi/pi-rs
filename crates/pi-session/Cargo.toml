@@ -1,0 +1,11 @@
+[package]
+name = "pi-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Append-only session tree management for the pi coding agent"
+
+[dependencies]
+pi-core = { path = "../pi-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }

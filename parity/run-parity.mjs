@@ -101,6 +101,33 @@ function normalize(value, dir) {
 	);
 }
 
+/** For cases that exercise the v1→v2 session migration (which generates
+ * random 8-hex-char entry ids), rewrite those ids to stable sequential
+ * tokens in order of first appearance. Linkage is preserved: two sides that
+ * build the same id graph produce the same token sequence. */
+function normalizeSessionIds(value) {
+	let counter = 0;
+	const map = new Map();
+	const visit = (v, key) => {
+		if (
+			typeof v === "string" &&
+			(key === "id" || key === "parentId" || key === "firstKeptEntryId") &&
+			/^[0-9a-f]{8}$/.test(v)
+		) {
+			if (!map.has(v)) map.set(v, `<ID${counter++}>`);
+			return map.get(v);
+		}
+		if (Array.isArray(v)) return v.map((x) => visit(x, undefined));
+		if (v && typeof v === "object") {
+			const out = {};
+			for (const k of Object.keys(v)) out[k] = visit(v[k], k);
+			return out;
+		}
+		return v;
+	};
+	return visit(value, undefined);
+}
+
 /** For cases whose output ordering is inherently racy (fd --max-results
  * early-stop, stdout/stderr pipe interleaving), sort the text lines of
  * every content block and of bash structuredContent.output. */
@@ -205,11 +232,17 @@ for (const c of selected) {
 
 	const tsRaw = runTs(c, tsDir);
 	const rsRaw = runRs(c, rsDir);
-	const ts = normalize(tsRaw, tsDir);
-	const rs = normalize(rsRaw, rsDir);
+	let ts = normalize(tsRaw, tsDir);
+	let rs = normalize(rsRaw, rsDir);
 	if (c.sortLines) {
 		sortResultLines(ts);
 		sortResultLines(rs);
+	}
+	if (c.normalizeSessionIds) {
+		const tsNorm = normalizeSessionIds(ts);
+		const rsNorm = normalizeSessionIds(rs);
+		ts = tsNorm;
+		rs = rsNorm;
 	}
 
 	const tsFs = normalize(snapshotDir(tsDir), tsDir);

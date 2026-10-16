@@ -16,11 +16,14 @@ converted output to the original's V8 execution (see [PARITY.md](PARITY.md)).
 
 **Phase 3 in progress: core runtime.** The process-runtime layer (shell
 config/env, process groups, `waitForChildProcess` grace semantics), streaming
-bash execution (`bash-executor`), `OutputAccumulator`, and the custom
-message model (`messages.ts`) are ported with differential parity coverage;
-the bash tool was rebuilt on these layers with behavior verified unchanged.
+bash execution (`bash-executor`), `OutputAccumulator`, the custom message
+model (`messages.ts`), session persistence (`session-manager.ts` in the new
+`pi-session` crate: JSONL session trees, projection, migrations, forking),
+compaction pure logic (token estimation, cut points, `prepareCompaction`),
+and nested-call recording are ported with differential parity coverage; the
+bash tool was rebuilt on these layers with behavior verified unchanged.
 
-The parity suite is now 103 cases, all passing.
+The parity suite is now 239 cases, all passing.
 
 Upstream layers (agent loop, providers, extensions, TUI) are not yet ported —
 see [TRACKING.md](TRACKING.md) for the roadmap and known gaps.
@@ -38,6 +41,9 @@ crates/
              output accumulator)
   pi-photon/ Executes the exact @silvia-odwyer/photon-node wasm binary
              under wasmtime (byte-identical image resize/convert)
+  pi-session/ Session persistence (JSONL session trees, projection,
+             migrations, forking/branching) and the compaction/nested-call
+             pure logic
   pi-cli/    CLI entry point (`harness tool|pure` subcommands used by parity)
 parity/      Differential test harness (Node.js) driving both implementations,
              with binary image fixtures in parity/fixtures/

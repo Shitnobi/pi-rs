@@ -56,6 +56,10 @@ differential coverage:
 | `bash-executor` | `core/bash-executor.js` (`executeBashWithOperations`, driven with `createLocalBashOperations` from `core/tools/bash.js`) | `pi_tools::bash_executor` |
 | `output-accumulator` | `core/tools/output-accumulator.js` (`OutputAccumulator`: append / finish / snapshot / closeTempFile / readFullOutput / getLastLineBytes) | `pi_tools::output_accumulator` |
 | `messages` | `core/messages.js` (`bashExecutionToText`, `convertToLlm`, `create*Message`) | `pi_core::messages` |
+| `session-manager` | `core/session-manager.js` (id validation, migrations, parsing, projection, context building, session-dir defaults, file loading, most-recent lookup) | `pi_session::session_manager` |
+| `compaction-utils` | `core/compaction/utils.js` (file-op tracking, `computeFileLists`, `formatFileOperations`, `serializeConversation`, `SUMMARIZATION_SYSTEM_PROMPT`) | `pi_session::compaction_utils` |
+| `compaction` | `core/compaction/compaction.js` (settings, token estimation, `shouldCompact`, cut points, `getSummarizationFailure`, `prepareCompaction`) | `pi_session::compaction` |
+| `nested-calls` | `core/nested-tool-calls.js` (`NESTED_CALL_LIMITS`, `NestedCallRecorder` driven by an op script) | `pi_session::nested_tool_calls` |
 
 For these entries `args` is module-specific JSON — e.g. base64-encoded
 `chunks` for the accumulator and `{fn, ...}` for messages — and each entry
@@ -102,6 +106,15 @@ and `parity/out/rs/<case>`). After execution both directories are snapshotted
    - `find` cases are constructed so that `fd --max-results` subsets are
      deterministic by construction (exactly `limit` matching files), rather
      than sorted, because fd's early-stop subset selection is arbitrary.
+4. **`normalizeSessionIds: true`** (per case): rewrites randomly generated
+   8-hex-char session-entry ids on the linkage keys (`id`, `parentId`,
+   `firstKeptEntryId`) to `<ID0>`, `<ID1>`, … in first-appearance order.
+   Used for code paths that generate random ids (the v1→v2 migration):
+   sequential token substitution preserves the tree shape, so the two sides
+   are compared graph-isomorphically. Fixture ids deliberately avoid the
+   8-hex shape so they are never rewritten.
+5. **Wall-clock values in op scripts**: the `nested-calls` recorder harness
+   normalizes each recorded call's `durationMs` to `0` on both sides.
 
 ## Running
 
