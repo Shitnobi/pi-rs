@@ -1,0 +1,11 @@
+[package]
+name = "pi-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Built-in tools (read, write, edit, bash, grep, find, ls) of the pi coding agent"
+
+[dependencies]
+pi-core = { path = "../pi-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }

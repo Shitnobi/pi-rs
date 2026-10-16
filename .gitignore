@@ -1,0 +1,5 @@
+/target
+node_modules/
+__pycache__/
+parity/out/
+.DS_Store
