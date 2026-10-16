@@ -86,6 +86,155 @@ async function runModule(tool, args, cwd) {
 				throw new Error("unknown tui-utils fn: " + args.fn);
 		}
 	}
+	if (tool === "tui-fuzzy") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const f = await import(pathToFileURL(TUI_SRC + "/fuzzy.ts").href);
+		try {
+			switch (args.fn) {
+				case "fuzzyMatch":
+					return { result: f.fuzzyMatch(args.query, args.text) };
+				case "fuzzyFilter": {
+					const textField = args.textField;
+					const getText = textField ? (item) => String(item[textField]) : (item) => item;
+					return { result: f.fuzzyFilter(args.items, args.query, getText) };
+				}
+				default:
+					throw new Error("unknown tui-fuzzy fn: " + args.fn);
+			}
+		} catch (e) {
+			return { error: String(e.message) };
+		}
+	}
+	if (tool === "tui-kill-ring") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const { KillRing } = await import(pathToFileURL(TUI_SRC + "/kill-ring.ts").href);
+		const ring = new KillRing();
+		const results = [];
+		for (const op of args.ops || []) {
+			switch (op.op) {
+				case "push":
+					ring.push(op.text, { prepend: !!op.prepend, accumulate: !!op.accumulate });
+					break;
+				case "peek":
+					results.push(ring.peek() ?? null);
+					break;
+				case "rotate":
+					ring.rotate();
+					break;
+				case "length":
+					results.push(ring.length);
+					break;
+				default:
+					throw new Error("unknown kill-ring op: " + op.op);
+			}
+		}
+		return { result: results };
+	}
+	if (tool === "tui-program-status") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const p = await import(pathToFileURL(TUI_SRC + "/program-status.ts").href);
+		try {
+			switch (args.fn) {
+				case "formatProgramStatus":
+					return { result: p.formatProgramStatus(args) };
+				case "isProgramStatusReply":
+					return { result: p.isProgramStatusReply(args.sequence) };
+				default:
+					throw new Error("unknown tui-program-status fn: " + args.fn);
+			}
+		} catch (e) {
+			return { error: String(e.message) };
+		}
+	}
+	if (tool === "tui-colors") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const c = await import(pathToFileURL(TUI_SRC + "/colors.ts").href);
+		/** Parse a color argument: string (parsed), number (indexed), or object. */
+		const color = (value) => {
+			if (typeof value === "string" || typeof value === "number") return c.parseColor(value);
+			return value;
+		};
+		try {
+			switch (args.fn) {
+				case "parseColor":
+					return { result: c.parseColor(args.value) };
+				case "indexedColor":
+					return { result: c.indexedColor(args.index) };
+				case "rgbColor":
+					return { result: c.rgbColor(args.r, args.g, args.b) };
+				case "oklchColor":
+					return { result: c.oklchColor(args.l, args.c, args.h) };
+				case "okhslColor":
+					return { result: c.okhslColor(args.h, args.s, args.l) };
+				case "colorToRgb":
+					return { result: c.colorToRgb(color(args.color)) };
+				case "colorToOklch":
+					return { result: c.colorToOklch(color(args.color)) };
+				case "colorToOkhsl":
+					return { result: c.colorToOkhsl(color(args.color)) };
+				case "colorToHex":
+					return { result: c.colorToHex(color(args.color)) };
+				case "mixColors":
+					return {
+						result: c.mixColors(
+							color(args.first),
+							color(args.second),
+							args.amount,
+							args.space ?? "oklch",
+						),
+					};
+				case "foregroundAnsi":
+					return { result: c.foregroundAnsi(color(args.color), args.mode) };
+				case "backgroundAnsi":
+					return { result: c.backgroundAnsi(color(args.color), args.mode) };
+				case "styleText":
+					return { result: c.styleText(args.text, args.style, args.mode) };
+				case "styleTextWithAnsi":
+					return {
+						result: c.styleTextWithAnsi(args.text, args.fgAnsi ?? undefined, args.bgAnsi ?? undefined, args.options ?? {}),
+					};
+				default:
+					throw new Error("unknown tui-colors fn: " + args.fn);
+			}
+		} catch (e) {
+			return { error: String(e.message) };
+		}
+	}
+	if (tool === "tui-terminal-colors") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const t = await import(pathToFileURL(TUI_SRC + "/terminal-colors.ts").href);
+		switch (args.fn) {
+			case "parseOscColorResponse": {
+				const result = t.parseOscColorResponse(args.data) ?? null;
+				return { result: result && result.rgb === undefined ? { ...result, rgb: null } : result };
+			}
+			case "parseTerminalColorSchemeReport":
+				return { result: t.parseTerminalColorSchemeReport(args.data) ?? null };
+			default:
+				throw new Error("unknown tui-terminal-colors fn: " + args.fn);
+		}
+	}
+	if (tool === "math") {
+		const buf = new ArrayBuffer(8);
+		const view = new DataView(buf);
+		const toHex = (f) => {
+			view.setFloat64(0, f, false);
+			const hex = Array.from({ length: 8 }, (_, i) => view.getUint8(i).toString(16).padStart(2, "0")).join("");
+			return hex;
+		};
+		const results = [];
+		for (const op of args.ops) {
+			const fn = Math[op.fn];
+			if (typeof fn !== "function") throw new Error("unknown math fn: " + op.fn);
+			results.push(toHex(fn(...op.args)));
+		}
+		return { results };
+	}
 	if (tool === "bash-executor") {
 		const { executeBashWithOperations } = require(path.join(distDir, "core", "bash-executor.js"));
 		const { createLocalBashOperations } = require(path.join(distDir, "core", "tools", "bash.js"));

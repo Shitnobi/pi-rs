@@ -274,7 +274,7 @@ fn position_of(bytes: &[u8], needle: u8, from: usize) -> Option<usize> {
 // --- JS string helpers --------------------------------------------------------
 
 /// ECMAScript `\s` / `trim` whitespace: WhiteSpace ∪ LineTerminator.
-fn is_js_whitespace(c: char) -> bool {
+pub fn is_js_whitespace(c: char) -> bool {
     matches!(
         c,
         '\u{9}'..='\u{d}'
@@ -295,7 +295,7 @@ fn js_trim_end(s: &str) -> &str {
     s.trim_end_matches(is_js_whitespace)
 }
 
-fn js_trim(s: &str) -> &str {
+pub fn js_trim(s: &str) -> &str {
     s.trim_matches(is_js_whitespace)
 }
 

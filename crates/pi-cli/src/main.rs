@@ -100,6 +100,12 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
         "compaction" => return run_compaction_harness(&input),
         "nested-calls" => return run_nested_calls_harness(&input),
         "tui-utils" => return run_tui_utils_harness(&input),
+        "tui-fuzzy" => return run_tui_fuzzy_harness(&input),
+        "tui-kill-ring" => return run_tui_kill_ring_harness(&input),
+        "tui-program-status" => return run_tui_program_status_harness(&input),
+        "tui-colors" => return run_tui_colors_harness(&input),
+        "tui-terminal-colors" => return run_tui_terminal_colors_harness(&input),
+        "math" => return run_math_harness(&input),
         _ => {}
     }
     let result: Result<pi_tools::ToolOutput, String> = match name {
@@ -219,6 +225,382 @@ fn run_tui_utils_harness(input: &Value) -> Result<Value, String> {
             Ok(serde_json::json!({ "result": utils::is_punctuation_char(c) }))
         }
         other => Err(format!("unknown tui-utils fn: {}", other)),
+    }
+}
+// --- TUI module harness entries (tui-fuzzy, tui-kill-ring, --------------------
+// --- tui-program-status, tui-colors, tui-terminal-colors) ---------------------
+
+/// Serialize an f64 the way JS `JSON.stringify` would (integral values lose
+/// the trailing `.0` that serde_json keeps).
+fn js_num(x: f64) -> Value {
+    if x.is_finite() && x.fract() == 0.0 && x.abs() <= 9_007_199_254_740_992.0 {
+        serde_json::json!(x as i64)
+    } else {
+        serde_json::json!(x)
+    }
+}
+
+/// `tui-fuzzy` entry: `fuzzyMatch` and `fuzzyFilter`.
+fn run_tui_fuzzy_harness(input: &Value) -> Result<Value, String> {
+    use pi_tui::fuzzy;
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    match fn_name {
+        "fuzzyMatch" => {
+            let m = fuzzy::fuzzy_match(
+                input["query"].as_str().unwrap_or(""),
+                input["text"].as_str().unwrap_or(""),
+            );
+            Ok(serde_json::json!({
+                "result": { "matches": m.matches, "score": js_num(m.score) }
+            }))
+        }
+        "fuzzyFilter" => {
+            let items = input["items"].as_array().ok_or("missing items array")?;
+            let query = input["query"].as_str().ok_or("missing query")?;
+            let text_field = input["textField"].as_str();
+            let get_text = |item: &Value| -> Result<String, String> {
+                match text_field {
+                    Some(field) => item[field]
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| format!("missing field {field}")),
+                    None => item
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| "item is not a string".to_string()),
+                }
+            };
+            let texts: Vec<String> = items.iter().map(get_text).collect::<Result<_, _>>()?;
+            // Filter over indices so the original items are returned (JS
+            // returns the item objects themselves).
+            let indexed: Vec<(usize, String)> =
+                texts.iter().cloned().enumerate().collect();
+            let filtered = fuzzy::fuzzy_filter(&indexed, query, |(_, t)| t.as_str());
+            let out: Vec<Value> = filtered.iter().map(|(i, _)| items[*i].clone()).collect();
+            Ok(serde_json::json!({ "result": out }))
+        }
+        other => Err(format!("unknown tui-fuzzy fn: {}", other)),
+    }
+}
+
+/// `tui-kill-ring` entry: a sequence of ring ops, returning the observable
+/// results (peek values, lengths) in order.
+fn run_tui_kill_ring_harness(input: &Value) -> Result<Value, String> {
+    use pi_tui::kill_ring::KillRing;
+    let ops = input["ops"].as_array().ok_or("missing ops array")?;
+    let mut ring = KillRing::new();
+    let mut results = Vec::new();
+    for op in ops {
+        let name = op["op"].as_str().ok_or("missing op name")?;
+        match name {
+            "push" => {
+                ring.push(
+                    op["text"].as_str().unwrap_or(""),
+                    op["prepend"].as_bool().unwrap_or(false),
+                    op["accumulate"].as_bool().unwrap_or(false),
+                );
+            }
+            "peek" => results.push(match ring.peek() {
+                Some(s) => serde_json::json!(s),
+                None => serde_json::json!(null),
+            }),
+            "rotate" => ring.rotate(),
+            "length" => results.push(serde_json::json!(ring.len())),
+            other => return Err(format!("unknown kill-ring op: {}", other)),
+        }
+    }
+    Ok(serde_json::json!({ "result": results }))
+}
+
+/// `tui-program-status` entry.
+fn run_tui_program_status_harness(input: &Value) -> Result<Value, String> {
+    use pi_tui::program_status;
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    match fn_name {
+        "formatProgramStatus" => {
+            let status = program_status::ProgramStatus {
+                state: input["state"]
+                    .as_str()
+                    .and_then(program_status::ProgramState::parse),
+                app: input["app"].as_str().map(|s| s.to_string()),
+                kind: input["kind"]
+                    .as_str()
+                    .and_then(program_status::ProgramStatusKind::parse),
+                message: input["message"].as_str().map(|s| s.to_string()),
+            };
+            Ok(serde_json::json!({
+                "result": program_status::format_program_status(&status)
+            }))
+        }
+        "isProgramStatusReply" => Ok(serde_json::json!({
+            "result": program_status::is_program_status_reply(
+                input["sequence"].as_str().unwrap_or("")
+            )
+        })),
+        other => Err(format!("unknown tui-program-status fn: {}", other)),
+    }
+}
+
+/// Parse a harness `color` argument: a string (parsed), a number (indexed),
+/// or an already-constructed color object.
+fn color_from_value(v: &Value) -> Result<pi_tui::colors::Color, String> {
+    use pi_tui::colors::{indexed_color, oklch_color, parse_color, Color};
+    match v {
+        Value::String(s) => parse_color(s),
+        Value::Number(n) => indexed_color(n.as_f64().unwrap_or(f64::NAN)),
+        Value::Object(o) => match o["kind"].as_str() {
+            Some("indexed") => indexed_color(o["index"].as_f64().unwrap_or(f64::NAN)),
+            Some("rgb") => Ok(Color::Rgb {
+                r: o["r"].as_f64().unwrap_or(0.0),
+                g: o["g"].as_f64().unwrap_or(0.0),
+                b: o["b"].as_f64().unwrap_or(0.0),
+            }),
+            Some("oklch") => oklch_color(
+                o["l"].as_f64().unwrap_or(0.0),
+                o["c"].as_f64().unwrap_or(0.0),
+                o["h"].as_f64().unwrap_or(0.0),
+            ),
+            _ => Err("Invalid color value: <object without kind>".to_string()),
+        },
+        _ => Err("Invalid color value: <non-string>".to_string()),
+    }
+}
+
+/// Serialize a color like the TS object shape.
+fn color_to_value(c: pi_tui::colors::Color) -> Value {
+    use pi_tui::colors::Color;
+    match c {
+        Color::Indexed { index } => serde_json::json!({ "kind": "indexed", "index": index }),
+        Color::Rgb { r, g, b } => serde_json::json!({
+            "kind": "rgb", "r": js_num(r), "g": js_num(g), "b": js_num(b)
+        }),
+        Color::Oklch { l, c, h } => serde_json::json!({
+            "kind": "oklch", "l": js_num(l), "c": js_num(c), "h": js_num(h)
+        }),
+    }
+}
+
+/// `tui-colors` entry. Expected errors are reported in-band as
+/// `{ "error": message }` so both sides compare identical messages (the TS
+/// harness catches throws and returns the same shape).
+fn run_tui_colors_harness(input: &Value) -> Result<Value, String> {
+    use pi_tui::colors::{
+        background_ansi, color_to_hex, color_to_oklch, color_to_okhsl, color_to_rgb,
+        foreground_ansi, indexed_color, mix_colors, okhsl_color, oklch_color, parse_color,
+        rgb_color, style_text, style_text_with_ansi, ColorMixSpace, TerminalColorMode,
+        TextAttributes, TextStyle,
+    };
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    let num = |key: &str| input[key].as_f64().unwrap_or(f64::NAN);
+    let mode = |key: &str| -> Result<TerminalColorMode, String> {
+        TerminalColorMode::parse(input[key].as_str().unwrap_or(""))
+            .ok_or_else(|| "unknown color mode".to_string())
+    };
+
+    let run = || -> Result<Value, String> {
+        match fn_name {
+            "parseColor" => match &input["value"] {
+                Value::String(s) => parse_color(s).map(color_to_value),
+                Value::Number(n) => {
+                    indexed_color(n.as_f64().unwrap_or(f64::NAN)).map(color_to_value)
+                }
+                _ => Err("Invalid color value: <non-string>".to_string()),
+            },
+            "indexedColor" => indexed_color(num("index")).map(color_to_value),
+            "rgbColor" => rgb_color(num("r"), num("g"), num("b")).map(color_to_value),
+            "oklchColor" => oklch_color(num("l"), num("c"), num("h")).map(color_to_value),
+            "okhslColor" => okhsl_color(num("h"), num("s"), num("l")).map(color_to_value),
+            "colorToRgb" => color_from_value(&input["color"]).map(|c| {
+                let rgb = color_to_rgb(c);
+                serde_json::json!({ "r": js_num(rgb.r), "g": js_num(rgb.g), "b": js_num(rgb.b) })
+            }),
+            "colorToOklch" => color_from_value(&input["color"]).map(|c| {
+                let o = color_to_oklch(c);
+                serde_json::json!({ "l": js_num(o.l), "c": js_num(o.c), "h": js_num(o.h) })
+            }),
+            "colorToOkhsl" => color_from_value(&input["color"]).map(|c| {
+                let o = color_to_okhsl(c);
+                serde_json::json!({ "h": js_num(o.h), "s": js_num(o.s), "l": js_num(o.l) })
+            }),
+            "colorToHex" => color_from_value(&input["color"]).map(|c| serde_json::json!(color_to_hex(c))),
+            "mixColors" => {
+                let space = if input["space"].as_str() == Some("srgb") {
+                    ColorMixSpace::Srgb
+                } else {
+                    ColorMixSpace::Oklch
+                };
+                color_from_value(&input["first"]).and_then(|first| {
+                    color_from_value(&input["second"]).and_then(|second| {
+                        mix_colors(first, second, num("amount"), space).map(color_to_value)
+                    })
+                })
+            }
+            "foregroundAnsi" => color_from_value(&input["color"])
+                .and_then(|c| mode("mode").map(|m| serde_json::json!(foreground_ansi(c, m)))),
+            "backgroundAnsi" => color_from_value(&input["color"])
+                .and_then(|c| mode("mode").map(|m| serde_json::json!(background_ansi(c, m)))),
+            "styleText" => {
+                let style = &input["style"];
+                // Mirror the TS path exactly: styleText passes options.fg/bg
+                // straight to foregroundAnsi/backgroundAnsi without parsing.
+                // A truthy non-Color value reaches colorToRgb, falls through
+                // the `switch (color.kind)`, and the `{ r, g, b }`
+                // destructuring throws the V8 TypeError below. Falsy values
+                // (null, "", 0, false) are skipped by `options.fg && ...`.
+                const TYPE_ERROR: &str = "Cannot read properties of undefined (reading 'r')";
+                let style_color = |value: &Value| -> Result<Option<pi_tui::colors::Color>, String> {
+                    if value.is_null() {
+                        return Ok(None);
+                    }
+                    let truthy = match value {
+                        Value::String(s) => !s.is_empty(),
+                        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+                        Value::Bool(b) => *b,
+                        _ => true,
+                    };
+                    if !truthy {
+                        return Ok(None);
+                    }
+                    match value {
+                        Value::Object(o) => match o["kind"].as_str() {
+                            Some("indexed") => indexed_color(o["index"].as_f64().unwrap_or(f64::NAN)).map(Some),
+                            Some("rgb") => Ok(Some(pi_tui::colors::Color::Rgb {
+                                r: o["r"].as_f64().unwrap_or(f64::NAN),
+                                g: o["g"].as_f64().unwrap_or(f64::NAN),
+                                b: o["b"].as_f64().unwrap_or(f64::NAN),
+                            })),
+                            Some("oklch") => oklch_color(
+                                o["l"].as_f64().unwrap_or(f64::NAN),
+                                o["c"].as_f64().unwrap_or(f64::NAN),
+                                o["h"].as_f64().unwrap_or(f64::NAN),
+                            ).map(Some),
+                            _ => Err(TYPE_ERROR.to_string()),
+                        },
+                        _ => Err(TYPE_ERROR.to_string()),
+                    }
+                };
+                let fg = style_color(&style["fg"])?;
+                let bg = style_color(&style["bg"])?;
+                let options = TextStyle {
+                    fg,
+                    bg,
+                    bold: style["bold"].as_bool().unwrap_or(false),
+                    dim: style["dim"].as_bool().unwrap_or(false),
+                    italic: style["italic"].as_bool().unwrap_or(false),
+                    underline: style["underline"].as_bool().unwrap_or(false),
+                    inverse: style["inverse"].as_bool().unwrap_or(false),
+                    strikethrough: style["strikethrough"].as_bool().unwrap_or(false),
+                };
+                let m = mode("mode")?;
+                Ok(serde_json::json!(style_text(
+                    input["text"].as_str().unwrap_or(""),
+                    &options,
+                    m
+                )))
+            }
+            "styleTextWithAnsi" => {
+                let attrs = &input["options"];
+                let options = TextAttributes {
+                    bold: attrs["bold"].as_bool().unwrap_or(false),
+                    dim: attrs["dim"].as_bool().unwrap_or(false),
+                    italic: attrs["italic"].as_bool().unwrap_or(false),
+                    underline: attrs["underline"].as_bool().unwrap_or(false),
+                    inverse: attrs["inverse"].as_bool().unwrap_or(false),
+                    strikethrough: attrs["strikethrough"].as_bool().unwrap_or(false),
+                };
+                let fg = input["fgAnsi"].as_str();
+                let bg = input["bgAnsi"].as_str();
+                Ok(serde_json::json!(style_text_with_ansi(
+                    input["text"].as_str().unwrap_or(""),
+                    fg,
+                    bg,
+                    &options,
+                )))
+            }
+            other => Err(format!("unknown tui-colors fn: {}", other)),
+        }
+    };
+
+    match run() {
+        Ok(value) => Ok(serde_json::json!({ "result": value })),
+        // Unknown-fn errors stay hard errors; everything else is in-band.
+        Err(message) if message.starts_with("unknown tui-colors fn") => Err(message),
+        Err(message) => Ok(serde_json::json!({ "error": message })),
+    }
+}
+
+/// `math` entry: batch bit-level evaluation of `Math.*` functions for
+/// differential float testing. Input: { ops: [{ fn, args: [..] }] }.
+/// Output: { results: ["<16 hex chars of f64 bits>", ...] }.
+fn run_math_harness(input: &Value) -> Result<Value, String> {
+    let ops = input["ops"].as_array().ok_or("missing ops")?;
+    let mut results = Vec::with_capacity(ops.len());
+    for op in ops {
+        let fn_name = op["fn"].as_str().ok_or("missing fn")?;
+        let args: Vec<f64> = op["args"]
+            .as_array()
+            .ok_or_else(|| format!("missing args for fn {}", fn_name))?
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .ok_or_else(|| format!("non-numeric arg for fn {}", fn_name))
+            })
+            .collect::<Result<_, _>>()?;
+        let value = match (fn_name, args.as_slice()) {
+            ("atan2", [y, x]) => pi_tui::fdlibm::atan2(*y, *x),
+            ("sin", [x]) => pi_tui::fdlibm::sin(*x),
+            ("cos", [x]) => pi_tui::fdlibm::cos(*x),
+            ("cbrt", [x]) => pi_tui::fdlibm::cbrt(*x),
+            ("hypot", [a, b]) => pi_tui::fdlibm::hypot(*a, *b),
+            ("sqrt", [x]) => x.sqrt(),
+            ("exp", [x]) => x.exp(),
+            ("pow", [x, y]) => x.powf(*y),
+            ("log", [x]) => x.ln(),
+            ("atan", [x]) => x.atan(),
+            _ => return Err(format!("unknown math fn: {}", fn_name)),
+        };
+        results.push(format!("{:016x}", value.to_bits()));
+    }
+    Ok(serde_json::json!({ "results": results }))
+}
+fn run_tui_terminal_colors_harness(input: &Value) -> Result<Value, String> {
+    use pi_tui::terminal_colors::{
+        parse_osc_color_response, parse_terminal_color_scheme_report, OscColorTarget,
+        TerminalColorScheme,
+    };
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    match fn_name {
+        "parseOscColorResponse" => {
+            let data = input["data"].as_str().unwrap_or("");
+            let result = match parse_osc_color_response(data) {
+                None => serde_json::json!(null),
+                Some((target, rgb)) => {
+                    let target = match target {
+                        OscColorTarget::Foreground => serde_json::json!("foreground"),
+                        OscColorTarget::Background => serde_json::json!("background"),
+                        OscColorTarget::Index(i) => serde_json::json!(i),
+                    };
+                    let rgb = match rgb {
+                        Some(c) => serde_json::json!({
+                            "r": js_num(c.r), "g": js_num(c.g), "b": js_num(c.b)
+                        }),
+                        None => serde_json::json!(null),
+                    };
+                    serde_json::json!({ "target": target, "rgb": rgb })
+                }
+            };
+            Ok(serde_json::json!({ "result": result }))
+        }
+        "parseTerminalColorSchemeReport" => {
+            let data = input["data"].as_str().unwrap_or("");
+            let result = match parse_terminal_color_scheme_report(data) {
+                Some(TerminalColorScheme::Dark) => serde_json::json!("dark"),
+                Some(TerminalColorScheme::Light) => serde_json::json!("light"),
+                None => serde_json::json!(null),
+            };
+            Ok(serde_json::json!({ "result": result }))
+        }
+        other => Err(format!("unknown tui-terminal-colors fn: {}", other)),
     }
 }
 

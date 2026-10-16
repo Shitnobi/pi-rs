@@ -246,3 +246,34 @@ Remaining, roughly in dependency order:
   harness entry on both sides (TS side dynamic-imports the TS source
   via Node 24 type-stripping, `PI_TUI_SRC` env) with 53 cases. Suite:
   292/292 parity, 225 Rust unit tests, clippy clean.
+- TUI tranche 1c (float parity): the last 4 parity failures fixed; suite is
+  389/389. Two root causes, both interesting:
+  1. **serde_json float parsing**: without the `float_roundtrip` feature,
+     serde_json's fast parser is up to 1 ULP off on shortest-round-trip
+     decimals, silently corrupting parity inputs. Enabled workspace-wide —
+     this was corrupting roughly 10% of full-mantissa doubles.
+  2. **V8 vs glibc libm**: Node's `Math.atan2/sin/cos/cbrt` come from V8's
+     fdlibm port (`src/base/ieee754.cc`, V8 13.6.233 = Node 24's V8) and
+     `Math.hypot` from the `FastMathHypot` Torque builtin; glibc's libm (Rust
+     std) differs in the last 1-2 ULPs. New `pi-tui/src/fdlibm.rs` ports
+     atan/atan2/sin/cos/cbrt (incl. `__ieee754_rem_pio2`/`__kernel_rem_pio2`
+     argument reduction and the 66-entry 2/pi table) plus the 2-arg Torque
+     hypot; `oklab.rs`/`colors.rs` now call these instead of std. Verified
+     bit-exact against Node over 300k random ops (`parity/math-diff.mjs`,
+     kept as a permanent differential float hunt: `node parity/math-diff.mjs
+     [count]`). `Math.pow`/`sqrt` verified empirically identical to Rust std
+     (0/250k mismatches) — no port needed. New batch `math` parity entry on
+     both sides reports raw f64 bit patterns as hex; 2 parity cases lock in
+     the fdlibm port (basic values + large-argument reduction paths).
+  Also fixed `tui-colors/styleText` harness divergence: TS passes
+  `options.fg`/`bg` to `foregroundAnsi` unparsed, so a truthy non-Color
+  value hits `colorToRgb` → falls through the `switch (color.kind)` → the
+  `{ r, g, b }` destructuring throws V8's `Cannot read properties of
+  undefined (reading 'r')`; the Rust harness now reproduces that exactly
+  (incl. JS truthiness: `""`/`0`/`false` are skipped by `fg && ...`).
+  Known model divergence, not yet exercised by tests: TS `Color` is
+  structural, so a raw `{kind: "indexed", index: 300}` reaches
+  `colorAnsi`'s indexed fast path and emits `38;5;300m` without throwing,
+  while the Rust `Color::Indexed { index: u8 }` validates at construction.
+  Tranche 1b remainder (fuzzy, kill-ring, undo-stack, program-status,
+  oklab, colors, terminal-colors) all green: 92 pi-tui unit tests.

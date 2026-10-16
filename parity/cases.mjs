@@ -2651,4 +2651,638 @@ export const cases = [
 		tool: "tui-utils",
 		args: { fn: "isPunctuationChar", char: "~" },
 	},
+
+	// ------------------------------------------------------------- tui-fuzzy
+	{
+		name: "tui-fuzzy/match-empty-query",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyMatch", query: "", text: "anything" },
+	},
+	{
+		name: "tui-fuzzy/match-exact",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyMatch", query: "test", text: "test" },
+	},
+	{
+		name: "tui-fuzzy/match-scattered-vs-consecutive",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyMatch", query: "foo", text: "f_o_o_bar" },
+	},
+	{
+		name: "tui-fuzzy/match-out-of-order",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyMatch", query: "abc", text: "cba" },
+	},
+	{
+		name: "tui-fuzzy/match-word-boundary",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyMatch", query: "fb", text: "foo-bar" },
+	},
+	{
+		name: "tui-fuzzy/match-swapped-alphanumeric",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyMatch", query: "codex52", text: "gpt-5.2-codex" },
+	},
+	{
+		name: "tui-fuzzy/match-swapped-numeric-alpha",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyMatch", query: "52codex", text: "codex-52" },
+	},
+	{
+		name: "tui-fuzzy/match-case-insensitive",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyMatch", query: "ABC", text: "aXbXc" },
+	},
+	{
+		name: "tui-fuzzy/match-unicode-lowercase",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyMatch", query: "ÉCOLE", text: "école" },
+	},
+	{
+		name: "tui-fuzzy/match-greek-final-sigma",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyMatch", query: "ΑΣ", text: "δας" },
+	},
+	{
+		name: "tui-fuzzy/filter-sorts-by-quality",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyFilter", items: ["a_p_p", "app", "application"], query: "app" },
+	},
+	{
+		name: "tui-fuzzy/filter-empty-query",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyFilter", items: ["apple", "banana", "cherry"], query: "" },
+	},
+	{
+		name: "tui-fuzzy/filter-slash-tokens",
+		tool: "tui-fuzzy",
+		args: {
+			fn: "fuzzyFilter",
+			items: [{ id: "gpt-5.5", provider: "openai-codex", text: "gpt-5.5 openai-codex" }],
+			query: "openai-codex/gpt-5.5",
+			textField: "text",
+		},
+	},
+	{
+		name: "tui-fuzzy/filter-text-field",
+		tool: "tui-fuzzy",
+		args: {
+			fn: "fuzzyFilter",
+			items: [
+				{ name: "foo", id: 1, text: "foo" },
+				{ name: "bar", id: 2, text: "bar" },
+			],
+			query: "foo",
+			textField: "text",
+		},
+	},
+	{
+		name: "tui-fuzzy/filter-no-match",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyFilter", items: ["apple", "banana"], query: "zzz" },
+	},
+	{
+		name: "tui-fuzzy/filter-all-tokens-must-match",
+		tool: "tui-fuzzy",
+		args: { fn: "fuzzyFilter", items: ["alpha beta", "alpha gamma"], query: "alpha beta" },
+	},
+
+	// --------------------------------------------------------- tui-kill-ring
+	{
+		name: "tui-kill-ring/push-peek-rotate",
+		tool: "tui-kill-ring",
+		args: {
+			ops: [
+				{ op: "push", text: "hello", prepend: false },
+				{ op: "push", text: "world", prepend: false },
+				{ op: "peek" },
+				{ op: "rotate" },
+				{ op: "peek" },
+				{ op: "length" },
+			],
+		},
+	},
+	{
+		name: "tui-kill-ring/accumulate-append",
+		tool: "tui-kill-ring",
+		args: {
+			ops: [
+				{ op: "push", text: "hello", prepend: false },
+				{ op: "push", text: " world", prepend: false, accumulate: true },
+				{ op: "peek" },
+				{ op: "length" },
+			],
+		},
+	},
+	{
+		name: "tui-kill-ring/accumulate-prepend",
+		tool: "tui-kill-ring",
+		args: {
+			ops: [
+				{ op: "push", text: "world", prepend: false },
+				{ op: "push", text: "hello ", prepend: true, accumulate: true },
+				{ op: "peek" },
+			],
+		},
+	},
+	{
+		name: "tui-kill-ring/empty-push-and-peek",
+		tool: "tui-kill-ring",
+		args: { ops: [{ op: "push", text: "", prepend: false }, { op: "peek" }, { op: "length" }] },
+	},
+
+	// ---------------------------------------------------- tui-program-status
+	{
+		name: "tui-program-status/format-blocked",
+		tool: "tui-program-status",
+		args: {
+			fn: "formatProgramStatus",
+			state: "blocked",
+			app: "pi",
+			kind: "permission",
+			message: "Allow bash?",
+		},
+	},
+	{
+		name: "tui-program-status/format-clear",
+		tool: "tui-program-status",
+		args: { fn: "formatProgramStatus", state: "clear" },
+	},
+	{
+		name: "tui-program-status/format-omits-invalid",
+		tool: "tui-program-status",
+		args: { fn: "formatProgramStatus", state: "working", app: "my app", kind: "auth", message: " \n " },
+	},
+	{
+		name: "tui-program-status/format-app-boundary",
+		tool: "tui-program-status",
+		args: { fn: "formatProgramStatus", state: "idle", app: "a".repeat(32) },
+	},
+	{
+		name: "tui-program-status/format-app-too-long",
+		tool: "tui-program-status",
+		args: { fn: "formatProgramStatus", state: "idle", app: "a".repeat(33) },
+	},
+	{
+		name: "tui-program-status/format-control-chars",
+		tool: "tui-program-status",
+		args: {
+			fn: "formatProgramStatus",
+			state: "error",
+			message: "first\nsecond\x1b[31mthird\t",
+		},
+	},
+	{
+		name: "tui-program-status/format-long-utf8-message",
+		tool: "tui-program-status",
+		args: { fn: "formatProgramStatus", state: "working", app: "pi", message: "é".repeat(2000) },
+	},
+	{
+		name: "tui-program-status/reply-query-st",
+		tool: "tui-program-status",
+		args: { fn: "isProgramStatusReply", sequence: "\x1b]7501;?\x1b\\" },
+	},
+	{
+		name: "tui-program-status/reply-query-bel",
+		tool: "tui-program-status",
+		args: { fn: "isProgramStatusReply", sequence: "\x1b]7501;?\x07" },
+	},
+	{
+		name: "tui-program-status/reply-future-pairs",
+		tool: "tui-program-status",
+		args: { fn: "isProgramStatusReply", sequence: "\x1b]7501;?version=2\x1b\\" },
+	},
+	{
+		name: "tui-program-status/reply-state-report",
+		tool: "tui-program-status",
+		args: { fn: "isProgramStatusReply", sequence: "\x1b]7501;state=idle\x1b\\" },
+	},
+	{
+		name: "tui-program-status/reply-osc11",
+		tool: "tui-program-status",
+		args: { fn: "isProgramStatusReply", sequence: "\x1b]11;rgb:0000/0000/0000\x07" },
+	},
+
+	// ------------------------------------------------------------ tui-colors
+	{
+		name: "tui-colors/parse-hex-3",
+		tool: "tui-colors",
+		args: { fn: "parseColor", value: "#abc" },
+	},
+	{
+		name: "tui-colors/parse-hex-6",
+		tool: "tui-colors",
+		args: { fn: "parseColor", value: "#4f8eb3" },
+	},
+	{
+		name: "tui-colors/parse-oklch-percent",
+		tool: "tui-colors",
+		args: { fn: "parseColor", value: "oklch(62% 0.1 200)" },
+	},
+	{
+		name: "tui-colors/parse-oklch-plain",
+		tool: "tui-colors",
+		args: { fn: "parseColor", value: "oklch(0.5 .1 +30)" },
+	},
+	{
+		name: "tui-colors/parse-oklch-deg-exp",
+		tool: "tui-colors",
+		args: { fn: "parseColor", value: "OKLCH( +.5e0  1E-1  30DEG )" },
+	},
+	{
+		name: "tui-colors/parse-okhsl",
+		tool: "tui-colors",
+		args: { fn: "parseColor", value: "okhsl(29.23 100% 56.8%)" },
+	},
+	{
+		name: "tui-colors/parse-okhsl-deg",
+		tool: "tui-colors",
+		args: { fn: "parseColor", value: "OKHSL(250deg 60% 55%)" },
+	},
+	{
+		name: "tui-colors/parse-number-indexed",
+		tool: "tui-colors",
+		args: { fn: "parseColor", value: 9 },
+	},
+	{
+		name: "tui-colors/parse-invalid",
+		tool: "tui-colors",
+		args: { fn: "parseColor", value: "red" },
+	},
+	{
+		name: "tui-colors/parse-empty",
+		tool: "tui-colors",
+		args: { fn: "parseColor", value: "" },
+	},
+	{
+		name: "tui-colors/indexed-valid",
+		tool: "tui-colors",
+		args: { fn: "indexedColor", index: 240 },
+	},
+	{
+		name: "tui-colors/indexed-out-of-range",
+		tool: "tui-colors",
+		args: { fn: "indexedColor", index: 300 },
+	},
+	{
+		name: "tui-colors/indexed-fractional",
+		tool: "tui-colors",
+		args: { fn: "indexedColor", index: 1.5 },
+	},
+	{
+		name: "tui-colors/rgb-valid",
+		tool: "tui-colors",
+		args: { fn: "rgbColor", r: 18, g: 52, b: 86 },
+	},
+	{
+		name: "tui-colors/rgb-out-of-range",
+		tool: "tui-colors",
+		args: { fn: "rgbColor", r: 0, g: 0, b: 256 },
+	},
+	{
+		name: "tui-colors/oklch-invalid-lightness",
+		tool: "tui-colors",
+		args: { fn: "oklchColor", l: 1.5, c: 0.1, h: 30 },
+	},
+	{
+		name: "tui-colors/oklch-negative-chroma",
+		tool: "tui-colors",
+		args: { fn: "oklchColor", l: 0.5, c: -0.1, h: 30 },
+	},
+	{
+		name: "tui-colors/oklch-normalizes-negative-hue",
+		tool: "tui-colors",
+		args: { fn: "oklchColor", l: 0.5, c: 0.1, h: -30 },
+	},
+	{
+		name: "tui-colors/okhsl-invalid-saturation",
+		tool: "tui-colors",
+		args: { fn: "okhslColor", h: 250, s: 1.6, l: 0.55 },
+	},
+	{
+		name: "tui-colors/okhsl-red-cusp",
+		tool: "tui-colors",
+		args: { fn: "okhslColor", h: 29.23, s: 1, l: 0.568 },
+	},
+	{
+		name: "tui-colors/rgb-from-oklch-red",
+		tool: "tui-colors",
+		args: { fn: "colorToRgb", color: { kind: "oklch", l: 0.627955, c: 0.257683, h: 29.2339 } },
+	},
+	{
+		name: "tui-colors/rgb-from-oklch-white-limit",
+		tool: "tui-colors",
+		args: { fn: "colorToRgb", color: { kind: "oklch", l: 1, c: 0.3, h: 150 } },
+	},
+	{
+		name: "tui-colors/rgb-from-oklch-black-limit",
+		tool: "tui-colors",
+		args: { fn: "colorToRgb", color: { kind: "oklch", l: 0, c: 0.3, h: 150 } },
+	},
+	{
+		name: "tui-colors/rgb-from-indexed-cube",
+		tool: "tui-colors",
+		args: { fn: "colorToRgb", color: { kind: "indexed", index: 200 } },
+	},
+	{
+		name: "tui-colors/rgb-from-indexed-gray",
+		tool: "tui-colors",
+		args: { fn: "colorToRgb", color: { kind: "indexed", index: 240 } },
+	},
+	{
+		name: "tui-colors/rgb-from-indexed-basic",
+		tool: "tui-colors",
+		args: { fn: "colorToRgb", color: { kind: "indexed", index: 3 } },
+	},
+	{
+		name: "tui-colors/oklch-roundtrip-blue",
+		tool: "tui-colors",
+		args: { fn: "colorToOklch", color: "#00ff00" },
+	},
+	{
+		name: "tui-colors/oklch-of-indexed",
+		tool: "tui-colors",
+		args: { fn: "colorToOklch", color: { kind: "indexed", index: 1 } },
+	},
+	{
+		name: "tui-colors/okhsl-of-hex",
+		tool: "tui-colors",
+		args: { fn: "colorToOkhsl", color: "#4f8eb3" },
+	},
+	{
+		name: "tui-colors/okhsl-of-dark-hex",
+		tool: "tui-colors",
+		args: { fn: "colorToOkhsl", color: "#20242a" },
+	},
+	{
+		name: "tui-colors/okhsl-of-gray",
+		tool: "tui-colors",
+		args: { fn: "colorToOkhsl", color: "#808080" },
+	},
+	{
+		name: "tui-colors/hex-of-oklch",
+		tool: "tui-colors",
+		args: { fn: "colorToHex", color: { kind: "oklch", l: 0.7, c: 0.15, h: 200 } },
+	},
+	{
+		name: "tui-colors/hex-of-indexed",
+		tool: "tui-colors",
+		args: { fn: "colorToHex", color: { kind: "indexed", index: 9 } },
+	},
+	{
+		name: "tui-colors/hex-of-hex",
+		tool: "tui-colors",
+		args: { fn: "colorToHex", color: "#4f8eb3" },
+	},
+	{
+		name: "tui-colors/mix-oklch-half",
+		tool: "tui-colors",
+		args: {
+			fn: "mixColors",
+			first: "#000000",
+			second: "#ffffff",
+			amount: 0.5,
+			space: "oklch",
+		},
+	},
+	{
+		name: "tui-colors/mix-srgb-half",
+		tool: "tui-colors",
+		args: {
+			fn: "mixColors",
+			first: "#000000",
+			second: "#ffffff",
+			amount: 0.5,
+			space: "srgb",
+		},
+	},
+	{
+		name: "tui-colors/mix-oklch-default-space",
+		tool: "tui-colors",
+		args: { fn: "mixColors", first: "#ff0000", second: "#0000ff", amount: 0.25 },
+	},
+	{
+		name: "tui-colors/mix-oklch-complement-hue",
+		tool: "tui-colors",
+		args: { fn: "mixColors", first: "#ff0000", second: "#00ff00", amount: 0.5 },
+	},
+	{
+		name: "tui-colors/mix-amount-out-of-range",
+		tool: "tui-colors",
+		args: { fn: "mixColors", first: "#000000", second: "#ffffff", amount: 1.5 },
+	},
+	{
+		name: "tui-colors/foreground-truecolor",
+		tool: "tui-colors",
+		args: { fn: "foregroundAnsi", color: { kind: "rgb", r: 18, g: 52, b: 86 }, mode: "truecolor" },
+	},
+	{
+		name: "tui-colors/foreground-256-rgb",
+		tool: "tui-colors",
+		args: { fn: "foregroundAnsi", color: { kind: "rgb", r: 18, g: 52, b: 86 }, mode: "256color" },
+	},
+	{
+		name: "tui-colors/foreground-indexed",
+		tool: "tui-colors",
+		args: { fn: "foregroundAnsi", color: { kind: "indexed", index: 9 }, mode: "256color" },
+	},
+	{
+		name: "tui-colors/background-truecolor",
+		tool: "tui-colors",
+		args: { fn: "backgroundAnsi", color: "#4f8eb3", mode: "truecolor" },
+	},
+	{
+		name: "tui-colors/background-256-gray",
+		tool: "tui-colors",
+		args: { fn: "backgroundAnsi", color: "#808080", mode: "256color" },
+	},
+	{
+		name: "tui-colors/background-256-oklch",
+		tool: "tui-colors",
+		args: { fn: "backgroundAnsi", color: { kind: "oklch", l: 0.4, c: 0.1, h: 250 }, mode: "256color" },
+	},
+	{
+		name: "tui-colors/style-text-truecolor",
+		tool: "tui-colors",
+		args: {
+			fn: "styleText",
+			text: "Ready",
+			style: {
+				fg: { kind: "rgb", r: 18, g: 52, b: 86 },
+				bg: { kind: "indexed", index: 9 },
+				bold: true,
+				italic: true,
+			},
+			mode: "truecolor",
+		},
+	},
+	{
+		name: "tui-colors/style-text-256",
+		tool: "tui-colors",
+		args: {
+			fn: "styleText",
+			text: "Ready",
+			style: { fg: { kind: "rgb", r: 18, g: 52, b: 86 } },
+			mode: "256color",
+		},
+	},
+	{
+		name: "tui-colors/style-text-all-attributes",
+		tool: "tui-colors",
+		args: {
+			fn: "styleText",
+			text: "x",
+			style: {
+				bold: true,
+				dim: true,
+				italic: true,
+				underline: true,
+				inverse: true,
+				strikethrough: true,
+			},
+			mode: "truecolor",
+		},
+	},
+	{
+		name: "tui-colors/style-text-with-ansi",
+		tool: "tui-colors",
+		args: {
+			fn: "styleTextWithAnsi",
+			text: "hi",
+			fgAnsi: "\x1b[38;5;240m",
+			bgAnsi: "\x1b[48;5;17m",
+			options: { underline: true },
+		},
+	},
+	{
+		name: "tui-colors/style-text-invalid-fg",
+		tool: "tui-colors",
+		args: { fn: "styleText", text: "x", style: { fg: "red" }, mode: "truecolor" },
+	},
+
+	// --------------------------------------------------- tui-terminal-colors
+	{
+		name: "tui-terminal-colors/osc10-rgb",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseOscColorResponse", data: "\x1b]10;rgb:ffff/ffff/ffff\x07" },
+	},
+	{
+		name: "tui-terminal-colors/osc4-hex-st",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseOscColorResponse", data: "\x1b]4;13;#ff0080\x1b\\" },
+	},
+	{
+		name: "tui-terminal-colors/osc4-bogus",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseOscColorResponse", data: "\x1b]4;1;bogus\x07" },
+	},
+	{
+		name: "tui-terminal-colors/osc12-not-color",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseOscColorResponse", data: "\x1b]12;#ffffff\x07" },
+	},
+	{
+		name: "tui-terminal-colors/osc11-12bit",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseOscColorResponse", data: "\x1b]11;rgb:eaea/6c6c/6d6d\x07" },
+	},
+	{
+		name: "tui-terminal-colors/osc10-hex12",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseOscColorResponse", data: "\x1b]10;#aabbccddeeff\x1b\\" },
+	},
+	{
+		name: "tui-terminal-colors/osc10-bad-hex",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseOscColorResponse", data: "\x1b]10;#aabbccdd\x07" },
+	},
+	{
+		name: "tui-terminal-colors/scheme-dark",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseTerminalColorSchemeReport", data: "\x1b[?997;1n" },
+	},
+	{
+		name: "tui-terminal-colors/scheme-light",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseTerminalColorSchemeReport", data: "\x1b[?997;2n" },
+	},
+	{
+		name: "tui-terminal-colors/scheme-last-wins-dark",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseTerminalColorSchemeReport", data: "\x1b[?997;2n\x1b[?997;1n\x1b[?997;1n" },
+	},
+	{
+		name: "tui-terminal-colors/scheme-last-wins-light",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseTerminalColorSchemeReport", data: "\x1b[?997;1n\x1b[?997;2n\x1b[?997;2n" },
+	},
+	{
+		name: "tui-terminal-colors/scheme-unknown-value",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseTerminalColorSchemeReport", data: "\x1b[?997;3n" },
+	},
+	{
+		name: "tui-terminal-colors/scheme-prefixed-junk",
+		tool: "tui-terminal-colors",
+		args: { fn: "parseTerminalColorSchemeReport", data: "x\x1b[?997;1n" },
+	},
+
+	// math: bit-level parity of the V8 (fdlibm-derived) Math.* ports used by
+	// the color pipeline. Results are hex f64 bit patterns on both sides.
+	{
+		name: "math/basic",
+		tool: "math",
+		args: {
+			ops: [
+				{ fn: "atan2", args: [1, 2] },
+				{ fn: "atan2", args: [-1, 2] },
+				{ fn: "atan2", args: [1, -2] },
+				{ fn: "atan2", args: [0.4809345314400326, 0.02897262682471269] },
+				{ fn: "atan2", args: [0.6141707790052229, -0.5202806468753018] },
+				{ fn: "atan2", args: [1.9750481795831567e-306, 4.2100188968685646e-297] },
+				{ fn: "atan2", args: [9.609330007667106e-303, 4.2100188968685646e-297] },
+				{ fn: "sin", args: [1.2957409547783927] },
+				{ fn: "sin", args: [2.3861895747392154e-307] },
+				{ fn: "sin", args: [-5.420249662451331] },
+				{ fn: "cos", args: [0.9648986460818719] },
+				{ fn: "cos", args: [3.9980273879569133] },
+				{ fn: "cos", args: [5.420249662451331] },
+				{ fn: "cbrt", args: [-0.7372079239367317] },
+				{ fn: "cbrt", args: [1.5563728631690855e-298] },
+				{ fn: "cbrt", args: [8] },
+				{ fn: "cbrt", args: [0.001] },
+				{ fn: "hypot", args: [0.13336238251905452, 0.42350188175877623] },
+				{ fn: "hypot", args: [-0.12249456161475236, -0.38605417966635047] },
+				{ fn: "hypot", args: [0.40228411685041243, 0.10167298157183269] },
+				{ fn: "sqrt", args: [2] },
+				{ fn: "pow", args: [0.5, 1 / 2.4] },
+				{ fn: "pow", args: [0.5, 2.4] },
+			],
+		},
+	},
+	{
+		name: "math/large-argument-reduction",
+		tool: "math",
+		args: {
+			ops: [
+				// Values that exercise __ieee754_rem_pio2's medium and large
+				// branches, where fdlibm and glibc diverge the most.
+				{ fn: "sin", args: [1000003.141592653589793] },
+				{ fn: "cos", args: [1000003.141592653589793] },
+				{ fn: "sin", args: [1e15] },
+				{ fn: "cos", args: [1e15] },
+				{ fn: "sin", args: [1e17] },
+				{ fn: "cos", args: [1e17] },
+				{ fn: "sin", args: [1e100] },
+				{ fn: "cos", args: [1e300] },
+				{ fn: "sin", args: [-2.5e20] },
+				{ fn: "cos", args: [-2.5e20] },
+				{ fn: "sin", args: [3.141592653589793] },
+				{ fn: "cos", args: [1.5707963267948966] },
+				{ fn: "atan2", args: [1e-300, 1e-310] },
+				{ fn: "cbrt", args: [1e-300] },
+				{ fn: "cbrt", args: [4.9e-324] },
+			],
+		},
+	},
 ];
