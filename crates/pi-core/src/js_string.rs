@@ -46,6 +46,18 @@ pub fn js_to_fixed_1(x: f64) -> String {
     format!("{}.{}", whole, frac)
 }
 
+/// JS `Number.prototype.toFixed(2)` for the non-negative finite values we use
+/// (image resize scale factors). Same ECMAScript rounding rule as
+/// `toFixed(1)`: pick the integer `n` such that `n / 100 - x` is closest to
+/// zero, ties to the larger `n`.
+pub fn js_to_fixed_2(x: f64) -> String {
+    debug_assert!(x.is_finite() && x >= 0.0);
+    let n = (x * 100.0 + 0.5).floor();
+    let whole = (n / 100.0).floor() as i64;
+    let frac = (n - whole as f64 * 100.0) as i64;
+    format!("{}.{:02}", whole, frac)
+}
+
 /// JS `String.prototype.length` (UTF-16 code units).
 pub fn js_length(s: &str) -> usize {
     s.chars().map(|c| c.len_utf16()).sum()
@@ -72,6 +84,17 @@ mod tests {
         assert_eq!(js_to_fixed_1(49.95), "50.0"); // 49.95 is 49.950000...28 in binary
         assert_eq!(js_to_fixed_1(1.25), "1.3"); // ties to larger
         assert_eq!(js_to_fixed_1(10.04), "10.0");
+    }
+
+    #[test]
+    fn to_fixed_2_matches_js() {
+        assert_eq!(js_to_fixed_2(0.0), "0.00");
+        assert_eq!(js_to_fixed_2(1.25), "1.25");
+        assert_eq!(js_to_fixed_2(1.005), "1.00"); // 1.005 is 1.00499... in binary
+        assert_eq!(js_to_fixed_2(2.5), "2.50");
+        assert_eq!(js_to_fixed_2(2500.0 / 2000.0), "1.25");
+        assert_eq!(js_to_fixed_2(0.285), "0.28"); // 0.285 is 0.28499... in binary
+        assert_eq!(js_to_fixed_2(3.748126), "3.75");
     }
 
     #[test]

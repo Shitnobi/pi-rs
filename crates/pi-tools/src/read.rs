@@ -137,26 +137,39 @@ pub fn read_execute(cwd: &str, input: &ReadToolInput) -> ToolResult {
         }
     };
 
-    // Image path. The original converts/resizes via the photon WASM
-    // module (image-process.ts) before returning base64; that is a
-    // documented phase-2 gap (see TRACKING.md). Phase 1 returns the raw
-    // image data, but with the original result shape: a text note plus an
-    // image content block, no details, and structuredContent describing
-    // the image.
+    // Image path: normalize/resize through the photon WASM pipeline
+    // (processImage in image-process.ts), byte-identical to the original.
     if let Some(mime) = detect_supported_image_mime_type(&buffer) {
-        let note = format!("Read image file [{}]", mime);
-        let data = base64_encode(&buffer);
-        return Ok(ToolOutput {
-            content: vec![
-                crate::ContentBlock::Text { text: note.clone() },
-                crate::ContentBlock::Image { data: data.clone(), mime_type: mime.to_string() },
-            ],
-            details: None,
-            is_error: None,
-            structured_content: Some(serde_json::json!({
-                "type": "image", "data": data, "mimeType": mime, "note": note,
-            })),
-        });
+        return match crate::image::process_image(&buffer, mime, true, None) {
+            crate::image::ProcessImageResult::Ok { data, mime_type, hints } => {
+                let mut note = format!("Read image file [{}]", mime_type);
+                if !hints.is_empty() {
+                    note.push('\n');
+                    note.push_str(&hints.join("\n"));
+                }
+                Ok(ToolOutput {
+                    content: vec![
+                        crate::ContentBlock::Text { text: note.clone() },
+                        crate::ContentBlock::Image { data: data.clone(), mime_type: mime_type.clone() },
+                    ],
+                    details: None,
+                    is_error: None,
+                    structured_content: Some(serde_json::json!({
+                        "type": "image", "data": data, "mimeType": mime_type, "note": note,
+                    })),
+                })
+            }
+            crate::image::ProcessImageResult::Err { message } => {
+                let note = format!("Read image file [{}]\n{}", mime, message);
+                Ok(ToolOutput {
+                    content: vec![crate::ContentBlock::Text { text: note.clone() }],
+                    details: None,
+                    is_error: None,
+                    // toReadOutput: no image block -> the note text itself.
+                    structured_content: Some(serde_json::Value::String(note)),
+                })
+            }
+        };
     }
 
     // Read text content.

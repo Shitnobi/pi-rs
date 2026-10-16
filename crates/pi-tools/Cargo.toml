@@ -6,6 +6,7 @@ license.workspace = true
 description = "Built-in tools (read, write, edit, bash, grep, find, ls) of the pi coding agent"
 
 [dependencies]
+pi-photon = { path = "../pi-photon" }
 pi-core = { path = "../pi-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }

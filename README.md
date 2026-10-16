@@ -8,8 +8,13 @@ TypeScript implementation.
 
 **Phase 1 complete: built-in tools.** All seven built-in file/shell tools
 (`read`, `write`, `edit`, `ls`, `grep`, `find`, `bash`) are ported and pass a
-64-case differential parity suite against the original TS implementation
-(see [PARITY.md](PARITY.md)).
+differential parity suite against the original TS implementation.
+
+**Phase 2 complete: image processing.** `read` on images runs the exact
+photon wasm binary under wasmtime, producing **byte-identical** resized /
+converted output to the original's V8 execution (see [PARITY.md](PARITY.md)).
+
+The parity suite is now 73 cases, all passing.
 
 Upstream layers (agent loop, providers, extensions, TUI) are not yet ported —
 see [TRACKING.md](TRACKING.md) for the roadmap and known gaps.
@@ -20,9 +25,13 @@ see [TRACKING.md](TRACKING.md) for the roadmap and known gaps.
 crates/
   pi-core/   Pure logic: jsdiff port, edit-diff/truncation, Unicode
              normalization, JS string semantics, path handling
-  pi-tools/  The built-in tools, plus Node.js fs/path semantics shims
+  pi-tools/  The built-in tools (incl. the image-processing pipeline),
+             plus Node.js fs/path semantics shims
+  pi-photon/ Executes the exact @silvia-odwyer/photon-node wasm binary
+             under wasmtime (byte-identical image resize/convert)
   pi-cli/    CLI entry point (`harness tool|pure` subcommands used by parity)
-parity/      Differential test harness (Node.js) driving both implementations
+parity/      Differential test harness (Node.js) driving both implementations,
+             with binary image fixtures in parity/fixtures/
 ```
 
 ## Building

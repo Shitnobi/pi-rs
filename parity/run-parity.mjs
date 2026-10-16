@@ -21,12 +21,16 @@
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { cases } from "./cases.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..");
-const piCli = join(repoRoot, "target", "debug", "pi-cli");
+const piCli = process.env.PI_CLI
+	?? (existsSync(join(repoRoot, "target", "release", "pi-cli"))
+		? join(repoRoot, "target", "release", "pi-cli")
+		: join(repoRoot, "target", "debug", "pi-cli"));
 const tsHarness = join(here, "ts-harness.js");
 const workDir = process.env.PARITY_DIR || "/tmp/pi-parity/run";
 
@@ -44,7 +48,15 @@ function setupDir(dir, setup) {
 	for (const [rel, content] of Object.entries(setup || {})) {
 		const p = join(dir, rel);
 		mkdirSync(dirname(p), { recursive: true });
-		writeFileSync(p, content, "utf8");
+		if (typeof content === "object" && content !== null && content.base64) {
+			// Binary fixture: { base64: "..." } so cases.mjs stays text-only.
+			writeFileSync(p, Buffer.from(content.base64, "base64"));
+		} else if (typeof content === "object" && content !== null && content.fixture) {
+			// Binary fixture file from parity/fixtures/.
+			writeFileSync(p, readFileSync(join(here, "fixtures", content.fixture)));
+		} else {
+			writeFileSync(p, content, "utf8");
+		}
 	}
 }
 
@@ -71,16 +83,22 @@ function snapshotDir(dir) {
 
 /** Normalize a result: hide fixture paths, temp spill files, pids. */
 function normalize(value, dir) {
-	const s = JSON.stringify(value)
-		.split(dir)
-		.join("<DIR>")
-		// bash temp spill files: <tmpdir>/pi-bash-<16 hex chars>.log
-		.replace(/[^\s"']*pi-bash-[0-9a-f]+\.log/g, "<SPILL>")
-		// node/rust temp dirs occasionally appear in messages
-		.replace(/\/tmp\/pi-bash-[^\s"']*/g, "<SPILL>")
-		// wall time is timing-dependent
-		.replace(/"wall_time_seconds":[0-9.eE+-]+/g, '"wall_time_seconds":0');
-	return JSON.parse(s);
+	let s = JSON.stringify(value).split(dir).join("<DIR>");
+	// The spill regexes have an unbounded leading character class; on multi-MB
+	// base64 image payloads that backtracks quadratically. Guard with a
+	// cheap literal scan so the regexes only run when a spill path exists.
+	if (s.includes("pi-bash-")) {
+		s = s
+			// bash temp spill files: <tmpdir>/pi-bash-<16 hex chars>.log
+			.replace(/[^\s"']*pi-bash-[0-9a-f]+\.log/g, "<SPILL>")
+			// node/rust temp dirs occasionally appear in messages
+			.replace(/\/tmp\/pi-bash-[^\s"']*/g, "<SPILL>");
+	}
+	return JSON.parse(
+		s
+			// wall time is timing-dependent
+			.replace(/"wall_time_seconds":[0-9.eE+-]+/g, '"wall_time_seconds":0'),
+	);
 }
 
 /** For cases whose output ordering is inherently racy (fd --max-results

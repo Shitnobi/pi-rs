@@ -1,0 +1,9 @@
+[package]
+name = "pi-photon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wasmtime = { version = "27", default-features = false, features = ["cranelift", "runtime", "std", "gc", "gc-drc"] }
+anyhow = "1"

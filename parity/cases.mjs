@@ -470,4 +470,62 @@ export const cases = [
 		tool: "bash",
 		args: { command: "printf 'h\\xc3\\xa9llo \\xf0\\x9f\\x8c\\x8d\\n'" },
 	},
+
+	// ------------------------------------------------------- read (images)
+	// Image fixtures live in parity/fixtures/; processing runs through the
+	// photon WASM pipeline on both sides (see PARITY.md).
+	{
+		name: "read/image-png-passthrough",
+		tool: "read",
+		args: { path: "small.png" },
+		setup: { "small.png": { fixture: "small.png" } },
+	},
+	{
+		name: "read/image-png-resize",
+		tool: "read",
+		args: { path: "resize.png" },
+		setup: { "resize.png": { fixture: "resize.png" } },
+	},
+	{
+		name: "read/image-jpeg-resize",
+		tool: "read",
+		args: { path: "tall.jpg" },
+		setup: { "tall.jpg": { fixture: "tall.jpg" } },
+	},
+	{
+		name: "read/image-bmp-convert",
+		tool: "read",
+		args: { path: "img.bmp" },
+		setup: { "img.bmp": { fixture: "img.bmp" } },
+	},
+	{
+		name: "read/image-gif-passthrough",
+		tool: "read",
+		args: { path: "small.gif" },
+		setup: { "small.gif": { fixture: "small.gif" } },
+	},
+	{
+		name: "read/image-webp-passthrough",
+		tool: "read",
+		args: { path: "small.webp" },
+		setup: { "small.webp": { fixture: "small.webp" } },
+	},
+	{
+		name: "read/image-corrupt-png",
+		tool: "read",
+		args: { path: "corrupt.png" },
+		setup: { "corrupt.png": { fixture: "corrupt.png" } },
+	},
+	{
+		name: "read/image-exif-orientation",
+		tool: "read",
+		args: { path: "exif6.jpg" },
+		setup: { "exif6.jpg": { fixture: "exif6.jpg" } },
+	},
+	{
+		name: "read/image-animated-png-text-path",
+		tool: "read",
+		args: { path: "animated.png" },
+		setup: { "animated.png": { fixture: "animated.png" } },
+	},
 ];
