@@ -211,3 +211,18 @@ Remaining, roughly in dependency order:
   random-id-generating code paths; parity suite at 239 cases. LLM-dependent
   summarization and the nested-call runner are deferred to later tranches
   (G7/G8).
+- TUI tranche 1 (first slice): new `pi-tui` crate with the Unicode
+  foundation for the width engine — `scripts/gen-unicode-tables.mjs`
+  regenerates `unicode/tables.rs` from the **live Node/V8 runtime**
+  (regex property scans over all codepoints, `get-east-asian-width`
+  package data, V8 `RGI_Emoji` string set: 3796 sequences) plus UCD 16.0
+  Grapheme_Cluster_Break and InCB data (matching Node 24's ICU vintage).
+  `unicode/mod.rs` implements UAX #29 GB3–GB999 including GB9c (Indic
+  conjunct breaks), validated by a 1208-case golden corpus recorded from
+  the live `Intl.Segmenter` (`scripts/gen-segmenter-corpus.mjs`) — ICU is
+  the ground truth and diverges from the published UCD expectations in
+  exactly one recorded case (U+2701 ZWJ U+2701). `utils.rs` ports the
+  width-engine slice of `utils.ts` (ANSI/OSC/APC parsing, terminal
+  spacing-mark set, grapheme widths, `visibleWidth`) with the upstream
+  visible-width tests ported. 11 unit tests pass. See
+  `docs/TUI_PORT_PLAN.md` for the full tranche plan (T1–T7).

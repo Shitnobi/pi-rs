@@ -1,0 +1,8 @@
+[package]
+name = "pi-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust port of @earendil-works/pi-tui (terminal UI library with differential rendering)"
+
+[dependencies]
