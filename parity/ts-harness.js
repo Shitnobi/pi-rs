@@ -106,6 +106,31 @@ async function runModule(tool, args, cwd) {
 			return { error: String(e.message) };
 		}
 	}
+	if (tool === "tui-word-navigation") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const wn = await import(pathToFileURL(TUI_SRC + "/word-navigation.ts").href);
+		const { getWordSegmenter } = await import(pathToFileURL(TUI_SRC + "/utils.ts").href);
+		const atomic = Array.isArray(args.atomic) ? args.atomic : null;
+		const options = atomic ? { isAtomicSegment: (s) => atomic.includes(s) } : undefined;
+		switch (args.fn) {
+			case "segmentWords":
+				return {
+					result: args.texts.map((text) =>
+						[...getWordSegmenter().segment(text)].map(({ segment, isWordLike }) => ({
+							segment,
+							isWordLike,
+						})),
+					),
+				};
+			case "findWordBackward":
+				return { result: args.cursors.map((c) => wn.findWordBackward(args.text, c, options)) };
+			case "findWordForward":
+				return { result: args.cursors.map((c) => wn.findWordForward(args.text, c, options)) };
+			default:
+				throw new Error("unknown tui-word-navigation fn: " + args.fn);
+		}
+	}
 	if (tool === "tui-kill-ring") {
 		const { pathToFileURL } = require("url");
 		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";

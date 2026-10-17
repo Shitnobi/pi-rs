@@ -277,3 +277,54 @@ Remaining, roughly in dependency order:
   while the Rust `Color::Indexed { index: u8 }` validates at construction.
   Tranche 1b remainder (fuzzy, kill-ring, undo-stack, program-status,
   oklab, colors, terminal-colors) all green: 92 pi-tui unit tests.
+- TUI tranche 1d (word-navigation / ICU word segmentation): COMPLETE.
+  `pi-tui/src/unicode/word_break.rs` (~1900 lines) executes Node's actual ICU
+  78.3 machinery offline: word.brk RBBI forward state table (58 states,
+  8-bit rows), UText, dictionary-engine dispatch (Thai/Lao/Khmer/Burmese SEA
+  + CJK Viterbi with NFKC fragment normalization, katakana-cost heuristic,
+  inputMap supplementary conversion), BytesTrie/UCharsTrie walks, and the
+  DictionaryCache (rbbi_cache.cpp) with process-global factory semantics.
+  Binary data is generated offline by `scripts/gen-word-break-data.mjs` into
+  `word_break_data.rs` + `data/*.bin`. `word_navigation.rs` operates at the
+  UTF-16 level (exact JS `String.slice` semantics — cursors may split
+  surrogate pairs). Validation stack:
+  - `scripts/probe-word-seg.mjs` validates the JS reference prototype
+    (`scripts/lib/word-segmenter.mjs`) vs live Intl.Segmenter; `--emit-fixture`
+    writes `data/word-seg-fixture.bin` (10099 cases, UTF-16 units so lone
+    surrogates survive) only when the probe is 0-fail.
+  - in-crate fixture test replays all 10099 cases through both the u16-level
+    and &str paths.
+  - `tui-word-navigation` parity harness (both sides) + 20 cases: 409/409.
+  - `scripts/batter-word-seg.mjs` — large-scale differential batter with
+    MATCHED trajectories (see below). Seeds 777/888/999 × (20000 warm seg +
+    1500 cold seg + 1500 cold nav sweeps + 1500 warm nav sweeps) all green.
+  - 112 pi-tui unit tests.
+  Notable bug fixed en route: BytesTrie/UCharsTrie `branch_next` binary
+  search must increment pos in the comparison (`u[pos++]` in JS) before
+  jump/skip-delta — otherwise wide trie branches never match.
+- **ICU engine-factory trajectory semantics** (matters for any differential
+  test of word segmentation): ICU's `ICULanguageBreakFactory` engine cache is
+  process-global and warms lazily on the first *dictionary dispatch*. A
+  leading Script=Common CJ-set char (U+FF70 ｰ, U+FF9E, U+FF9F, U+30FC) merges
+  with the following word while the factory is cold (loadEngineFor returns
+  null for Common → UnhandledEngine rejects the whole Common script → the CJ
+  engine range starts after it), but splits once Cjk is cached (the CJ set
+  explicitly covers those code points). Subtleties that make trajectories
+  diverge innocently:
+  1. `DictionaryCache::populate` no-ops on ranges of length ≤ 1, so
+     single-char dictionary prefixes (e.g. "饩" or "ｰ") NEVER dispatch an
+     engine and never warm the factory — live ICU behaves the same.
+  2. Each `segment()` call gets a fresh instance engine stack (per-iterator),
+     but the factory cache persists across calls in-process.
+  3. JSON transport can't carry lone surrogates, so cursor sweeps that split
+     surrogate pairs can't be shipped as sliced prefixes — send the full text
+     + cursors and slice in the harness.
+  The batter therefore compares matched trajectories on both sides: warm
+  (one pi-cli `batchNav` process warmed by the same corpus sequence as the
+  shared Intl.Segmenter) and cold (fresh pi-cli process vs
+  `scripts/navref-cold.mjs`, a fresh node whose first segmentation is the
+  input). `batchNav` was added to the `tui-word-navigation` pi-cli harness
+  entry for the warm phase. The original 3 batter "failures" were all
+  trajectory artifacts of comparing cold Rust vs warm live — the Rust port
+  was already bit-exact (verified against true-fresh live ICU and the
+  prototype on minimal repros).

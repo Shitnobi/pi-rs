@@ -9,6 +9,8 @@
 
 pub mod tables;
 pub mod segmenter_corpus;
+pub mod word_break;
+pub mod word_break_data;
 
 use tables::*;
 

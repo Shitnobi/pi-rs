@@ -101,6 +101,7 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
         "nested-calls" => return run_nested_calls_harness(&input),
         "tui-utils" => return run_tui_utils_harness(&input),
         "tui-fuzzy" => return run_tui_fuzzy_harness(&input),
+        "tui-word-navigation" => return run_tui_word_navigation_harness(&input),
         "tui-kill-ring" => return run_tui_kill_ring_harness(&input),
         "tui-program-status" => return run_tui_program_status_harness(&input),
         "tui-colors" => return run_tui_colors_harness(&input),
@@ -280,6 +281,90 @@ fn run_tui_fuzzy_harness(input: &Value) -> Result<Value, String> {
             Ok(serde_json::json!({ "result": out }))
         }
         other => Err(format!("unknown tui-fuzzy fn: {}", other)),
+    }
+}
+
+/// `tui-word-navigation` entry: word-granularity segmentation
+/// (Intl.Segmenter) and cursor motion (word-navigation.ts) parity.
+/// The Rust side runs the offline ICU 78.3 port in pi-tui; the TS side runs
+/// the original module against Node's live Intl.Segmenter.
+fn run_tui_word_navigation_harness(input: &Value) -> Result<Value, String> {
+    // Optional atomic-segment allowlist (mirrors the isAtomicSegment option).
+    let atomic: Option<std::collections::HashSet<String>> = input["atomic"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        });
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    match fn_name {
+        // Batch mode for trajectory-matched differential testing: ICU's
+        // language-break-engine factory is process-global, so warm-up order
+        // affects results (e.g. U+FF70-led dictionary runs). `batchNav` runs
+        // a sequence of segmentWords/findWordBackward/findWordForward ops in
+        // ONE process so the Rust factory warms exactly like the reference.
+        "batchNav" => {
+            let ops = input["ops"].as_array().ok_or("missing ops array")?;
+            let mut out = Vec::with_capacity(ops.len());
+            for op in ops {
+                out.push(run_tui_word_navigation_op(op, &atomic)?);
+            }
+            Ok(serde_json::json!({ "result": out }))
+        }
+        _ => Ok(serde_json::json!({
+            "result": run_tui_word_navigation_op(input, &atomic)?
+        })),
+    }
+}
+
+/// One tui-word-navigation op: segmentWords (texts array) or
+/// findWordBackward/findWordForward (text + cursors array).
+fn run_tui_word_navigation_op(
+    input: &Value,
+    atomic: &Option<std::collections::HashSet<String>>,
+) -> Result<Value, String> {
+    use pi_tui::unicode::word_break::segment_words;
+    use pi_tui::word_navigation::{self, WordNavigationOptions};
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    match fn_name {
+        "segmentWords" => {
+            let texts = input["texts"].as_array().ok_or("missing texts array")?;
+            let mut out = Vec::with_capacity(texts.len());
+            for t in texts {
+                let text = t.as_str().ok_or("texts entries must be strings")?;
+                let segs: Vec<Value> = segment_words(text)
+                    .iter()
+                    .map(|w| {
+                        serde_json::json!({ "segment": w.segment, "isWordLike": w.is_word_like })
+                    })
+                    .collect();
+                out.push(Value::Array(segs));
+            }
+            Ok(Value::Array(out))
+        }
+        "findWordBackward" | "findWordForward" => {
+            let text = input["text"].as_str().ok_or("missing text")?;
+            let cursors = input["cursors"].as_array().ok_or("missing cursors array")?;
+            let pred = |s: &str| atomic.as_ref().is_some_and(|set| set.contains(s));
+            let options = WordNavigationOptions {
+                segment: None,
+                is_atomic_segment: Some(&pred),
+            };
+            let mut results = Vec::with_capacity(cursors.len());
+            for c in cursors {
+                let cursor =
+                    c.as_u64().ok_or("cursors entries must be non-negative integers")? as usize;
+                let r = if fn_name == "findWordBackward" {
+                    word_navigation::find_word_backward(text, cursor, Some(&options))
+                } else {
+                    word_navigation::find_word_forward(text, cursor, Some(&options))
+                };
+                results.push(serde_json::json!(r));
+            }
+            Ok(Value::Array(results))
+        }
+        other => Err(format!("unknown tui-word-navigation fn: {}", other)),
     }
 }
 

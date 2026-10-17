@@ -12,5 +12,6 @@ pub mod oklab;
 pub mod program_status;
 pub mod terminal_colors;
 pub mod unicode;
+pub mod word_navigation;
 pub mod undo_stack;
 pub mod utils;
