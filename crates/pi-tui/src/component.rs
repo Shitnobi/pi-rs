@@ -530,9 +530,11 @@ impl Component for Container {
         lines
     }
 
-    fn handles_input(&self) -> bool {
-        true
-    }
+    // TS `Container` defines NO `handleInput` (tui.ts:358-418), so
+    // `handles_input()` stays `false` (trait default): a plain Container
+    // never claims keyboard focus — `focus_target` remains the child that
+    // requested it (tui.ts:397's `(this as Component).handleInput` is
+    // always `undefined` here).
 
     fn invalidate(&mut self) {
         for child in &self.children {
@@ -558,8 +560,11 @@ impl Component for Container {
                 let result = dispatch_mouse_event(&child, &local);
                 return match result {
                     // `if (result?.focus && (this as Component).handleInput)`
-                    // → `{ ...result, focusTarget: this }` (tui.ts:397) — the
-                    // focus target is the dispatching container itself.
+                    // → `{ ...result, focusTarget: this }` (tui.ts:397). For a
+                    // plain Container `handleInput` is undefined, so the
+                    // retarget never fires and the child's focus target is
+                    // kept; a Container subclass that handles input opts in
+                    // via `handles_input()`.
                     Some(dispatch) if dispatch.is_focus() && self.handles_input() => {
                         let mut with_target = dispatch;
                         with_target.focus_target = Some(self_ref.clone());
@@ -683,6 +688,50 @@ mod tests {
             .borrow_mut()
             .handle_mouse(&container_ref, &event(-1, 5))
             .is_none());
+    }
+
+    /// TS `Container` has no `handleInput` (tui.ts:358-418), so a child that
+    /// requests focus keeps it — the container never retargets to itself
+    /// (tui.ts:397 `(this as Component).handleInput` is undefined).
+    /// Regression test for the T3 redteam F1 finding.
+    #[test]
+    fn container_does_not_steal_focus_from_focusable_child() {
+        struct FocusLeaf;
+
+        impl Component for FocusLeaf {
+            fn render(&mut self, _width: usize) -> Vec<String> {
+                vec!["leaf".to_string()]
+            }
+            fn handle_mouse(
+                &mut self,
+                _self_ref: &ComponentRef,
+                _event: &TuiMouseEvent,
+            ) -> Option<ComponentMouseResult> {
+                let mut result = TuiMouseEventResult::capture();
+                result.focus = Some(true);
+                Some(ComponentMouseResult::Result(result))
+            }
+        }
+
+        let child: ComponentRef = Rc::new(RefCell::new(FocusLeaf));
+        let mut container = Container::new();
+        container.add_child(child.clone());
+        let container_ref: ComponentRef = Rc::new(RefCell::new(container));
+
+        let result = container_ref
+            .borrow_mut()
+            .handle_mouse(&container_ref, &event(0, 1));
+        match result {
+            Some(ComponentMouseResult::Forwarded(dispatch)) => {
+                assert!(dispatch.is_focus());
+                let target = dispatch.focus_target.as_ref().expect("focus target");
+                assert!(
+                    Rc::ptr_eq(target, &child),
+                    "focus target must be the child, not the container"
+                );
+            }
+            other => panic!("expected forwarded dispatch, got none: {}", other.is_none()),
+        }
     }
 
     #[test]

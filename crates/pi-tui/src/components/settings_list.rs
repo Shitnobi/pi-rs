@@ -221,15 +221,20 @@ impl SettingsList {
     }
 
     /// `selectItem(id)` (settings-list.ts:79-85) — move selection to the
-    /// item with the given id (no-op if not found).
+    /// item with the given id (no-op if not found). `selectedIndex` is a
+    /// position in the filtered list (TS `findIndex` over `filteredItems`),
+    /// NOT an item index.
     pub fn select_item(&mut self, id: &str) {
         let indices: Vec<usize> = if self.search_enabled {
             self.filtered_items.clone()
         } else {
             (0..self.items.len()).collect()
         };
-        if let Some(&index) = indices.iter().find(|&&index| self.items[index].id == id) {
-            self.selected_index = index;
+        if let Some(position) = indices
+            .iter()
+            .position(|&index| self.items[index].id == id)
+        {
+            self.selected_index = position;
         }
     }
 
@@ -322,9 +327,15 @@ impl SettingsList {
             )));
         }
 
-        // Add description for selected item
+        // Add description for selected item (TS `if (selectedItem?.description)`
+        // — settings-list.ts:165 — JS truthiness: "" is falsy).
         if let Some(&index) = display_items.get(self.selected_index) {
-            if let Some(description) = self.items[index].description.clone() {
+            if let Some(description) = self
+                .items[index]
+                .description
+                .clone()
+                .filter(|description| !description.is_empty())
+            {
                 lines.push(String::new());
                 let wrapped_desc = wrap_text_with_ansi(&description, width.saturating_sub(4));
                 for line in wrapped_desc {
@@ -718,6 +729,82 @@ mod tests {
         assert_eq!(
             *changes.borrow(),
             vec![("tui-mode".to_string(), "fullscreen".to_string())]
+        );
+    }
+
+    /// Empty-string description is JS-falsy (settings-list.ts:165
+    /// `if (selectedItem?.description)`) — no description block is
+    /// rendered. T3 redteam lists-F2 regression test.
+    #[test]
+    fn empty_description_is_falsy_and_renders_no_description_block() {
+        let with_empty = vec![SettingItem::new("a", "a", "v1").with_description("")];
+        let without = vec![SettingItem::new("a", "a", "v1")];
+
+        let empty_changes: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded = empty_changes.clone();
+        let mut list_empty = SettingsList::with_options(
+            with_empty,
+            10,
+            test_theme(),
+            Box::new(move |id, value| {
+                recorded.borrow_mut().push((id.to_string(), value.to_string()));
+            }),
+            Box::new(|| {}),
+            Default::default(),
+        );
+
+        let changes2: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded2 = changes2.clone();
+        let mut list_none = SettingsList::with_options(
+            without,
+            10,
+            test_theme(),
+            Box::new(move |id, value| {
+                recorded2.borrow_mut().push((id.to_string(), value.to_string()));
+            }),
+            Box::new(|| {}),
+            Default::default(),
+        );
+
+        assert_eq!(list_empty.render(80), list_none.render(80));
+    }
+
+    /// `selectItem(id)` positions the selection in the FILTERED list
+    /// (settings-list.ts:85 `findIndex` over `filteredItems`), so after a
+    /// search that reorders rows the correct setting is activated. T3
+    /// redteam lists-F3 regression test.
+    #[test]
+    fn select_item_positions_within_the_filtered_list() {
+        let changes: Rc<RefCell<Vec<(String, String)>>> = Rc::new(RefCell::new(Vec::new()));
+        let recorded = changes.clone();
+        let mut list = SettingsList::with_options(
+            vec![
+                SettingItem::new("ab", "ab", "ab-1")
+                    .with_values(vec!["ab-1".to_string(), "ab-2".to_string()]),
+                SettingItem::new("ba", "ba", "ba-1")
+                    .with_values(vec!["ba-1".to_string(), "ba-2".to_string()]),
+            ],
+            10,
+            test_theme(),
+            Box::new(move |id, value| {
+                recorded.borrow_mut().push((id.to_string(), value.to_string()));
+            }),
+            Box::new(|| {}),
+            SettingsListOptions {
+                enable_search: Some(true),
+            },
+        );
+
+        // Search "b": fuzzy filter reorders to [ba, ab].
+        list.handle_input("b");
+        assert!(list.render(80).iter().any(|line| line.contains("ba")));
+
+        // Select the second filtered row (item "ab") and activate it.
+        list.select_item("ab");
+        list.handle_input("\r");
+        assert_eq!(
+            *changes.borrow(),
+            vec![("ab".to_string(), "ab-2".to_string())]
         );
     }
 }

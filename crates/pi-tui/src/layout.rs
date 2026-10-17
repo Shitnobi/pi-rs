@@ -51,7 +51,7 @@ use std::rc::{Rc, Weak};
 use crate::component::{composite_tui_line, is_image_line, ComponentRef, CURSOR_MARKER};
 use crate::layout_node::{
     Basis, LayoutNode, LayoutViewport, ScrollLayoutNode, ScrollLayoutState, StackAlign,
-    StackLayoutEntry, StackType,
+    StackType,
 };
 use crate::utils::{
     extract_ansi_code, get_active_background_ansi, get_grapheme_cell_range, slice_by_column,
@@ -349,8 +349,15 @@ fn layout_component(
             );
             let scroll_view = lookup_scroll_view_state(&state);
             let is_primary = state.borrow().primary();
-            if is_primary || context.primary_scroll_view.is_none() {
-                context.primary_scroll_view = scroll_view.clone();
+            // TS (layout.ts:149-150) always tracks the scroll-view state as
+            // the primary; a Rust view that bypasses `scroll_layout_node`
+            // has no registered state here — skip the assignment entirely
+            // (neither claim nor overwrite) instead of clobbering an
+            // existing primary with `None`.
+            if let Some(scroll_view) = &scroll_view {
+                if is_primary || context.primary_scroll_view.is_none() {
+                    context.primary_scroll_view = Some(scroll_view.clone());
+                }
             }
             let rect = LayoutRect { x, y, width: safe_width, height: viewport_height };
             let child_clip = intersect(clip, rect);
@@ -629,6 +636,7 @@ struct KittyImageMetadata {
 /// is preserved with a `Vec`; the >1000 cap evicts the oldest entry.
 struct RegisteredKittyImageMetadata {
     metadata: KittyImageMetadata,
+    #[allow(dead_code)] // [T6] parity field, read when terminal-image lands
     transmission_generation: i64,
 }
 
@@ -638,6 +646,7 @@ thread_local! {
 }
 
 /// `registerKittyImageMetadata` (terminal-image.ts:349-359). [T6]
+#[allow(dead_code)] // wired up when terminal-image rendering lands (T6)
 fn register_kitty_image_metadata(metadata: KittyImageMetadata) {
     KITTY_TRANSMISSION_GENERATION.with(|generation| generation.set(generation.get() + 1));
     let transmission_generation = KITTY_TRANSMISSION_GENERATION.with(|generation| generation.get());
@@ -980,7 +989,7 @@ mod tests {
     use super::*;
     use crate::component::Component;
     use crate::components::stack::{allocate_stack_sizes, visible_stack_entries};
-    use crate::layout_node::{LayoutViewport, Overscroll, StackLayoutNode};
+    use crate::layout_node::{LayoutViewport, Overscroll, StackLayoutEntry, StackLayoutNode};
     use crate::utils::{
         apply_background_to_line, js_trim, strip_terminal_sequences, wrap_text_with_ansi,
     };

@@ -137,6 +137,7 @@ pub struct ScrollViewStateData {
     /// `readonly scrollbarThumbStyle` (scroll-view.ts:28).
     thumb_style: Option<Rc<dyn Fn(&str) -> String>>,
     /// `private readonly scrollbarHideDelayMs` (scroll-view.ts:30).
+    #[allow(dead_code)] // TS field parity; the hide timer lands with tui.rs (T5)
     hide_delay_ms: i64,
     /// `private currentScrollbar` (scroll-view.ts:29).
     scrollbar: ScrollViewScrollbar,

@@ -4326,4 +4326,372 @@ export const cases = [
 			],
 		},
 	},
+	// ------------------------------------------------------ tui-components
+	// Differential render-line testing of TUI components: the same
+	// JSON-serializable component spec tree is built on the TS side (ground
+	// truth) and the Rust side, rendered at the given widths, and optionally
+	// driven by a script (handle_input sequences, loader ticks, scroll ops,
+	// mouse dispatch) with re-renders. Function-valued params are named
+	// presets ("identity"/"bracket" styles, "record" callbacks whose event
+	// log is part of the compared output). See ts-harness.js.
+	{
+		name: "tui-components/text",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("basic", txt("hello"), { widths: [20] }),
+				tc("empty", txt(""), { widths: [10] }),
+				tc("whitespace-only", txt("   "), { widths: [10] }),
+				tc("multiline", txt("one\ntwo\nthree"), { widths: [20] }),
+				tc("wrap-long", txt("the quick brown fox jumps over the lazy dog"), { widths: [20, 12] }),
+				tc("wrap-cjk", txt("世界你好世界你好世界"), { widths: [10, 7] }),
+				tc("wrap-emoji-astral", txt("👍🏽👍🏽👍🏽👍🏽 family 👨‍👩‍👧‍👦 test"), { widths: [10] }),
+				tc("padding-x-0", txt("hi", 0), { widths: [10] }),
+				tc("padding-x-3", txt("hi", 3), { widths: [10] }),
+				tc("padding-y-0", txt("hi", 1, 0), { widths: [10] }),
+				tc("padding-y-2", txt("hi", 1, 2), { widths: [10] }),
+				tc("narrow-3", txt("hello world", 2), { widths: [3] }),
+				tc("tabs", txt("a\tb\tc"), { widths: [20] }),
+				tc("bg-bracket", txt("hi", 1, 1, "bracket"), { widths: [12] }),
+				tc("bg-identity", txt("hi", 1, 1, "identity"), { widths: [12] }),
+			],
+		},
+	},
+	{
+		name: "tui-components/truncated-text",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("basic", ttxt("hello world this is long"), { widths: [20] }),
+				tc("exact-fit", ttxt("hello"), { widths: [10] }),
+				tc("short", ttxt("hi"), { widths: [10] }),
+				tc("multiline-first-line", ttxt("first\nsecond"), { widths: [20] }),
+				tc("padding", ttxt("hello world", 2, 1), { widths: [15] }),
+				tc("cjk", ttxt("世界世界世界"), { widths: [7] }),
+				tc("empty", ttxt(""), { widths: [10] }),
+			],
+		},
+	},
+	{
+		name: "tui-components/spacer",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("default", spc(), { widths: [10] }),
+				tc("zero", spc(0), { widths: [10] }),
+				tc("three", spc(3), { widths: [10] }),
+				tc("in-box", boxc([txt("a"), spc(2), txt("b")], 0, 0), { widths: [10] }),
+			],
+		},
+	},
+	{
+		name: "tui-components/box",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("empty", boxc([], 1, 1), { widths: [10] }),
+				tc("single-child", boxc([txt("hello")], 1, 1), { widths: [20] }),
+				tc("no-padding", boxc([txt("hello")], 0, 0), { widths: [12] }),
+				tc("padding-2-0", boxc([txt("hello")], 2, 0), { widths: [14] }),
+				tc("padding-0-2", boxc([txt("hello")], 0, 2), { widths: [12] }),
+				tc("multiple-children", boxc([txt("one"), txt("two"), txt("three")], 1, 1), { widths: [16] }),
+				tc("nested", boxc([boxc([txt("inner")], 1, 1)], 2, 2), { widths: [20] }),
+				tc("bg-bracket", boxc([txt("hi")], 1, 1, "bracket"), { widths: [12] }),
+				tc("child-wrap", boxc([txt("a long line that wraps around")], 1, 1), { widths: [14] }),
+				tc("empty-text-child", boxc([txt("")], 1, 1), { widths: [10] }),
+				tc("spacer-child", boxc([spc(1), txt("x")], 0, 0), { widths: [10] }),
+			],
+		},
+	},
+	{
+		name: "tui-components/stacks",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("vstack-basic", stk("v-stack", [ent(txt("a")), ent(txt("b"))]), { widths: [10] }),
+				tc("vstack-gap", stk("v-stack", [ent(txt("a")), ent(txt("b"))], { gap: 2 }), { widths: [10] }),
+				tc("vstack-empty", stk("v-stack", []), { widths: [10] }),
+				tc("hstack-basic", stk("h-stack", [ent(txt("aa")), ent(txt("bb"))]), { widths: [20] }),
+				tc("hstack-gap", stk("h-stack", [ent(txt("aa")), ent(txt("bb"))], { gap: 1 }), { widths: [20] }),
+				tc("hstack-grow", stk("h-stack", [ent(txt("a"), { grow: 1 }), ent(txt("b"), { grow: 3 })]), { widths: [20] }),
+				tc("hstack-shrink", stk("h-stack", [ent(txt("aaaaaaaaaa"), { shrink: 1 }), ent(txt("bbbbbbbbbb"), { shrink: 3 })]), { widths: [10] }),
+				tc("hstack-basis-points", stk("h-stack", [ent(txt("a"), { basis: 6 }), ent(txt("b"), { basis: 4 })]), { widths: [20] }),
+				tc("hstack-basis-auto", stk("h-stack", [ent(txt("aaa"), { basis: "auto" }), ent(txt("b"), { basis: "auto", grow: 1 })]), { widths: [20] }),
+				tc("hstack-min-size", stk("h-stack", [ent(txt("a"), { basis: 10, min: 4 }), ent(txt("b"))]), { widths: [8] }),
+				tc("hstack-max-size", stk("h-stack", [ent(txt("a"), { grow: 1, max: 5 }), ent(txt("b"), { grow: 1 })]), { widths: [20] }),
+				tc("hidden-entry", stk("v-stack", [ent(txt("a")), ent(txt("hidden"), { visible: "never" }), ent(txt("b"))]), { widths: [10] }),
+				tc("align-center", stk("h-stack", [ent(txt("a")), ent(txt("b\nb2"))], { align: "center" }), { widths: [20] }),
+				tc("align-end", stk("h-stack", [ent(txt("a")), ent(txt("b\nb2"))], { align: "end" }), { widths: [20] }),
+				tc("align-start", stk("h-stack", [ent(txt("a\na2")), ent(txt("b"))], { align: "start" }), { widths: [20] }),
+				tc("nested-v-in-h", boxc([stk("v-stack", [ent(txt("x")), ent(stk("h-stack", [ent(txt("y")), ent(txt("z"))]))])], 1, 1), { widths: [24] }),
+			],
+		},
+	},
+	{
+		name: "tui-components/loader",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("initial", ld({}), { widths: [20] }),
+				tc("tick-1", ld({}), { script: [{ ticks: 1, render: true }] }),
+				tc("tick-3", ld({}), { script: [{ ticks: 3, render: true }] }),
+				tc("tick-12-wrap", ld({}), { script: [{ ticks: 12, render: true }] }),
+				tc("custom-message", ld({ message: "Working hard" }), { widths: [20] }),
+				tc("custom-frames", ld({ frames: ["-", "\\", "|", "/"], intervalMs: 10 }), { script: [{ render: true }, { ticks: 2, render: true }] }),
+				tc("empty-frames", ld({ frames: [] }), { widths: [20] }),
+				tc("single-frame", ld({ frames: ["*"] }), { script: [{ ticks: 2, render: true }] }),
+				tc("interval-ms-zero", ld({ intervalMs: 0 }), { script: [{ ticks: 1, render: true }] }),
+			],
+		},
+	},
+	{
+		name: "tui-components/cancellable-loader",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("initial", { type: "cancellable-loader", message: "Working..." }, { widths: [20] }),
+				tc("escape-abort", { type: "cancellable-loader", onAbort: "record" }, { script: [{ inputs: ["\u001b"], render: true }] }),
+				tc("escape-twice", { type: "cancellable-loader", onAbort: "record" }, { script: [{ inputs: ["\u001b"] }, { inputs: ["\u001b"], render: true }] }),
+				tc("plain-input-ignored", { type: "cancellable-loader", onAbort: "record" }, { script: [{ inputs: ["x", "\r"], render: true }] }),
+				tc("tick", { type: "cancellable-loader" }, { script: [{ ticks: 2, render: true }] }),
+			],
+		},
+	},
+	{
+		name: "tui-components/mouse-region",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("render-passthrough", mr(txt("hello")), { widths: [12] }),
+				tc("render-box-child", mr(boxc([txt("a"), txt("b")], 1, 1)), { widths: [12] }),
+				tc("press-record", mr(txt("hello")), {
+					widths: [12],
+					script: [{ mouse: { type: "press", button: "left", x: 2, y: 0, width: 12, height: 3 }, render: true }],
+				}),
+				tc("click-record", mr(txt("hello")), {
+					script: [{ mouse: { type: "click", button: "left", x: 4, y: 1, width: 12, height: 3, clickCount: 2 } }],
+				}),
+				tc("wheel-record", mr(txt("hello")), {
+					script: [{ mouse: { type: "wheel", button: "none", x: 0, y: 0, width: 12, height: 3, wheelDelta: -3 } }],
+				}),
+				tc("modifiers-record", mr(txt("hello")), {
+					script: [{ mouse: { type: "move", button: "none", x: 1, y: 2, width: 12, height: 3, shift: true, alt: true, ctrl: true } }],
+				}),
+				tc("box-dispatch", boxc([txt("hello")], 1, 1), {
+					widths: [12],
+					script: [{ mouse: { type: "press", button: "left", x: 2, y: 1, width: 12, height: 5 } }],
+				}),
+			],
+		},
+	},
+	{
+		name: "tui-components/scroll-view",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("render-passthrough", svw(txt("hello")), { widths: [12] }),
+				tc("initial-state", svw(txt("a")), { widths: [10] }),
+				tc("scroll-state", svw(boxc([txt("one"), txt("two"), txt("three"), txt("four"), txt("five")], 0, 0)), {
+					script: [
+						{ scroll: [{ updateLayout: [5, 2] }] },
+						{ scroll: [{ scrollBy: 1 }] },
+						{ scroll: [{ scrollBy: 10 }] },
+						{ scroll: [{ scrollToStart: true }] },
+						{ scroll: [{ scrollToEnd: true }] },
+						{ render: true, width: 10 },
+					],
+				}),
+				tc("follow-end", svw(boxc([txt("one"), txt("two"), txt("three")], 0, 0), { follow: "end" }), {
+					script: [
+						{ scroll: [{ updateLayout: [3, 2] }, { scrollBy: 5 }] },
+						{ render: true, width: 10 },
+					],
+				}),
+				tc("scroll-to-negative", svw(txt("x")), { script: [{ scroll: [{ updateLayout: [4, 2] }, { scrollTo: -5 }] }] }),
+				tc("nested-in-box", boxc([svw(txt("deep"))], 1, 1), { widths: [12] }),
+			],
+		},
+	},
+	{
+		name: "tui-components/input",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("initial", inp({}), { widths: [20] }),
+				tc("prompt-placeholder", inp({ prompt: "Name: ", placeholder: "enter name" }), { widths: [30] }),
+				tc("placeholder-focused", inp({ placeholder: "type here", focused: true }), { widths: [30] }),
+				tc("type-plain", inp({}), { script: [press("h", "e", "l", "l", "o"), { render: true, width: 20 }] }),
+				tc("backspace", inp({}), { script: [press("a", "b", "c", "\u007f"), { render: true, width: 20 }] }),
+				tc("arrows", inp({}), { script: [press("a", "b", "c", "\u001b[D", "\u001b[D", "\u001b[C"), { render: true, width: 20 }] }),
+				tc("home-end", inp({ focused: true }), { script: [press("a", "b", "\u0001", "x", "\u0005", "z"), { render: true, width: 20 }] }),
+				tc("word-left-right", inp({}), { script: [press("one two three", "\u001bb", "\u001bb", "\u001bf", "\u001bf"), { render: true, width: 30 }] }),
+				tc("delete-word-backward", inp({}), { script: [press("one two", "\u001b\u007f"), { render: true, width: 20 }] }),
+				tc("enter-submit", inp({ onSubmit: "record" }), { script: [press("hi", "\r", "\r")] }),
+				tc("escape", inp({ onEscape: "record" }), { script: [press("a", "\u001b")] }),
+				tc("cjk-input", inp({ focused: true }), { script: [press("你", "好", "世", "界"), { render: true, width: 20 }] }),
+				tc("astral-input", inp({ focused: true }), { script: [press("\ud835\udc00", "b", "\ud83d\ude00"), { render: true, width: 20 }] }),
+				tc("narrow-scroll", inp({ focused: true }), {
+					script: [press("abcdefghijklmnopqrstuvwxyz"), { render: true, width: 10 }, { inputs: ["\u001b[D", "\u001b[D"], render: true, width: 10 }],
+				}),
+				tc("narrow-cjk", inp({}), { script: [press("世界世界世界世界"), { render: true, width: 9 }] }),
+				tc("paste", inp({}), { script: [press("\u001b[200~ab\ncd\u001b[201~"), { render: true, width: 20 }] }),
+				tc("kitty-csi-u", inp({}), { script: [press("\u001b[97u", "\u001b[98u"), { render: true, width: 20 }] }),
+				tc("control-ignored", inp({}), { script: [press("\u0000", "\u0003"), { render: true, width: 20 }] }),
+				tc("wide-render", inp({ prompt: ">>> " }), { script: [press("hello"), { render: true, width: 60 }] }),
+			],
+		},
+	},
+	{
+		name: "tui-components/select-list",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("empty", slist([]), { widths: [40] }),
+				tc("single", slist([sitem("a", "Alpha")]), { widths: [40] }),
+				tc("three", slist([sitem("a", "Alpha"), sitem("b", "Beta"), sitem("c", "Gamma")]), { widths: [40] }),
+				tc("many-scroll", slist(Array.from({ length: 8 }, (_, i) => sitem("v" + i, "Item " + i)), { maxVisible: 3 }), { widths: [40] }),
+				tc("descriptions", slist([sitem("a", "Alpha", "the first letter"), sitem("b", "Beta", "the second letter")]), { widths: [60] }),
+				tc("description-narrow", slist([sitem("a", "Alpha", "desc here")]), { widths: [30] }),
+				tc("move-down-wrap", slist([sitem("a", "A"), sitem("b", "B"), sitem("c", "C")], { onSelectionChange: "record" }), {
+					script: [press("\u001b[A"), { render: true, width: 30 }, press("\u001b[B"), press("\u001b[B"), { render: true, width: 30 }],
+				}),
+				tc("enter-select", slist([sitem("a", "A"), sitem("b", "B")], { onSelect: "record", onSelectionChange: "record" }), {
+					script: [press("\u001b[B"), press("\r")],
+				}),
+				tc("escape-cancel", slist([sitem("a", "A")], { onCancel: "record" }), { script: [press("\u001b")] }),
+				tc("filter-match", slist([sitem("alpha", "Alpha"), sitem("beta", "Beta"), sitem("alphabet", "Alphabet")]), {
+					script: [{ setFilter: "al" }, { render: true, width: 40 }],
+				}),
+				tc("filter-no-match", slist([sitem("a", "A")]), { script: [{ setFilter: "zzz" }, { render: true, width: 40 }] }),
+				tc("min-max-primary", slist([sitem("a", "A"), sitem("b", "Bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")], { layoutOptions: { minPrimaryColumnWidth: 10, maxPrimaryColumnWidth: 12 } }), { widths: [60] }),
+				tc("max-primary-only", slist([sitem("a", "A"), sitem("b", "B")], { layoutOptions: { maxPrimaryColumnWidth: 8 } }), { widths: [60] }),
+				tc("label-fallback", slist([sitem("value-only", "")]), { widths: [40] }),
+				tc("truncation-narrow", slist([sitem("a", "AAAAAAAAAAAAAAAAAAAA"), sitem("b", "B")]), { widths: [12] }),
+			],
+		},
+	},
+	{
+		name: "tui-components/settings-list",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("basic", stlist([sit("theme", "Theme", "dark"), sit("lang", "Language", "en")]), { widths: [50] }),
+				tc("selected-cursor", stlist([sit("a", "Aaa", "1"), sit("b", "Bbb", "2")]), { widths: [50] }),
+				tc("description", stlist([sit("a", "Alpha", "off", { description: "The alpha setting controls things" }), sit("b", "Beta", "on")]), { widths: [50] }),
+				tc("values-cycle", stlist([sit("mode", "Mode", "auto", { values: ["auto", "manual", "off"] })], { onChange: "record" }), {
+					script: [press("\r"), { render: true, width: 50 }, press("\r"), { render: true, width: 50 }],
+				}),
+				tc("move-up-down", stlist([sit("a", "A", "1"), sit("b", "B", "2"), sit("c", "C", "3")]), {
+					script: [press("\u001b[B"), { render: true, width: 40 }, press("\u001b[A"), { render: true, width: 40 }],
+				}),
+				tc("escape-cancel", stlist([sit("a", "A", "1")], { onCancel: "record" }), { script: [press("\u001b")] }),
+				tc("empty", stlist([], { onCancel: "record" }), { widths: [40] }),
+				tc("search-filter", stlist([sit("alpha", "Alpha", "1"), sit("beta", "Beta", "2"), sit("gamma", "Gamma", "3")], { enableSearch: true }), {
+					script: [press("al"), { render: true, width: 40 }, press("z"), { render: true, width: 40 }],
+				}),
+				tc("max-visible-scroll", stlist(Array.from({ length: 6 }, (_, i) => sit("s" + i, "Setting " + i, String(i))), { maxVisible: 2 }), {
+					script: [press("\u001b[B"), press("\u001b[B"), press("\u001b[B"), { render: true, width: 40 }],
+				}),
+			],
+		},
+	},
+	{
+		name: "tui-components/composite",
+		tool: "tui-components",
+		args: {
+			cases: [
+				tc("box-vstack", boxc([stk("v-stack", [ent(txt("Title")), ent(spc(1)), ent(txt("Body text here"))])], 1, 1), { widths: [24] }),
+				tc("box-hstack", boxc([stk("h-stack", [ent(txt("left")), ent(txt("right"))], { gap: 1 })], 1, 1), { widths: [24] }),
+				tc("box-input-static", boxc([stk("v-stack", [ent(txt("Name:")), ent(inp({ placeholder: "type...", focused: true }))])], 1, 1), {
+					script: [press("bob"), { render: true, width: 30 }],
+				}),
+				tc("box-selectlist", boxc([slist([sitem("a", "Alpha"), sitem("b", "Beta")], { onSelect: "record" })], 1, 1), {
+					script: [press("\u001b[B"), press("\r"), { render: true, width: 40 }],
+				}),
+				tc("scroll-vstack", svw(stk("v-stack", [ent(txt("one")), ent(txt("two")), ent(txt("three"))])), {
+					script: [{ scroll: [{ updateLayout: [3, 2] }] }, { render: true, width: 12 }],
+				}),
+			],
+		},
+	},
 ];
+
+// tui-components sub-case builders (hoisted; used by the cases above).
+function tc(name, component, opts = {}) {
+	return {
+		name,
+		component,
+		...(opts.widths ? { widths: opts.widths } : {}),
+		...(opts.script ? { script: opts.script } : {}),
+	};
+}
+function txt(text, px, py, bg) {
+	return {
+		type: "text",
+		text,
+		...(px !== undefined ? { paddingX: px } : {}),
+		...(py !== undefined ? { paddingY: py } : {}),
+		...(bg ? { bg } : {}),
+	};
+}
+function ttxt(text, px, py) {
+	return {
+		type: "truncated-text",
+		text,
+		...(px !== undefined ? { paddingX: px } : {}),
+		...(py !== undefined ? { paddingY: py } : {}),
+	};
+}
+function spc(lines) {
+	return { type: "spacer", ...(lines !== undefined ? { lines } : {}) };
+}
+function boxc(children, px, py, bg) {
+	return {
+		type: "box",
+		children,
+		...(px !== undefined ? { paddingX: px } : {}),
+		...(py !== undefined ? { paddingY: py } : {}),
+		...(bg ? { bg } : {}),
+	};
+}
+function ent(component, o = {}) {
+	return {
+		component,
+		...(o.basis !== undefined ? { basis: o.basis } : {}),
+		...(o.grow !== undefined ? { grow: o.grow } : {}),
+		...(o.shrink !== undefined ? { shrink: o.shrink } : {}),
+		...(o.min !== undefined ? { minSize: o.min } : {}),
+		...(o.max !== undefined ? { maxSize: o.max } : {}),
+		...(o.visible !== undefined ? { visible: o.visible } : {}),
+	};
+}
+function stk(type, entries, o = {}) {
+	return { type, entries, ...(o.gap !== undefined ? { gap: o.gap } : {}), ...(o.align ? { align: o.align } : {}) };
+}
+function inp(o = {}) {
+	return { type: "input", ...o };
+}
+function slist(items, o = {}) {
+	return { type: "select-list", items, ...o };
+}
+function stlist(items, o = {}) {
+	return { type: "settings-list", items, ...o };
+}
+function ld(o = {}) {
+	return { type: "loader", ...o };
+}
+function svw(child, o = {}) {
+	return { type: "scroll-view", child, ...o };
+}
+function mr(child) {
+	return { type: "mouse-region", child, onMouse: "record" };
+}
+function press(...inputs) {
+	return { inputs: [...inputs] };
+}
+function sitem(value, label, description) {
+	return { value, label, ...(description !== undefined ? { description } : {}) };
+}
+function sit(id, label, currentValue, o = {}) {
+	return { id, label, currentValue, ...o };
+}

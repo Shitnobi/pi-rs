@@ -343,6 +343,271 @@ async function runModule(tool, args, cwd) {
 				throw new Error("unknown tui-terminal-colors fn: " + args.fn);
 		}
 	}
+	if (tool === "tui-components") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const tui = await import(pathToFileURL(TUI_SRC + "/tui.ts").href);
+		const load = (name) => import(pathToFileURL(TUI_SRC + "/components/" + name + ".ts").href);
+		const [textMod, ttMod, spacerMod, boxMod, hsMod, vsMod, loaderMod, clMod, mrMod, svMod, inputMod, slMod, stlMod] =
+			await Promise.all([
+				load("text"), load("truncated-text"), load("spacer"), load("box"), load("h-stack"), load("v-stack"),
+				load("loader"), load("cancellable-loader"), load("mouse-region"), load("scroll-view"), load("input"),
+				load("select-list"), load("settings-list"),
+			]);
+		const bgPreset = (preset) => {
+			if (preset === "identity") return (t) => t;
+			if (preset === "bracket") return (t) => `[${t}]`;
+			return undefined;
+		};
+		const stylePreset = () => (t) => t;
+		const serializeMouse = (ev) => ({
+			kind: "mouse",
+			type: ev.type,
+			button: ev.button,
+			x: ev.x,
+			y: ev.y,
+			width: ev.width,
+			height: ev.height,
+			shift: ev.shift,
+			alt: ev.alt,
+			ctrl: ev.ctrl,
+			wheelDelta: ev.wheelDelta ?? null,
+			clickCount: ev.clickCount ?? null,
+		});
+		const serializeItem = (item) =>
+			item ? { value: item.value, label: item.label, description: item.description ?? null } : null;
+		const build = (spec, log) => {
+			switch (spec.type) {
+				case "text":
+					return new textMod.Text(spec.text ?? "", spec.paddingX ?? 1, spec.paddingY ?? 1, bgPreset(spec.bg));
+				case "truncated-text":
+					return new ttMod.TruncatedText(spec.text ?? "", spec.paddingX ?? 0, spec.paddingY ?? 0);
+				case "spacer":
+					return new spacerMod.Spacer(spec.lines ?? 1);
+				case "box": {
+					const box = new boxMod.Box(spec.paddingX ?? 1, spec.paddingY ?? 1, bgPreset(spec.bg));
+					for (const child of spec.children || []) box.addChild(build(child, log));
+					return box;
+				}
+				case "h-stack":
+				case "v-stack": {
+					const children = (spec.entries || []).map((entry) => {
+						const component = build(entry.component, log);
+						const opts = {};
+						if (entry.basis !== undefined) opts.basis = entry.basis;
+						if (entry.grow !== undefined) opts.grow = entry.grow;
+						if (entry.shrink !== undefined) opts.shrink = entry.shrink;
+						if (entry.minSize !== undefined) opts.minSize = entry.minSize;
+						if (entry.maxSize !== undefined) opts.maxSize = entry.maxSize;
+						if (entry.visible !== undefined)
+							opts.visible = entry.visible === "always" ? () => true : () => false;
+						return Object.keys(opts).length ? { component, ...opts } : component;
+					});
+					const options = {};
+					if (spec.gap !== undefined) options.gap = spec.gap;
+					if (spec.align !== undefined) options.align = spec.align;
+					return spec.type === "h-stack"
+						? new hsMod.HStack(children, options)
+						: new vsMod.VStack(children, options);
+				}
+				case "loader":
+					return new loaderMod.Loader(
+						null,
+						stylePreset(),
+						stylePreset(),
+						spec.message ?? "Loading...",
+						spec.frames !== undefined || spec.intervalMs !== undefined
+							? {
+									...(spec.frames !== undefined ? { frames: spec.frames } : {}),
+									...(spec.intervalMs !== undefined ? { intervalMs: spec.intervalMs } : {}),
+								}
+							: undefined,
+					);
+				case "cancellable-loader": {
+					const loader = new clMod.CancellableLoader(
+						null,
+						stylePreset(),
+						stylePreset(),
+						spec.message ?? "Loading...",
+						undefined,
+					);
+					if (spec.onAbort === "record") loader.onAbort = () => log.push({ kind: "abort" });
+					return loader;
+				}
+				case "mouse-region":
+					return new mrMod.MouseRegion(
+						build(spec.child, log),
+						spec.onMouse === "record"
+							? (ev) => {
+									log.push(serializeMouse(ev));
+									return undefined;
+								}
+							: () => undefined,
+					);
+				case "scroll-view":
+					return new svMod.ScrollView(build(spec.child, log), {
+						...(spec.follow !== undefined ? { follow: spec.follow } : {}),
+						...(spec.primary !== undefined ? { primary: spec.primary } : {}),
+					});
+				case "input": {
+					const input = new inputMod.Input({
+						...(spec.prompt !== undefined ? { prompt: spec.prompt } : {}),
+						...(spec.placeholder !== undefined ? { placeholder: spec.placeholder } : {}),
+					});
+					if (spec.focused) input.focused = true;
+					if (spec.onSubmit === "record") input.onSubmit = (value) => log.push({ kind: "submit", value });
+					if (spec.onEscape === "record") input.onEscape = () => log.push({ kind: "escape" });
+					return input;
+				}
+				case "select-list": {
+					const items = (spec.items || []).map((it) => ({
+						value: it.value,
+						label: it.label,
+						...(it.description !== undefined ? { description: it.description } : {}),
+					}));
+					const theme = {
+						selectedPrefix: (t) => t,
+						selectedText: (t) => t,
+						description: (t) => t,
+						scrollInfo: (t) => t,
+						noMatch: (t) => t,
+					};
+					const layout = {};
+					if (spec.layoutOptions) {
+						if (spec.layoutOptions.minPrimaryColumnWidth !== undefined)
+							layout.minPrimaryColumnWidth = spec.layoutOptions.minPrimaryColumnWidth;
+						if (spec.layoutOptions.maxPrimaryColumnWidth !== undefined)
+							layout.maxPrimaryColumnWidth = spec.layoutOptions.maxPrimaryColumnWidth;
+					}
+					const list = new slMod.SelectList(items, spec.maxVisible ?? 5, theme, layout);
+					if (spec.onSelect === "record")
+						list.onSelect = (it) => log.push({ kind: "select", ...serializeItem(it) });
+					if (spec.onCancel === "record") list.onCancel = () => log.push({ kind: "cancel" });
+					if (spec.onSelectionChange === "record")
+						list.onSelectionChange = (it) => log.push({ kind: "selectionChange", ...serializeItem(it) });
+					return list;
+				}
+				case "settings-list": {
+					const items = (spec.items || []).map((it) => {
+						const out = { id: it.id, label: it.label, currentValue: it.currentValue };
+						if (it.description !== undefined) out.description = it.description;
+						if (it.values !== undefined) out.values = it.values;
+						return out;
+					});
+					const theme = {
+						label: (t) => t,
+						value: (t) => t,
+						description: (t) => t,
+						cursor: "> ",
+						hint: (t) => t,
+					};
+					const onChange =
+						spec.onChange === "record"
+							? (id, value) => log.push({ kind: "change", id, value })
+							: () => {};
+					const onCancel =
+						spec.onCancel === "record" ? () => log.push({ kind: "cancel" }) : () => {};
+					return new stlMod.SettingsList(items, spec.maxVisible ?? 5, theme, onChange, onCancel, {
+						enableSearch: spec.enableSearch ?? false,
+					});
+				}
+				default:
+					throw new Error("unknown tui-components type: " + spec.type);
+			}
+		};
+		// Deterministic loader timers: patch setInterval/clearInterval so the
+		// loader's animation callback is stored (never scheduled); a script
+		// "tick" invokes it synchronously — mirroring the Rust harness's
+		// Loader::tick().
+		let intervalFn = null;
+		const origSetInterval = globalThis.setInterval;
+		const origClearInterval = globalThis.clearInterval;
+		globalThis.setInterval = (fn) => {
+			intervalFn = fn;
+			return 2;
+		};
+		globalThis.clearInterval = (id) => {
+			if (id === 2) intervalFn = null;
+		};
+		try {
+			const results = [];
+			for (const c of args.cases || []) {
+				intervalFn = null;
+				const log = [];
+				const component = build(c.component, log);
+				const frames = [];
+				let lastWidth = 40;
+				const doRender = (w) => {
+					lastWidth = w;
+					frames.push({ width: w, lines: component.render(w) });
+				};
+				for (const w of c.widths || []) doRender(w);
+				for (const step of c.script || []) {
+					for (const s of step.inputs || []) {
+						if (component.handleInput) component.handleInput(s);
+					}
+					for (let i = 0; i < (step.ticks || 0); i++) {
+						if (intervalFn) intervalFn();
+					}
+					if (step.setFilter !== undefined && component.setFilter)
+						component.setFilter(step.setFilter);
+					for (const op of step.scroll || []) {
+						if (op.updateLayout) component.updateLayout(op.updateLayout[0], op.updateLayout[1], () => {});
+						if (op.scrollTo !== undefined)
+							component.scrollTo(op.scrollTo, op.disableFollow ? { disableFollow: true } : {});
+						if (op.scrollBy !== undefined) component.scrollBy(op.scrollBy);
+						if (op.scrollToStart) component.scrollToStart();
+						if (op.scrollToEnd) component.scrollToEnd();
+					}
+					if (step.mouse) {
+						const m = step.mouse;
+						const ev = {
+							type: m.type,
+							button: m.button ?? "none",
+							x: m.x,
+							y: m.y,
+							screenX: m.x,
+							screenY: m.y,
+							width: m.width,
+							height: m.height,
+							shift: !!m.shift,
+							alt: !!m.alt,
+							ctrl: !!m.ctrl,
+						};
+						if (m.wheelDelta !== undefined) ev.wheelDelta = m.wheelDelta;
+						if (m.clickCount !== undefined) ev.clickCount = m.clickCount;
+						const res = tui.dispatchMouseEvent(component, ev);
+						log.push({
+							kind: "dispatch",
+							result: res
+								? {
+										handled: res.handled,
+										capture: res.capture ?? null,
+										focus: res.focus ?? null,
+										render: res.render ?? null,
+									}
+								: null,
+						});
+					}
+					if (step.render) doRender(step.width ?? lastWidth);
+				}
+				const state = {};
+				if (c.component.type === "input") state.value = component.getValue();
+				if (c.component.type === "select-list") state.selected = serializeItem(component.getSelectedItem());
+				if (c.component.type === "cancellable-loader") state.aborted = component.aborted;
+				if (c.component.type === "scroll-view") {
+					state.scrollTop = component.scrollTop;
+					state.viewportHeight = component.viewportHeight;
+					state.followingEnd = component.isFollowingEnd;
+				}
+				results.push({ name: c.name, frames, events: log, state });
+			}
+			return { results };
+		} finally {
+			globalThis.setInterval = origSetInterval;
+			globalThis.clearInterval = origClearInterval;
+		}
+	}
 	if (tool === "math") {
 		const buf = new ArrayBuffer(8);
 		const view = new DataView(buf);

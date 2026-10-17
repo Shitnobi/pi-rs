@@ -17,7 +17,9 @@
 //!   resolved synchronously through the seam).
 //! * `AbortSignal` is a simple shared flag (`Rc<Cell<bool>>`), mirroring the
 //!   TS usage sites (only `signal.aborted` is consulted).
-//! * `localeCompare` is approximated with codepoint ordering; `path.join` /
+//! * `localeCompare` is approximated with an en-US-style ICU collation
+//!   (case/diacritic-insensitive primary weights + lowercase-first
+//!   tertiary tiebreak — see [`locale_compare`]); `path.join` /
 //!   `dirname` / `basename` are hand-ported POSIX-js helpers
 //!   ([`js_path_join`], [`js_path_dirname`], [`js_path_basename`]).
 
@@ -63,9 +65,90 @@ fn path_wrapper_closer(c: char) -> Option<char> {
     }
 }
 
-/// Approximation of JS `localeCompare` with codepoint ordering.
+/// Approximation of JS `localeCompare` (node ICU, en-US collation).
+///
+/// Primary pass ignores case and Latin diacritics (with DUCET-style
+/// ligature expansions `ß→ss`, `æ→ae`, `œ→oe`, `þ→th`); ties break
+/// lowercase-before-uppercase (CLDR root tertiary ordering), then by
+/// codepoint. Verified against node for the mixed-case / accented path
+/// names autocomplete sorts (see the `locale_compare` unit test); pure
+/// CJK/ASCII ordering is codepoint order on both sides.
 fn locale_compare(a: &str, b: &str) -> std::cmp::Ordering {
-    a.cmp(b)
+    use std::cmp::Ordering;
+
+    let pa = collation_primary_key(a);
+    let pb = collation_primary_key(b);
+    match pa.cmp(&pb) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    // Tertiary tiebreak on the original characters.
+    for (ca, cb) in a.chars().zip(b.chars()) {
+        if ca == cb {
+            continue;
+        }
+        let same_letter = ca.to_lowercase().eq(cb.to_lowercase());
+        return if same_letter {
+            // Same base letter, different case: lowercase sorts first.
+            if ca.is_lowercase() {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        } else {
+            ca.cmp(&cb)
+        };
+    }
+    a.chars().count().cmp(&b.chars().count())
+}
+
+/// Primary collation weight of one character: base letter, lowercased, with
+/// ligature expansions. Unhandled (non-Latin) characters pass through
+/// case-folded, which is codepoint order for CJK.
+fn collation_primary_char(c: char, out: &mut String) {
+    match c {
+        'ß' | 'ẞ' => out.push_str("ss"),
+        'æ' | 'Æ' => out.push_str("ae"),
+        'œ' | 'Œ' => out.push_str("oe"),
+        'þ' | 'Þ' => out.push_str("th"),
+        'Ĳ' | 'ĳ' => out.push_str("ij"),
+        'đ' | 'Đ' | 'ð' | 'Ð' => out.push('d'),
+        'ø' | 'Ø' => out.push('o'),
+        'ł' | 'Ł' => out.push('l'),
+        'ĸ' => out.push('k'),
+        '\u{C0}'..='\u{C5}' | '\u{E0}'..='\u{E5}' | '\u{100}'..='\u{105}' => out.push('a'),
+        '\u{C7}' | '\u{E7}' | '\u{106}'..='\u{10D}' => out.push('c'),
+        '\u{10E}'..='\u{111}' => out.push('d'),
+        '\u{C8}'..='\u{CB}' | '\u{E8}'..='\u{EB}' | '\u{112}'..='\u{11B}' => out.push('e'),
+        '\u{11C}'..='\u{123}' => out.push('g'),
+        '\u{124}'..='\u{127}' => out.push('h'),
+        '\u{CC}'..='\u{CF}' | '\u{EC}'..='\u{EF}' | '\u{128}'..='\u{131}' => out.push('i'),
+        '\u{134}'..='\u{135}' => out.push('j'),
+        '\u{136}'..='\u{138}' => out.push('k'),
+        '\u{139}'..='\u{142}' => out.push('l'),
+        '\u{D1}' | '\u{F1}' | '\u{143}'..='\u{149}' => out.push('n'),
+        '\u{D2}'..='\u{D6}' | '\u{F2}'..='\u{F6}' | '\u{14C}'..='\u{151}' => out.push('o'),
+        '\u{154}'..='\u{159}' => out.push('r'),
+        '\u{15A}'..='\u{161}' => out.push('s'),
+        '\u{162}'..='\u{167}' => out.push('t'),
+        '\u{D9}'..='\u{DC}' | '\u{F9}'..='\u{FC}' | '\u{168}'..='\u{173}' => out.push('u'),
+        '\u{174}'..='\u{175}' => out.push('w'),
+        '\u{DD}' | '\u{FD}' | '\u{FF}' | '\u{176}'..='\u{178}' => out.push('y'),
+        '\u{179}'..='\u{17E}' => out.push('z'),
+        other => {
+            for lc in other.to_lowercase() {
+                out.push(lc);
+            }
+        }
+    }
+}
+
+fn collation_primary_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        collation_primary_char(c, &mut out);
+    }
+    out
 }
 
 // --- js path helpers (path.join / dirname / basename, POSIX semantics) --------
@@ -1529,67 +1612,81 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     enum FakeKind {
         Dir,
         File,
         Link,
     }
 
-    /// In-memory filesystem fake implementing [`FsSeam`].
+    /// In-memory filesystem fake implementing [`FsSeam`]. Interior-mutable:
+    /// clones share state, mirroring the live filesystem the TS provider
+    /// reads (files created after provider construction must be visible).
     #[derive(Clone)]
     struct FakeFs {
+        state: Rc<RefCell<FakeFsState>>,
+        home: String,
+    }
+
+    struct FakeFsState {
         dirs: BTreeSet<String>,
         files: BTreeSet<String>,
         links: BTreeMap<String, String>,
-        home: String,
     }
 
     impl FakeFs {
         fn new(home: &str) -> Self {
             Self {
-                dirs: BTreeSet::from(["/".to_string()]),
-                files: BTreeSet::new(),
-                links: BTreeMap::new(),
+                state: Rc::new(RefCell::new(FakeFsState {
+                    dirs: BTreeSet::from(["/".to_string()]),
+                    files: BTreeSet::new(),
+                    links: BTreeMap::new(),
+                })),
                 home: home.to_string(),
             }
         }
 
+        /// Insert only the ancestor directories of `path` (not `path`
+        /// itself — a file/link path is not a directory).
         fn add_parents(&mut self, path: &str) {
+            let segs: Vec<&str> = path
+                .trim_start_matches('/')
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut state = self.state.borrow_mut();
             let mut acc = String::new();
-            for seg in path.trim_start_matches('/').split('/') {
-                if seg.is_empty() {
-                    continue;
-                }
+            for seg in &segs[..segs.len().saturating_sub(1)] {
                 acc.push('/');
                 acc.push_str(seg);
-                self.dirs.insert(acc.clone());
+                state.dirs.insert(acc.clone());
             }
         }
 
         fn add_dir(&mut self, path: &str) {
             let c = canon(path);
             self.add_parents(&c);
-            self.dirs.insert(c);
+            self.state.borrow_mut().dirs.insert(c);
         }
 
         fn add_file(&mut self, path: &str) {
             let c = canon(path);
             self.add_parents(&c);
-            self.files.insert(c);
+            self.state.borrow_mut().files.insert(c);
         }
 
         fn add_link(&mut self, link: &str, target: &str) {
             let c = canon(link);
             self.add_parents(&c);
-            self.links.insert(c, target.to_string());
+            self.state.borrow_mut().links.insert(c, target.to_string());
         }
 
         /// Resolve a path through symlinks (bounded against cycles).
         fn follow(&self, path: &str) -> Option<String> {
+            let state = self.state.borrow();
             let mut cur = canon(path);
             for _ in 0..16 {
-                match self.links.get(&cur) {
+                match state.links.get(&cur) {
                     Some(target) => cur = canon(&js_path_join(&js_path_dirname(&cur), target)),
                     None => return Some(cur),
                 }
@@ -1598,18 +1695,19 @@ mod tests {
         }
 
         fn children(&self, dir: &str) -> BTreeMap<String, FakeKind> {
+            let state = self.state.borrow();
             let mut out = BTreeMap::new();
-            for p in &self.dirs {
+            for p in &state.dirs {
                 if js_path_dirname(p) == dir {
                     out.insert(js_path_basename(p), FakeKind::Dir);
                 }
             }
-            for p in &self.files {
+            for p in &state.files {
                 if js_path_dirname(p) == dir {
                     out.insert(js_path_basename(p), FakeKind::File);
                 }
             }
-            for p in self.links.keys() {
+            for p in state.links.keys() {
                 if js_path_dirname(p) == dir {
                     out.insert(js_path_basename(p), FakeKind::Link);
                 }
@@ -1617,11 +1715,19 @@ mod tests {
             out
         }
 
+        fn contains_dir(&self, path: &str) -> bool {
+            self.state.borrow().dirs.contains(path)
+        }
+
+        fn contains_file(&self, path: &str) -> bool {
+            self.state.borrow().files.contains(path)
+        }
+
         /// Emulate `fd`'s walk: all files and dirs under `base` (relative
         /// paths, dirs with a trailing `/`), `.git` excluded, symlinks
         /// followed, depth-limited, children visited in sorted order.
         fn walk(&self, base: &str, max_depth: Option<usize>) -> Vec<String> {
-            let Some(resolved) = self.follow(base).filter(|p| self.dirs.contains(p)) else {
+            let Some(resolved) = self.follow(base).filter(|p| self.contains_dir(p)) else {
                 return vec![];
             };
             let mut out = Vec::new();
@@ -1664,10 +1770,10 @@ mod tests {
                     FakeKind::File => out.push(child_rel),
                     FakeKind::Link => {
                         if let Some(followed) = self.follow(&child_abs) {
-                            if self.dirs.contains(&followed) {
+                            if self.contains_dir(&followed) {
                                 out.push(format!("{}/", child_rel));
                                 self.walk_dir(&followed, &child_rel, max_depth, out, visited);
-                            } else if self.files.contains(&followed) {
+                            } else if self.contains_file(&followed) {
                                 out.push(child_rel);
                             }
                         }
@@ -1681,7 +1787,7 @@ mod tests {
         fn read_dir(&self, path: &str) -> io::Result<Vec<FsDirEntry>> {
             let resolved = self
                 .follow(path)
-                .filter(|p| self.dirs.contains(p))
+                .filter(|p| self.contains_dir(p))
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not found"))?;
             Ok(self
                 .children(&resolved)
@@ -1708,7 +1814,7 @@ mod tests {
 
         fn is_dir(&self, path: &str) -> io::Result<bool> {
             match self.follow(path) {
-                Some(p) => Ok(self.dirs.contains(&p)),
+                Some(p) => Ok(self.contains_dir(&p)),
                 None => Err(io::Error::new(io::ErrorKind::NotFound, "not found")),
             }
         }
@@ -1851,7 +1957,7 @@ mod tests {
             let Some(base) = self
                 .fs
                 .follow(&base_dir)
-                .filter(|p| self.fs.dirs.contains(p))
+                .filter(|p| self.fs.contains_dir(p))
             else {
                 return Ok((1, String::new()));
             };
@@ -2791,5 +2897,44 @@ mod tests {
     fn keeps_fuzzy_skill_prefix_shorthand_working() {
         let items = suggestions_for(skill_commands(), "skbra");
         assert!(items.contains(&"skill:brainstorm".to_string()));
+    }
+
+
+    /// `locale_compare` matches node's en-US `localeCompare` sign on a
+    /// battery of mixed-case / accented / CJK / punctuation pairs (probed
+    /// against node on 2026-10-17; T3 redteam misc-F2 regression test).
+    #[test]
+    fn locale_compare_matches_node_en_us_signs() {
+        // (a, b, expected sign of a.localeCompare(b) in node)
+        let cases: &[(&str, &str, i32)] = &[
+            ("a", "B", -1),
+            ("Apple", "apple", 1),
+            ("x", "X", -1),
+            ("foo.txt", "Foo.TXT", -1),
+            ("é", "z", -1),
+            ("desktop", "Documents", -1),
+            ("README.md", "readme.md", 1),
+            ("Zebra", "apple", 1),
+            ("café", "cafe", 1),
+            ("naïve", "naive", 1),
+            ("Áb", "ac", -1),
+            ("strasbourg", "Straße", -1),
+            ("日本語", "にほんご", 1),
+            ("punctuation!", "punctuation", 1),
+            ("a b", "ab", -1),
+            ("dir/sub", "dir/Sub", -1),
+            ("Ä", "a", 1),
+            ("Ö", "o", 1),
+            ("ü", "u", 1),
+            ("ß", "ss", 1),
+        ];
+        for (a, b, expected) in cases {
+            let sign = match locale_compare(a, b) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            assert_eq!(sign, *expected, "locale_compare({:?}, {:?})", a, b);
+        }
     }
 }

@@ -116,7 +116,11 @@ impl Component for HStack {
             let mut offset: i64 = 0;
             match self.stack.align {
                 // TS: Math.floor((height - lines.length) / 2)
-                StackAlign::Center => offset = ((height - lines.len()) / 2) as i64,
+                // Math.floor((height - lines.length) / 2) (h-stack.ts:40) —
+                // floor semantics via div_euclid.
+                StackAlign::Center => {
+                    offset = (height as i64 - lines.len() as i64).div_euclid(2)
+                }
                 StackAlign::End => offset = height as i64 - lines.len() as i64,
                 StackAlign::Stretch | StackAlign::Start => {}
             }

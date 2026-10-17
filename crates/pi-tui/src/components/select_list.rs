@@ -354,9 +354,12 @@ impl Component for SelectList {
             };
 
             let is_selected = i == self.selected_index;
+            // TS `item.description ? ... : undefined` (select-list.ts:95) —
+            // JS truthiness: an empty-string description is falsy.
             let description_single_line = item
                 .description
                 .as_ref()
+                .filter(|description| !description.is_empty())
                 .map(|description| normalize_to_single_line(description));
             lines.push(self.render_item(
                 item,
@@ -519,6 +522,13 @@ mod tests {
         visible_width(&line[..index])
     }
 
+    /// JS `String.prototype.indexOf` — UTF-16 code-unit index in the raw
+    /// string (ANSI escapes included).
+    fn utf16_index_of(line: &str, text: &str) -> usize {
+        let index = line.find(text).expect("text expected in line");
+        line[..index].encode_utf16().count()
+    }
+
     /// "normalizes multiline descriptions to single line"
     /// (select-list.test.ts:19-33).
     #[test]
@@ -577,8 +587,8 @@ mod tests {
         );
         let rendered = list.render(80);
 
-        assert_eq!(rendered[0].find("first"), Some(14));
-        assert_eq!(rendered[1].find("second"), Some(14));
+        assert_eq!(utf16_index_of(&rendered[0], "first"), 14);
+        assert_eq!(utf16_index_of(&rendered[1], "second"), 14);
     }
 
     /// "uses the configured maximum primary column width"
@@ -653,17 +663,23 @@ mod tests {
             visible_index_of(&rendered[1], "second")
         );
     }
+
+    /// Empty-string description is JS-falsy (select-list.ts:95
+    /// `item.description ?`) — the plain render branch is used, no
+    /// description column. T3 redteam lists-F1 regression test.
+    #[test]
+    fn empty_description_is_falsy_and_renders_the_plain_branch() {
+        let items = vec![SelectItem::new("x".repeat(40), "x".repeat(40))
+            .with_description("")];
+
+        let mut list = SelectList::new(items, 5, test_theme());
+        let rendered = list.render(80);
+
+        assert_eq!(rendered.len(), 1);
+        // Plain branch: marker + label truncated to width - 4, no ANSI
+        // reset/description padding.
+        assert_eq!(rendered[0], format!("→ {}", "x".repeat(40)));
+        assert!(!rendered[0].contains("\x1b"));
+    }
 }
-#[test]
-fn dbg_min_width() {
-    use crate::components::select_list::*;
-    let items = vec![
-        SelectItem::new("a", "a").with_description("first"),
-        SelectItem::new("bb", "bb").with_description("second"),
-    ];
-    let mut list = SelectList::with_layout(items, 5, SelectListTheme::default(),
-        SelectListLayoutOptions { min_primary_column_width: Some(12), max_primary_column_width: Some(20), ..Default::default() });
-    let rendered = list.render(80);
-    eprintln!("row0: {:?}", rendered[0]);
-    eprintln!("row1: {:?}", rendered[1]);
-}
+

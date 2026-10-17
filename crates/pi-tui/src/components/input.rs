@@ -651,7 +651,7 @@ impl Component for Input {
             return vec![format!("{}{text_with_cursor}{padding}", self.prompt)];
         }
 
-        let mut visible_text;
+        let visible_text;
         let mut cursor_display = self.cursor;
         self.rendered_start_column = 0;
         let total_width = visible_width(&self.value);

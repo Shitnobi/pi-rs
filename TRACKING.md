@@ -180,8 +180,9 @@ Remaining, roughly in dependency order:
 | G8 | async | `NestedToolCallRunner` (drives the agent tool pipeline) and `file-mutation-queue.ts` (global registration queue + per-realpath mutation queues) need an async runtime and the agent session layer; deferred with the agent-loop tranche. `NestedCallRecorder` — the persisted half — is ported | 3+ |
 ## Parity suite status
 
-- 434/434 cases pass (stable across repeated runs)
-- 509 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
+- 447/447 cases pass (stable across repeated runs; includes the
+  `tui-components` render-line differential group added in TUI tranche 3)
+- 757 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
   plus fuzz corpora: ansi 2010 cases, decoder 800 cases, pi-photon
   byte-parity, segmenter corpus 1208 cases)
 - `cargo clippy --all-targets` clean
@@ -347,3 +348,52 @@ Remaining, roughly in dependency order:
   trajectory artifacts of comparing cold Rust vs warm live — the Rust port
   was already bit-exact (verified against true-fresh live ICU and the
   prototype on minimal repros).
+
+- TUI tranche 3 (layout + components): COMPLETE. Foundation
+  `component.rs` (~800 lines: `Component` trait,
+  `ComponentRef = Rc<RefCell<dyn Component>>`, mouse types with i64
+  numerics and `Option<bool>` JS-truthiness flags,
+  `ComponentMouseResult::{Result, Forwarded}` ≡ TS `"target" in result`,
+  `dispatch_mouse_event`/`retarget_mouse_event`, `Container`, `Focusable`,
+  `CURSOR_MARKER`/fake-cursor/composite_tui_line) and `layout_node.rs`,
+  then `layout.rs` (~2150 lines: full flex solver, LayoutBox tree,
+  scrollbar painting, kitty-image crop w/ [T6] markers, hit-testing) and
+  all 15 components: stack/h-stack/v-stack (API contract
+  `visible_stack_entries`/`allocate_stack_sizes`), text, truncated-text,
+  spacer, box, loader (timer → deadline + `tick()`), cancellable-loader,
+  mouse-region, scroll-view (~1330 lines), input (~1450 lines),
+  select-list, settings-list, autocomplete (~2900 lines with injectable
+  FsSeam/CommandRunner seams). Validation: 584 pi-tui tests (583 pass,
+  1 ignored), 757 workspace tests, and a new `tui-components` parity
+  group (13 cases / ~128 sub-cases: render-line differential at multiple
+  widths for every component, stateful scripts — input key sequences,
+  select movement, loader ticks, mouse records — with identical
+  theme/callback presets on both sides) — 447/447 parity. Fleet-built
+  (parallel builders + redteams; reports in /tmp/report-*.md). Notable
+  fixes en route: (a) the 6 wind-down test failures were all
+  test-harness bugs, not engine bugs — the FakeFs must be
+  interior-mutable with clones sharing state (TS reads a live
+  filesystem, so files created after provider construction must be
+  visible), `add_parents` must not register file/link paths as
+  directories (a symlink-to-file then got a spurious trailing `/` in the
+  emulated fd output), and one select-list test measured byte indices
+  where TS `indexOf` returns UTF-16 code units; (b) redteam findings
+  fixed: `Container::handles_input()` must be `false` (TS `Container`
+  defines no `handleInput`, so it never steals keyboard focus from a
+  focusable child — tui.ts:397), `locale_compare` upgraded from raw
+  codepoint ordering to an en-US ICU approximation (case/diacritic-
+  insensitive primary weights with ligature expansions +
+  lowercase-first tertiary tiebreak; sign-verified against node on a
+  20-pair battery), SelectList/SettingsList empty-string description
+  JS-truthiness ("" is falsy → no description column/block), and
+  SettingsList `select_item` must position within the FILTERED list
+  (TS `findIndex` over `filteredItems`), not by item index; (c) layout
+  tidy-ups: primary scroll-view tracking skips unregistered views
+  instead of clobbering with `None`, h-stack center offset uses
+  `div_euclid` (Math.floor semantics). Documented divergences (all
+  unreachable via public APIs): `distribute()` floors fractional
+  grow/shrink capacities (Stack normalizes sizes to integers),
+  MAX_SAFE_INTEGER stand-in `i64::MAX/2`, `LayoutBox.parent` is
+  write-only upstream, autocomplete `cursor_col` uses char (Unicode
+  scalar) indices vs TS UTF-16 code units (no astral-plane engine input
+  identified).

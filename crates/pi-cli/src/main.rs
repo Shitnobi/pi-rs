@@ -108,6 +108,7 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
         "tui-terminal-colors" => return run_tui_terminal_colors_harness(&input),
         "tui-keys" => return run_tui_keys_harness(&input),
         "tui-stdin-buffer" => return run_tui_stdin_buffer_harness(&input),
+        "tui-components" => return run_tui_components_harness(&input),
         "math" => return run_math_harness(&input),
         _ => {}
     }
@@ -1344,4 +1345,613 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         i += 4;
     }
     Some(out)
+}
+
+/// `tui-components` module-level harness entry: differential render-line
+/// testing of the TUI components (mirrored on the TS side by ts-harness.js).
+///
+/// Input: `{ cases: [{ name, component: <spec tree>, widths?: [n],
+/// script?: [{ inputs?: [str], ticks?: n, setFilter?: str,
+/// scroll?: [{updateLayout?, scrollTo?, scrollBy?, scrollToStart?,
+/// scrollToEnd?, disableFollow?}], mouse?: {...}, render?: bool,
+/// width?: n }] }] }`.
+///
+/// Each sub-case builds the SAME component tree on both sides (specs are
+/// JSON; function-valued params are named presets mapped identically by
+/// both harnesses — style presets "identity"/"bracket", callback preset
+/// "record" whose events land in the compared event log), renders it at
+/// the given widths, optionally runs a scripted input/tick/scroll/mouse
+/// sequence with re-renders, and outputs the rendered lines, the recorder
+/// event log, and component state. Loader animation ticks call the clock
+/// seam (`Loader::tick`) exactly as often as the TS harness invokes the
+/// captured setInterval callback.
+fn run_tui_components_harness(input: &Value) -> Result<Value, String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use pi_tui::component::{
+        dispatch_mouse_event, ComponentRef, Focusable, TuiMouseButton, TuiMouseEvent,
+        TuiMouseEventResult, TuiMouseEventType,
+    };
+    use pi_tui::components::box_component::TuiBox;
+    use pi_tui::components::cancellable_loader::CancellableLoader;
+    use pi_tui::components::h_stack::HStack;
+    use pi_tui::components::input::{Input, InputOptions};
+    use pi_tui::components::loader::{Loader, LoaderIndicatorOptions};
+    use pi_tui::components::mouse_region::MouseRegion;
+    use pi_tui::components::scroll_view::{
+        ScrollView, ScrollViewFollow, ScrollViewOptions, ScrollViewScrollToOptions,
+    };
+    use pi_tui::components::select_list::{
+        SelectItem, SelectList, SelectListLayoutOptions, SelectListTheme,
+    };
+    use pi_tui::components::settings_list::{
+        SettingItem, SettingsList, SettingsListOptions, SettingsListTheme,
+    };
+    use pi_tui::components::spacer::Spacer;
+    use pi_tui::components::stack::{StackChild, StackEntryOptions, StackOptions};
+    use pi_tui::components::text::{CustomBgFn, Text};
+    use pi_tui::components::truncated_text::TruncatedText;
+    use pi_tui::components::v_stack::VStack;
+    use pi_tui::layout_node::{Basis, LayoutViewport, StackAlign};
+
+    type Log = Rc<RefCell<Vec<Value>>>;
+
+    /// A built sub-case component: the `ComponentRef` handle plus the typed
+    /// handles the script steps need (input/scroll/tick/state accessors).
+    enum Built {
+        Plain(ComponentRef),
+        Input(Rc<RefCell<Input>>),
+        Select(Rc<RefCell<SelectList>>),
+        Scroll(Rc<RefCell<ScrollView>>),
+        Loader(Rc<RefCell<Loader>>),
+        CancelLoader(Rc<RefCell<CancellableLoader>>),
+    }
+
+    impl Built {
+        fn comp(&self) -> ComponentRef {
+            match self {
+                Built::Plain(c) => Rc::clone(c),
+                Built::Input(c) => {
+                    let erased: ComponentRef = c.clone();
+                    erased
+                }
+                Built::Select(c) => {
+                    let erased: ComponentRef = c.clone();
+                    erased
+                }
+                Built::Scroll(c) => {
+                    let erased: ComponentRef = c.clone();
+                    erased
+                }
+                Built::Loader(c) => {
+                    let erased: ComponentRef = c.clone();
+                    erased
+                }
+                Built::CancelLoader(c) => {
+                    let erased: ComponentRef = c.clone();
+                    erased
+                }
+            }
+        }
+    }
+
+    fn bg_preset(preset: Option<&str>) -> Option<CustomBgFn> {
+        match preset {
+            Some("identity") => Some(Box::new(|t: &str| t.to_string())),
+            Some("bracket") => Some(Box::new(|t: &str| format!("[{}]", t))),
+            _ => None,
+        }
+    }
+
+    fn style_preset() -> Box<dyn Fn(&str) -> String> {
+        Box::new(|t: &str| t.to_string())
+    }
+
+    fn mouse_event_json(ev: &TuiMouseEvent) -> Value {
+        serde_json::json!({
+            "kind": "mouse",
+            "type": ev.event_type.as_str(),
+            "button": ev.button.as_str(),
+            "x": ev.x,
+            "y": ev.y,
+            "width": ev.width,
+            "height": ev.height,
+            "shift": ev.shift,
+            "alt": ev.alt,
+            "ctrl": ev.ctrl,
+            "wheelDelta": ev.wheel_delta,
+            "clickCount": ev.click_count,
+        })
+    }
+
+    fn item_event_json(kind: &str, item: &SelectItem) -> Value {
+        serde_json::json!({
+            "kind": kind,
+            "value": item.value,
+            "label": item.label,
+            "description": item.description,
+        })
+    }
+
+    fn build(spec: &Value, log: &Log) -> Result<Built, String> {
+        let type_ = spec["type"].as_str().ok_or("missing component type")?;
+        let num = |key: &str, default: u64| -> u64 {
+            spec[key]
+                .as_f64()
+                .map(|f| f.max(0.0) as u64)
+                .unwrap_or(default)
+        };
+        match type_ {
+            "text" => Ok(Built::Plain(Rc::new(RefCell::new(Text::new(
+                spec["text"].as_str().unwrap_or(""),
+                num("paddingX", 1) as usize,
+                num("paddingY", 1) as usize,
+                bg_preset(spec["bg"].as_str()),
+            ))))),
+            "truncated-text" => Ok(Built::Plain(Rc::new(RefCell::new(
+                TruncatedText::new(
+                    spec["text"].as_str().unwrap_or(""),
+                    num("paddingX", 0) as usize,
+                    num("paddingY", 0) as usize,
+                ),
+            )))),
+            "spacer" => Ok(Built::Plain(Rc::new(RefCell::new(Spacer::new(
+                num("lines", 1) as usize,
+            ))))),
+            "box" => {
+                let mut box_ = TuiBox::new(
+                    num("paddingX", 1) as usize,
+                    num("paddingY", 1) as usize,
+                    bg_preset(spec["bg"].as_str()),
+                );
+                let empty: Vec<Value> = Vec::new();
+                for child in spec["children"].as_array().unwrap_or(&empty) {
+                    box_.add_child(build(child, log)?.comp());
+                }
+                Ok(Built::Plain(Rc::new(RefCell::new(box_))))
+            }
+            "h-stack" | "v-stack" => {
+                let mut children: Vec<StackChild> = Vec::new();
+                let empty: Vec<Value> = Vec::new();
+                for entry in spec["entries"].as_array().unwrap_or(&empty) {
+                    let component = build(&entry["component"], log)?.comp();
+                    let mut options = StackEntryOptions::default();
+                    if entry["basis"].as_str() == Some("auto") {
+                        options.basis = Some(Basis::Auto);
+                    } else if let Some(b) = entry["basis"].as_f64() {
+                        options.basis = Some(Basis::Points(b));
+                    }
+                    if let Some(g) = entry["grow"].as_f64() {
+                        options.grow = Some(g);
+                    }
+                    if let Some(s) = entry["shrink"].as_f64() {
+                        options.shrink = Some(s);
+                    }
+                    if let Some(m) = entry["minSize"].as_f64() {
+                        options.min_size = Some(m);
+                    }
+                    if let Some(m) = entry["maxSize"].as_f64() {
+                        options.max_size = Some(m);
+                    }
+                    match entry["visible"].as_str() {
+                        Some("always") => {
+                            options.visible = Some(Rc::new(|_vp: &LayoutViewport| true));
+                        }
+                        Some("never") => {
+                            options.visible = Some(Rc::new(|_vp: &LayoutViewport| false));
+                        }
+                        _ => {}
+                    }
+                    children.push(StackChild::Entry { component, options });
+                }
+                let mut stack_options = StackOptions::default();
+                if let Some(g) = spec["gap"].as_f64() {
+                    stack_options.gap = Some(g);
+                }
+                if let Some(a) = spec["align"].as_str() {
+                    stack_options.align = Some(match a {
+                        "start" => StackAlign::Start,
+                        "center" => StackAlign::Center,
+                        "end" => StackAlign::End,
+                        _ => StackAlign::Stretch,
+                    });
+                }
+                let comp: ComponentRef = if type_ == "h-stack" {
+                    Rc::new(RefCell::new(HStack::new(children, stack_options)))
+                } else {
+                    Rc::new(RefCell::new(VStack::new(children, stack_options)))
+                };
+                Ok(Built::Plain(comp))
+            }
+            "loader" => {
+                let indicator =
+                    if spec.get("frames").is_some() || spec.get("intervalMs").is_some() {
+                        Some(LoaderIndicatorOptions {
+                            frames: spec["frames"].as_array().map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            }),
+                            interval_ms: spec["intervalMs"].as_u64(),
+                        })
+                    } else {
+                        None
+                    };
+                Ok(Built::Loader(Rc::new(RefCell::new(Loader::new(
+                    None,
+                    style_preset(),
+                    style_preset(),
+                    spec["message"].as_str().unwrap_or("Loading..."),
+                    indicator,
+                )))))
+            }
+            "cancellable-loader" => {
+                let loader = Rc::new(RefCell::new(CancellableLoader::new(
+                    None,
+                    style_preset(),
+                    style_preset(),
+                    spec["message"].as_str().unwrap_or("Loading..."),
+                    None,
+                )));
+                if spec["onAbort"].as_str() == Some("record") {
+                    let log2 = Rc::clone(log);
+                    loader.borrow_mut().on_abort = Some(Box::new(move || {
+                        log2.borrow_mut().push(serde_json::json!({ "kind": "abort" }));
+                    }));
+                }
+                Ok(Built::CancelLoader(loader))
+            }
+            "mouse-region" => {
+                let child = build(&spec["child"], log)?.comp();
+                let log2 = Rc::clone(log);
+                let handler = Box::new(move |ev: &TuiMouseEvent| -> Option<TuiMouseEventResult> {
+                    log2.borrow_mut().push(mouse_event_json(ev));
+                    None
+                });
+                Ok(Built::Plain(Rc::new(RefCell::new(MouseRegion::new(
+                    child, handler,
+                )))))
+            }
+            "scroll-view" => {
+                let mut options = ScrollViewOptions::default();
+                match spec["follow"].as_str() {
+                    Some("end") => options.follow = Some(ScrollViewFollow::End),
+                    Some("none") => options.follow = Some(ScrollViewFollow::None),
+                    _ => {}
+                }
+                if let Some(p) = spec["primary"].as_bool() {
+                    options.primary = p;
+                }
+                Ok(Built::Scroll(Rc::new(RefCell::new(ScrollView::new(
+                    build(&spec["child"], log)?.comp(),
+                    options,
+                )))))
+            }
+            "input" => {
+                let mut options = InputOptions::default();
+                if let Some(p) = spec["prompt"].as_str() {
+                    options.prompt = Some(p.to_string());
+                }
+                if let Some(p) = spec["placeholder"].as_str() {
+                    options.placeholder = Some(p.to_string());
+                }
+                let input = Rc::new(RefCell::new(Input::with_options(options)));
+                if spec["focused"].as_bool().unwrap_or(false) {
+                    input.borrow_mut().set_focused(true);
+                }
+                if spec["onSubmit"].as_str() == Some("record") {
+                    let log2 = Rc::clone(log);
+                    input.borrow_mut().on_submit = Some(Box::new(move |value: &str| {
+                        log2.borrow_mut().push(
+                            serde_json::json!({ "kind": "submit", "value": value }),
+                        );
+                    }));
+                }
+                if spec["onEscape"].as_str() == Some("record") {
+                    let log2 = Rc::clone(log);
+                    input.borrow_mut().on_escape = Some(Box::new(move || {
+                        log2.borrow_mut().push(serde_json::json!({ "kind": "escape" }));
+                    }));
+                }
+                Ok(Built::Input(input))
+            }
+            "select-list" => {
+                let mut items: Vec<SelectItem> = Vec::new();
+                let empty: Vec<Value> = Vec::new();
+                for item in spec["items"].as_array().unwrap_or(&empty) {
+                    let mut si = SelectItem::new(
+                        item["value"].as_str().unwrap_or(""),
+                        item["label"].as_str().unwrap_or(""),
+                    );
+                    if let Some(d) = item["description"].as_str() {
+                        si = si.with_description(d);
+                    }
+                    items.push(si);
+                }
+                let mut layout = SelectListLayoutOptions::default();
+                if let Some(lo) = spec["layoutOptions"].as_object() {
+                    layout.min_primary_column_width = lo
+                        .get("minPrimaryColumnWidth")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as usize);
+                    layout.max_primary_column_width = lo
+                        .get("maxPrimaryColumnWidth")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as usize);
+                }
+                let list = Rc::new(RefCell::new(SelectList::with_layout(
+                    items,
+                    num("maxVisible", 5) as usize,
+                    SelectListTheme::default(),
+                    layout,
+                )));
+                if spec["onSelect"].as_str() == Some("record") {
+                    let log2 = Rc::clone(log);
+                    list.borrow_mut().on_select = Some(Box::new(move |item: &SelectItem| {
+                        log2.borrow_mut().push(item_event_json("select", item));
+                    }));
+                }
+                if spec["onCancel"].as_str() == Some("record") {
+                    let log2 = Rc::clone(log);
+                    list.borrow_mut().on_cancel = Some(Box::new(move || {
+                        log2.borrow_mut().push(serde_json::json!({ "kind": "cancel" }));
+                    }));
+                }
+                if spec["onSelectionChange"].as_str() == Some("record") {
+                    let log2 = Rc::clone(log);
+                    list.borrow_mut().on_selection_change =
+                        Some(Box::new(move |item: &SelectItem| {
+                            log2.borrow_mut().push(item_event_json("selectionChange", item));
+                        }));
+                }
+                Ok(Built::Select(list))
+            }
+            "settings-list" => {
+                let mut items: Vec<SettingItem> = Vec::new();
+                let empty: Vec<Value> = Vec::new();
+                for item in spec["items"].as_array().unwrap_or(&empty) {
+                    let mut si = SettingItem::new(
+                        item["id"].as_str().unwrap_or(""),
+                        item["label"].as_str().unwrap_or(""),
+                        item["currentValue"].as_str().unwrap_or(""),
+                    );
+                    if let Some(d) = item["description"].as_str() {
+                        si = si.with_description(d);
+                    }
+                    if let Some(values) = item["values"].as_array() {
+                        si = si.with_values(
+                            values
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect(),
+                        );
+                    }
+                    items.push(si);
+                }
+                let log_change = Rc::clone(log);
+                let on_change: Box<dyn Fn(&str, &str)> =
+                    if spec["onChange"].as_str() == Some("record") {
+                        Box::new(move |id: &str, value: &str| {
+                            log_change.borrow_mut().push(
+                                serde_json::json!({ "kind": "change", "id": id, "value": value }),
+                            );
+                        })
+                    } else {
+                        Box::new(|_, _| {})
+                    };
+                let log_cancel = Rc::clone(log);
+                let on_cancel: Box<dyn Fn()> = if spec["onCancel"].as_str() == Some("record") {
+                    Box::new(move || {
+                        log_cancel
+                            .borrow_mut()
+                            .push(serde_json::json!({ "kind": "cancel" }));
+                    })
+                } else {
+                    Box::new(|| {})
+                };
+                let mut options = SettingsListOptions::default();
+                options.enable_search = Some(spec["enableSearch"].as_bool().unwrap_or(false));
+                Ok(Built::Plain(Rc::new(RefCell::new(
+                    SettingsList::with_options(
+                        items,
+                        num("maxVisible", 5) as usize,
+                        SettingsListTheme::default(),
+                        on_change,
+                        on_cancel,
+                        options,
+                    ),
+                ))))
+            }
+            other => return Err(format!("unknown tui-components type: {}", other)),
+        }
+    }
+
+    let cases = input["cases"].as_array().ok_or("missing cases array")?;
+    let mut results = Vec::new();
+    for case in cases {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let built = build(&case["component"], &log)?;
+        let comp = built.comp();
+        let mut frames: Vec<Value> = Vec::new();
+        let mut last_width: usize = 40;
+        {
+            let empty: Vec<Value> = Vec::new();
+            for w in case["widths"].as_array().unwrap_or(&empty) {
+                let width = w.as_u64().unwrap_or(40) as usize;
+                last_width = width;
+                let lines = comp.borrow_mut().render(width);
+                frames.push(serde_json::json!({ "width": width, "lines": lines }));
+            }
+        }
+        {
+            let empty: Vec<Value> = Vec::new();
+            for step in case["script"].as_array().unwrap_or(&empty) {
+                {
+                    let empty: Vec<Value> = Vec::new();
+                    for s in step["inputs"].as_array().unwrap_or(&empty) {
+                        let data = s.as_str().unwrap_or("");
+                        if comp.borrow().handles_input() {
+                            comp.borrow_mut().handle_input(data);
+                        }
+                    }
+                }
+                for _ in 0..step["ticks"].as_u64().unwrap_or(0) {
+                    match &built {
+                        Built::Loader(loader) => loader.borrow_mut().tick(),
+                        Built::CancelLoader(loader) => loader.borrow_mut().tick(),
+                        _ => {}
+                    }
+                }
+                if let Some(filter) = step["setFilter"].as_str() {
+                    if let Built::Select(list) = &built {
+                        list.borrow_mut().set_filter(filter);
+                    }
+                }
+                {
+                    let empty: Vec<Value> = Vec::new();
+                    for op in step["scroll"].as_array().unwrap_or(&empty) {
+                        if let Built::Scroll(view) = &built {
+                            let sv = view.borrow_mut();
+                            if let Some(ul) = op["updateLayout"].as_array() {
+                                let ch = ul.get(0).and_then(Value::as_i64).unwrap_or(0);
+                                let vh = ul.get(1).and_then(Value::as_i64).unwrap_or(0);
+                                let mut noop = || {};
+                                sv.update_layout(ch, vh, &mut noop);
+                            }
+                            if let Some(n) = op["scrollTo"].as_i64() {
+                                sv.scroll_to(
+                                    n,
+                                    ScrollViewScrollToOptions {
+                                        disable_follow: op["disableFollow"]
+                                            .as_bool()
+                                            .unwrap_or(false),
+                                    },
+                                );
+                            }
+                            if let Some(n) = op["scrollBy"].as_i64() {
+                                sv.scroll_by(n);
+                            }
+                            if op["scrollToStart"].as_bool().unwrap_or(false) {
+                                sv.scroll_to_start();
+                            }
+                            if op["scrollToEnd"].as_bool().unwrap_or(false) {
+                                sv.scroll_to_end();
+                            }
+                        }
+                    }
+                }
+                if let Some(m) = step["mouse"].as_object() {
+                    let event_type = match m.get("type").and_then(Value::as_str) {
+                        Some("release") => TuiMouseEventType::Release,
+                        Some("move") => TuiMouseEventType::Move,
+                        Some("drag") => TuiMouseEventType::Drag,
+                        Some("click") => TuiMouseEventType::Click,
+                        Some("wheel") => TuiMouseEventType::Wheel,
+                        _ => TuiMouseEventType::Press,
+                    };
+                    let button = match m.get("button").and_then(Value::as_str) {
+                        Some("left") => TuiMouseButton::Left,
+                        Some("middle") => TuiMouseButton::Middle,
+                        Some("right") => TuiMouseButton::Right,
+                        _ => TuiMouseButton::None,
+                    };
+                    let x = m.get("x").and_then(Value::as_i64).unwrap_or(0);
+                    let y = m.get("y").and_then(Value::as_i64).unwrap_or(0);
+                    let width = m.get("width").and_then(Value::as_i64).unwrap_or(0);
+                    let height = m.get("height").and_then(Value::as_i64).unwrap_or(0);
+                    let event = TuiMouseEvent {
+                        event_type,
+                        button,
+                        x,
+                        y,
+                        screen_x: x,
+                        screen_y: y,
+                        width,
+                        height,
+                        shift: m.get("shift").and_then(Value::as_bool).unwrap_or(false),
+                        alt: m.get("alt").and_then(Value::as_bool).unwrap_or(false),
+                        ctrl: m.get("ctrl").and_then(Value::as_bool).unwrap_or(false),
+                        wheel_delta: m.get("wheelDelta").and_then(Value::as_i64),
+                        click_count: m.get("clickCount").and_then(Value::as_i64),
+                    };
+                    let result = match dispatch_mouse_event(&comp, &event) {
+                        None => Value::Null,
+                        Some(r) => serde_json::json!({
+                            "handled": r.handled,
+                            "capture": r.capture,
+                            "focus": r.focus,
+                            "render": r.render,
+                        }),
+                    };
+                    log.borrow_mut()
+                        .push(serde_json::json!({ "kind": "dispatch", "result": result }));
+                }
+                if step["render"].as_bool().unwrap_or(false) {
+                    let width = step["width"]
+                        .as_u64()
+                        .map(|w| w as usize)
+                        .unwrap_or(last_width);
+                    last_width = width;
+                    let lines = comp.borrow_mut().render(width);
+                    frames.push(serde_json::json!({ "width": width, "lines": lines }));
+                }
+            }
+        }
+        let mut state = serde_json::Map::new();
+        match case["component"]["type"].as_str() {
+            Some("input") => {
+                if let Built::Input(input) = &built {
+                    state.insert(
+                        "value".to_string(),
+                        serde_json::json!(input.borrow().get_value()),
+                    );
+                }
+            }
+            Some("select-list") => {
+                if let Built::Select(list) = &built {
+                    let selected = list.borrow().get_selected_item().map(|item| {
+                        serde_json::json!({
+                            "value": item.value,
+                            "label": item.label,
+                            "description": item.description,
+                        })
+                    });
+                    state.insert("selected".to_string(), selected.unwrap_or(Value::Null));
+                }
+            }
+            Some("cancellable-loader") => {
+                if let Built::CancelLoader(loader) = &built {
+                    state.insert(
+                        "aborted".to_string(),
+                        serde_json::json!(loader.borrow().aborted()),
+                    );
+                }
+            }
+            Some("scroll-view") => {
+                if let Built::Scroll(view) = &built {
+                    state.insert(
+                        "scrollTop".to_string(),
+                        serde_json::json!(view.borrow().scroll_top()),
+                    );
+                    state.insert(
+                        "viewportHeight".to_string(),
+                        serde_json::json!(view.borrow().viewport_height()),
+                    );
+                    state.insert(
+                        "followingEnd".to_string(),
+                        serde_json::json!(view.borrow().is_following_end()),
+                    );
+                }
+            }
+            _ => {}
+        }
+        results.push(serde_json::json!({
+            "name": case["name"].as_str().unwrap_or(""),
+            "frames": frames,
+            "events": Value::Array(std::mem::take(&mut *log.borrow_mut())),
+            "state": Value::Object(state),
+        }));
+    }
+    Ok(serde_json::json!({ "results": results }))
 }

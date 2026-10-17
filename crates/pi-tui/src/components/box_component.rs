@@ -12,7 +12,6 @@
 //!   objects every frame, so the cache check is a cheap identity comparison")
 //!   becomes a value comparison of the child lines — semantically identical.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::component::{
@@ -261,6 +260,7 @@ mod tests {
     use crate::component::TuiMouseEventResult;
     use crate::components::text::Text;
     use std::cell::Cell;
+    use std::cell::RefCell;
 
     /// Leaf component that records renders, invalidations, and mouse hits.
     struct Probe {
