@@ -5,10 +5,14 @@
 //! original TypeScript implementation; see `docs/TUI_PORT_PLAN.md`.
 
 pub mod colors;
+pub mod component;
+pub mod components;
 pub mod fdlibm;
 pub mod fuzzy;
 pub mod keys;
 pub mod keybindings;
+pub mod layout;
+pub mod layout_node;
 pub mod kill_ring;
 pub mod native_modifiers;
 pub mod native_module_path;
