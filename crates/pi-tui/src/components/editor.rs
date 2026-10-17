@@ -387,10 +387,6 @@ pub struct Editor {
     pub(crate) autocomplete_state: Option<AutocompleteMode>,
     pub(crate) autocomplete_prefix: String,
     pub(crate) autocomplete_max_visible: usize,
-    /// TS `autocompleteAbort` (AbortController) — the abort flag of the
-    /// in-flight request. [T4-D1b] owns the pipeline; the flag models
-    /// `controller.signal.aborted`.
-    pub(crate) autocomplete_aborted: bool,
     /// TS `autocompleteRequestTask` promise chain — modeled as an explicit
     /// pending-request queue owned by [T4-D1b].
     pub(crate) autocomplete_request_pending: Vec<PendingAutocompleteRequest>,
@@ -481,7 +477,6 @@ impl Editor {
             autocomplete_state: None,
             autocomplete_prefix: String::new(),
             autocomplete_max_visible,
-            autocomplete_aborted: false,
             autocomplete_request_pending: Vec::new(),
             autocomplete_debounce_timer: None,
             autocomplete_start_token: 0,
@@ -751,14 +746,18 @@ impl Editor {
         }
     }
 
-    /// `cancelAutocompleteRequest()` (editor.ts:2444-2452).
+    /// `cancelAutocompleteRequest()` (editor.ts:2444-2452): bump the
+    /// token, clear the armed debounce timer and the queued requests,
+    /// then ABORT the in-flight continuation (`this.autocompleteAbort?
+    /// .abort()` + `= undefined`). Aborting at cancel time (not lazily at
+    /// the next request start) is observable: the provider's captured
+    /// `AbortSignal` reads aborted immediately, and a later flush can
+    /// never resurrect a cancelled request (redteam R3 finding #1/#2).
     pub(crate) fn cancel_autocomplete_request(&mut self) {
         self.autocomplete_start_token += 1;
         self.autocomplete_debounce_timer = None;
         self.autocomplete_request_pending.clear();
-        if self.autocomplete_aborted {
-            self.autocomplete_aborted = false;
-        }
+        self.abort_in_flight_autocomplete();
     }
 
     /// `clearAutocompleteUi()` (editor.ts:2454-2458).

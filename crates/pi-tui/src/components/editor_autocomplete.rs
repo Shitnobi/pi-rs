@@ -27,6 +27,7 @@
 //! reset the slots through their editor factory.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::components::autocomplete::{
@@ -45,9 +46,6 @@ use super::editor::{
 /// (editor.ts:2391-2396) plus the `autocompleteAbort` controller
 /// (editor.ts:2333-2334).
 struct AutocompleteContinuation {
-    /// Identity of the owning editor — guards the thread-local slot
-    /// against cross-editor leakage when tests run in parallel threads.
-    editor_id: usize,
     request_id: u64,
     snapshot_text: String,
     snapshot_line: usize,
@@ -63,14 +61,21 @@ struct AutocompleteContinuation {
 }
 
 thread_local! {
-    /// `this.autocompleteRequestTask` (the latest suspended continuation).
-    /// At most one slot: every new request first cancels the previous one
-    /// (editor.ts:2294), so older continuations are always stale.
-    static IN_FLIGHT: RefCell<Option<AutocompleteContinuation>> = RefCell::new(None);
-    /// Accumulated mock-timer time for the currently armed debounce timer:
-    /// `(editor_id, armed start_token, elapsed ms)`. Re-arming (a new
-    /// start token) resets the accumulation, like a fresh `setTimeout`.
-    static DEBOUNCE_ELAPSED: RefCell<(usize, u64, u64)> = RefCell::new((0, 0, 0));
+    /// `this.autocompleteRequestTask` (the latest suspended continuation)
+    /// — **per editor instance**, exactly like the TS per-instance field
+    /// (editor.ts:2324-2341): each editor's promise chain runs
+    /// independently, so the slot is keyed by editor identity. Within one
+    /// editor there is at most one slot: every new request first cancels
+    /// the previous one (editor.ts:2294).
+    static IN_FLIGHT: RefCell<HashMap<usize, AutocompleteContinuation>> =
+        RefCell::new(HashMap::new());
+    /// Accumulated mock-timer time per armed debounce timer, keyed by
+    /// `(editor_id, armed start_token)` — one `setTimeout(…, 20)` per
+    /// editor instance (editor.ts:2297-2301); wall-clock time advances all
+    /// armed timers independently. Re-arming (a new start token for that
+    /// editor) resets the accumulation, like a fresh `setTimeout`.
+    static DEBOUNCE_ELAPSED: RefCell<HashMap<(usize, u64), u64>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Build an owned `SelectListTheme` that forwards every style hook to the
@@ -144,11 +149,9 @@ impl Editor {
         };
         let elapsed = DEBOUNCE_ELAPSED.with(|state| {
             let mut state = state.borrow_mut();
-            if state.0 != editor_id || state.1 != armed.start_token {
-                *state = (editor_id, armed.start_token, 0);
-            }
-            state.2 = state.2.saturating_add(ms);
-            state.2
+            let elapsed = state.entry((editor_id, armed.start_token)).or_insert(0);
+            *elapsed = elapsed.saturating_add(ms);
+            *elapsed
         });
         if elapsed >= ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS {
             // setTimeout callback: `this.autocompleteDebounceTimer =
@@ -209,17 +212,19 @@ impl Editor {
 
         let editor_id = self.autocomplete_editor_id();
         IN_FLIGHT.with(|slot| {
-            *slot.borrow_mut() = Some(AutocompleteContinuation {
+            slot.borrow_mut().insert(
                 editor_id,
-                request_id,
-                snapshot_text,
-                snapshot_line,
-                snapshot_col,
-                force: request.force,
-                explicit_tab: request.explicit_tab,
-                signal,
-                result,
-            });
+                AutocompleteContinuation {
+                    request_id,
+                    snapshot_text,
+                    snapshot_line,
+                    snapshot_col,
+                    force: request.force,
+                    explicit_tab: request.explicit_tab,
+                    signal,
+                    result,
+                },
+            );
         });
     }
 
@@ -231,13 +236,14 @@ impl Editor {
         let editor_id = self.autocomplete_editor_id();
         let continuation = IN_FLIGHT.with(|slot| {
             let mut slot = slot.borrow_mut();
-            match slot.take() {
-                Some(cont) if cont.editor_id == editor_id && cont.request_id == request_id => {
-                    Some(cont)
-                }
-                // Not ours (a stale slot from another editor): put it back.
+            match slot.remove(&editor_id) {
+                Some(cont) if cont.request_id == request_id => Some(cont),
+                // Not ours (a different request id for this editor):
+                // put it back.
                 other => {
-                    *slot = other;
+                    if let Some(cont) = other {
+                        slot.insert(editor_id, cont);
+                    }
                     None
                 }
             }
@@ -258,11 +264,11 @@ impl Editor {
             )
         {
             // TS aborted this controller inside `cancelAutocompleteRequest`
-            // (editor.ts:2448); the sync port aborts lazily here (or at
-            // the next request start, whichever comes first).
+            // (editor.ts:2448) — normally already done eagerly at cancel
+            // time; this is the safety net for continuations that slip
+            // past the gate another way.
             if !continuation.signal.aborted() {
                 continuation.signal.abort();
-                self.autocomplete_aborted = true;
             }
             return;
         }
@@ -430,31 +436,22 @@ impl Editor {
         let editor_id = self.autocomplete_editor_id();
         IN_FLIGHT.with(|slot| {
             slot.borrow()
-                .as_ref()
-                .filter(|cont| cont.editor_id == editor_id)
+                .get(&editor_id)
                 .map(|cont| (cont.request_id, cont.force, cont.explicit_tab))
         })
     }
 
-    /// Abort and drop this editor's suspended continuation — the lazy
-    /// model of `cancelAutocompleteRequest`'s
-    /// `this.autocompleteAbort?.abort()` (editor.ts:2448).
-    fn abort_in_flight_autocomplete(&mut self) {
+    /// Abort and drop this editor's suspended continuation — the model of
+    /// `cancelAutocompleteRequest`'s `this.autocompleteAbort?.abort()` +
+    /// `= undefined` (editor.ts:2448-2449). Called eagerly from
+    /// `cancel_autocomplete_request` so the abort is observable at cancel
+    /// time and a cancelled request can never resurrect on a later flush.
+    pub(crate) fn abort_in_flight_autocomplete(&mut self) {
         let editor_id = self.autocomplete_editor_id();
-        let stale = IN_FLIGHT.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            match slot.take() {
-                Some(cont) if cont.editor_id == editor_id => Some(cont),
-                other => {
-                    *slot = other;
-                    None
-                }
-            }
-        });
+        let stale = IN_FLIGHT.with(|slot| slot.borrow_mut().remove(&editor_id));
         if let Some(continuation) = stale {
             if !continuation.signal.aborted() {
                 continuation.signal.abort();
-                self.autocomplete_aborted = true;
             }
         }
     }
@@ -1754,6 +1751,120 @@ mod tests {
         assert_eq!(provider.call_count(), 0);
         assert!(!editor.is_showing_autocomplete());
     }
+
+    // -------------------------------------------------------------------------
+    // Redteam R3 regression tests (findings #1-#4) — cancel-time abort and
+    // per-editor pipeline slots.
+    // -------------------------------------------------------------------------
+
+    /// R3 #1 [HIGH]: a cancelled autocomplete request can never resurrect
+    /// on a later flush. TS: every cancel path aborts the in-flight
+    /// `AbortController` (editor.ts:2448); the resolved continuation's
+    /// currency gate then discards the result. Verified against TS
+    /// empirically by redteam R3 (Up arrow on empty history after a
+    /// started request → `isShowingAutocomplete()` stays false).
+    #[test]
+    fn cancelled_request_cannot_resurrect_on_flush() {
+        let mut editor = make_editor();
+        let provider = FakeProvider::new(|info| {
+            let before = info.before();
+            Some(suggestions(vec![item("@main.ts", "main.ts")], &before))
+        });
+        editor.set_autocomplete_provider(provider);
+
+        for ch in ["@", "m", "a", "i"] {
+            editor.handle_input(ch);
+        }
+        // The 20ms debounce fires: the request starts (provider called,
+        // continuation suspended with the "@mai" snapshot).
+        editor.tick_autocomplete_debounce(20);
+        assert_eq!(provider_state_snapshot(), 1);
+        assert!(!editor.is_showing_autocomplete());
+
+        // Up arrow on empty history: `historyPrevious` →
+        // `cancelAutocomplete` → `cancelAutocompleteRequest` — state is
+        // unchanged but the in-flight request must be aborted.
+        editor.handle_input("\x1b[A");
+
+        // A later flush must NOT resurrect the cancelled request.
+        flush(&mut editor);
+        assert!(!editor.is_showing_autocomplete());
+    }
+
+    /// R3 #2 [MED]: the abort is observable at the re-requesting
+    /// keystroke (editor.ts:2294 + 2448), not only at the next request
+    /// start. TS `aborts === 1` immediately after typing continues.
+    #[test]
+    fn abort_is_observable_at_cancel_time() {
+        let mut editor = make_editor();
+        let provider = FakeProvider::new(|info| {
+            let before = info.before();
+            Some(suggestions(vec![item("@main.ts", "main.ts")], &before))
+        });
+        editor.set_autocomplete_provider(provider.clone());
+
+        for ch in ["@", "m", "a", "i"] {
+            editor.handle_input(ch);
+        }
+        editor.tick_autocomplete_debounce(20);
+        assert_eq!(provider.call_count(), 1);
+
+        // Typing continues → re-request → `cancelAutocompleteRequest`
+        // aborts the previous signal SYNCHRONOUSLY (no tick needed).
+        editor.handle_input("n");
+        assert_eq!(provider.aborted_signal_count(), 1);
+    }
+
+    /// R3 #3 + #4 [MED]: the pipeline slots are per editor instance (TS
+    /// `autocompleteRequestTask` is an instance field; one `setTimeout`
+    /// per instance). Two editors' in-flight requests coexist, and
+    /// interleaved debounce ticks accumulate independently.
+    #[test]
+    fn pipeline_slots_are_per_editor() {
+        support::reset_pipeline_state();
+        let mut e1 = Editor::new(create_test_tui(), EditorTheme::default());
+        let mut e2 = Editor::new(create_test_tui(), EditorTheme::default());
+
+        let p1 = FakeProvider::new(|info| {
+            let before = info.before();
+            Some(suggestions(vec![item("@one.ts", "one.ts")], &before))
+        });
+        let p2 = FakeProvider::new(|info| {
+            let before = info.before();
+            Some(suggestions(vec![item("@two.ts", "two.ts")], &before))
+        });
+        e1.set_autocomplete_provider(p1.clone());
+        e2.set_autocomplete_provider(p2.clone());
+
+        for ch in ["@", "a"] {
+            e1.handle_input(ch);
+        }
+        for ch in ["@", "b"] {
+            e2.handle_input(ch);
+        }
+
+        // Interleaved 10ms ticks: with a single shared slot neither timer
+        // would ever fire; per editor, both accumulate to 20ms.
+        e1.tick_autocomplete_debounce(10);
+        e2.tick_autocomplete_debounce(10);
+        e1.tick_autocomplete_debounce(10);
+        e2.tick_autocomplete_debounce(10);
+
+        assert_eq!(p1.call_count(), 1, "e1's debounce fired");
+        assert_eq!(p2.call_count(), 1, "e2's debounce fired");
+
+        // E2 starting its request must not have dropped E1's continuation.
+        flush(&mut e1);
+        flush(&mut e2);
+        assert!(e1.is_showing_autocomplete());
+        assert!(e2.is_showing_autocomplete());
+    }
+
+    /// Number of continuations currently suspended (pipeline bookkeeping
+    /// sanity for the resurrection test).
+    fn provider_state_snapshot() -> usize {
+        support::in_flight_count()
+    }
 }
 
 /// Test-only access to the thread-local pipeline state (see
@@ -1767,7 +1878,12 @@ pub(crate) mod editor_autocomplete_tests_support {
     /// module's tests (cargo test reuses threads across test fns, and the
     /// editor identity is an allocation address that can repeat).
     pub(crate) fn reset_pipeline_state() {
-        super::IN_FLIGHT.with(|slot| *slot.borrow_mut() = None);
-        super::DEBOUNCE_ELAPSED.with(|state| *state.borrow_mut() = (0, 0, 0));
+        super::IN_FLIGHT.with(|slot| slot.borrow_mut().clear());
+        super::DEBOUNCE_ELAPSED.with(|state| state.borrow_mut().clear());
+    }
+
+    /// Number of currently suspended continuations (all editors).
+    pub(crate) fn in_flight_count() -> usize {
+        super::IN_FLIGHT.with(|slot| slot.borrow().len())
     }
 }
