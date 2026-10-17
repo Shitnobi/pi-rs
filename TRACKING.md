@@ -400,10 +400,24 @@ Remaining, roughly in dependency order:
 
 ## T4 (editor) — in progress
 
-- Wave A landed: editor_word_wrap.rs complete (D2, 30/30 tests); parity
-  tui-editor TS side complete (D3, 118 cases; Rust side pending); editor.rs
-  coordinator foundation (types, struct, sync autocomplete surface, pattern
-  matcher, UTF-16 helpers) + binding-signature stubs for E2-E6/D1b files.
-- pi-tui: 613 tests green; parity 447/447 (tui-editor 0/118 pending Rust
-  harness); zero warnings.
-- Resume point: docs/T4_RESUME.md (next: spawn E2-E6 parallel delegates).
+- Wave A landed (commit cfafe3c): editor_word_wrap.rs complete (D2, 30/30
+  tests); parity tui-editor TS side complete (D3, 118 cases; Rust side
+  pending); editor.rs coordinator foundation (types, struct, sync
+  autocomplete surface, pattern matcher, UTF-16 helpers) +
+  binding-signature stubs for E2-E6/D1b files.
+- Wave B landed (E2-E6 fleet): editor_text.rs (1952), editor_cursor.rs
+  (1596), editor_history.rs (1962), editor_render.rs (825), editor_input.rs
+  (~940) — full editor.ts port minus the async autocomplete pipeline (D1b
+  stubs remain). Fleet reports in docs/t4-reports/report-t4-E{2..6}.md.
+  Integration fixes: 2 wrong derived E6 tests corrected (Alt+Enter ≠ Enter
+  for shouldSubmitOnBackslashEnter; undo of "abb" → "" via word-char
+  coalescing). Removed a unit test that remapped global keybindings —
+  set_keybindings() races parallel test threads (positive
+  shouldSubmitOnBackslashEnter path deferred to the parity differential,
+  which is per-process/deterministic; negative Alt+Enter path unit-tested).
+- pi-tui: 802 tests green / 1 ignored; parity 447/447 (tui-editor 0/118
+  pending Rust harness); zero warnings.
+- Remaining: D1b editor_autocomplete.rs + async tests (editor.test.ts
+  2096-3079) + editor_component.rs trait; Wave C parity harness
+  (`pi-cli harness tui-editor`, target 565/565) + redteams; final gate.
+- Resume point: docs/T4_RESUME.md (steps 1-2 done; next: step 3, D1b).

@@ -3,9 +3,43 @@
 Read `docs/T4_PLAN.md` first (wave plan + binding contracts). This file is
 the live checkpoint; update it as work lands.
 
-## Current state (checkpoint 2026-10-17, commit after 6397b02)
+## Current state (checkpoint 2026-10-17, AFTER Wave B landing)
 
-**Wave A partially landed:**
+**Wave B COMPLETE (uncommitted at time of writing → commit follows this
+doc update):**
+
+- ✅ **E2** — `editor_text.rs` (1952 lines): text mutation + ported tests
+  (backslash-enter, CSI-u/unicode/emoji, setText/insert, paste markers incl.
+  getExpandedText + marker snap navigation, CRLF). Report:
+  `docs/t4-reports/report-t4-E2.md`.
+- ✅ **E3** — `editor_cursor.rs` (1596 lines): cursor movement/visual map/
+  sticky column/jump mode + ported tests. Report: `report-t4-E3.md`.
+- ✅ **E4** — `editor_history.rs` (1962 lines): history/kill ring/undo +
+  editor-history-keybindings.test.ts port (RestoreDefaultKeybindings Drop
+  guard + global_test_lock). Report: `report-t4-E4.md`.
+- ✅ **E5** — `editor_render.rs` (825 lines): render_editor/layout_text/
+  handle_mouse_impl + tests. Report: `report-t4-E5.md`.
+- ✅ **E6** — `editor_input.rs` (~940 lines): full handleInput dispatch
+  (editor.ts:696-998) + derived dispatch tests. Report: `report-t4-E6.md`.
+- Test status: **802 passed / 0 failed / 1 ignored**, `cargo build
+  --workspace` zero warnings, parity still 447/447 (tui-editor 118 remain
+  0/118 pending Wave C harness).
+- Integration fixes by coordinator after fleet landing: unignored E6's 19
+  stub-gated tests; fixed 2 wrong derived tests (Alt+Enter ≠ Enter for
+  `shouldSubmitOnBackslashEnter`; undo of "abb" restores "" due to word-char
+  coalescing).
+
+**KEYBINDINGS-RACE LESSON (do not reintroduce):** a unit test that calls
+`set_keybindings()` mutates process-global state while `cargo test` runs
+test fns in PARALLEL THREADS — `global_test_lock()` only serializes tests
+that also acquire it, so a remapped-keybindings test raced (and broke)
+every other test pressing Enter. The positive `shouldSubmitOnBackslashEnter`
+path (remap submit=shift+enter) is therefore **covered only by the
+tui-editor parity differential** (per-process, deterministic), noted in
+`editor_input.rs`. The negative path (Alt+Enter before backslash → newline,
+no submit) IS unit-tested.
+
+**Wave A (prior checkpoint, commit cfafe3c):**
 
 - ✅ **D2 COMPLETE** — `components/editor_word_wrap.rs` (1042 lines):
   `is_paste_marker`, `segment_graphemes_with_markers`,
@@ -50,12 +84,9 @@ the live checkpoint; update it as work lands.
 
 ## NEXT STEPS (in order)
 
-### 1. Spawn E2-E6 in PARALLEL (async delegates, one file each)
+### 1. Spawn E2-E6 in PARALLEL (async delegates, one file each) — ✅ DONE
 
-Spawn 5 async delegates simultaneously. The result channel will likely
-report failure ("Other"/max-turns) — that is EXPECTED; verify via the
-working tree + `cargo test -p pi-tui --lib` instead (fleet playbook).
-Delegate instructions template (per delegate E_n owning file F):
+**STALE:** all five delegates landed; see "Current state" above.
 
 > You are delegate E_n in the pi-rs TUI port. Read
 > /home/shinobi/AI-Trident/pi-rs/docs/T4_PLAN.md and
@@ -99,10 +130,10 @@ Per-delegate test assignments (editor.test.ts line ranges):
   accessors) + any remaining non-autocomplete handleInput-level tests not
   covered above (grep for uncovered `it(` blocks after E2-E5 land).
 
-### 2. After E2-E6 land: verify, fix, commit
+### 2. After E2-E6 land: verify, fix, commit — ✅ DONE (this checkpoint)
 
-`cargo test -p pi-tui --lib` (expect ~613 + ~145 ported editor tests),
-`cargo build --workspace` zero warnings, full parity still 447/447.
+802 passed / 0 failed / 1 ignored; build zero warnings; reports preserved
+to docs/t4-reports/.
 
 ### 3. D1b — editor_autocomplete.rs + async tests
 
