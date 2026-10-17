@@ -3,6 +3,8 @@
 pub mod autocomplete;
 pub mod box_component;
 pub mod cancellable_loader;
+pub mod editor;
+pub mod editor_word_wrap;
 pub mod h_stack;
 pub mod input;
 pub mod loader;

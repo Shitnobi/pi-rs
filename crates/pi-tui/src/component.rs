@@ -356,6 +356,24 @@ pub trait Component {
     }
 }
 
+// =============================================================================
+// TUI host abstraction (tui.ts `TUI` interface — editor.ts usage surface)
+// =============================================================================
+
+/// The slice of the TS `TUI` interface that components consume before the
+/// T5 renderer lands. `Editor` (editor.ts:402,414,537,1963,2389,2408,2413)
+/// uses exactly two members: `requestRender()` and `terminal.rows`.
+///
+/// `TuiMainScreen` implements this when the renderer is ported (T5); tests
+/// use the `FakeTui` double in `test_support`.
+pub trait TuiHost {
+    /// TS `tui.requestRender()` — schedule a re-render of the screen.
+    fn request_render(&mut self);
+
+    /// TS `tui.terminal.rows` — current terminal height in rows.
+    fn terminal_rows(&self) -> usize;
+}
+
 /// `Focusable` (tui.ts:189-197): components that can receive focus and
 /// display a hardware cursor. When focused, the component emits
 /// `CURSOR_MARKER` at the cursor position in its render output; the TUI
