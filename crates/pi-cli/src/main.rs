@@ -109,6 +109,7 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
         "tui-keys" => return run_tui_keys_harness(&input),
         "tui-stdin-buffer" => return run_tui_stdin_buffer_harness(&input),
         "tui-components" => return run_tui_components_harness(&input),
+        "tui-editor" => return run_tui_editor_harness(&input),
         "math" => return run_math_harness(&input),
         _ => {}
     }
@@ -1954,4 +1955,150 @@ fn run_tui_components_harness(input: &Value) -> Result<Value, String> {
         }));
     }
     Ok(serde_json::json!({ "results": results }))
+}
+
+/// `tui-editor` module-level harness entry: differential event-sequence
+/// testing of the Editor component (mirrored on the TS side by
+/// ts-harness.js's `tui-editor` handler; case contract in
+/// docs/T4_PLAN.md §6).
+///
+/// Input: ONE case — `{ name, group: "tui-editor", theme: "default",
+/// width?: 80, options?: { paddingX, autocompleteMaxVisible },
+/// history?: string[], setText?: string, focused?: bool,
+/// disableSubmit?: bool, script: [{ input } | { setText } |
+/// { insertTextAtCursor } | { addToHistory } | { render: width|true } |
+/// { tickMs: n }] }`.
+///
+/// Both sides construct `Editor` with the identity theme and a fake TUI
+/// (`{ requestRender(){count++}, terminal: {rows: 24} }`), attach onChange /
+/// onSubmit recorders, run the script, and return
+/// `{ name, text, expandedText, cursor: {line, col}, lines,
+/// frames: [{width, lines}], renderRequests, events: {onChange, onSubmit} }`.
+///
+/// Timer model: `{tickMs: n}` advances a deterministic virtual clock. The
+/// TS side patches setTimeout and fires due callbacks (which START a
+/// debounced autocomplete request but never resolve its promise chain —
+/// the harness script contains no `await`). The Rust mirror is
+/// `Editor::tick_autocomplete_debounce(n)`: with no provider attached
+/// (no harness case sets one) `requestAutocomplete` returns at the
+/// provider guard, so both sides are timer no-ops; the request-flush
+/// divergence is therefore unobservable in this group.
+fn run_tui_editor_harness(input: &Value) -> Result<Value, String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use pi_tui::component::{Component, Focusable, TuiHost};
+    use pi_tui::components::editor::{Editor, EditorOptions, EditorTheme};
+
+    /// The fake TUI (ts-harness.js `tui-editor`: `{ requestRender() {
+    /// this.renderRequests++ }, terminal: { rows: 24, cols: 80 } }`).
+    struct HarnessTui {
+        render_requests: usize,
+    }
+
+    impl TuiHost for HarnessTui {
+        fn request_render(&mut self) {
+            self.render_requests += 1;
+        }
+
+        fn terminal_rows(&self) -> usize {
+            24
+        }
+    }
+
+    let options = if input.get("options").map(Value::is_null).unwrap_or(true) {
+        EditorOptions::default()
+    } else {
+        let o = input["options"].as_object().ok_or("options must be an object")?;
+        EditorOptions {
+            padding_x: o.get("paddingX").and_then(Value::as_f64),
+            autocomplete_max_visible: o.get("autocompleteMaxVisible").and_then(Value::as_f64),
+        }
+    };
+
+    // Keep the typed handle for reading the render counter; the erased
+    // copy handed to the Editor shares the same allocation (unsizing
+    // coercion), so both observe the same `render_requests`.
+    let tui = Rc::new(RefCell::new(HarnessTui { render_requests: 0 }));
+    let host: Rc<RefCell<dyn TuiHost>> = tui.clone();
+    let mut editor = Editor::with_options(host, EditorTheme::default(), options);
+
+    // onChange / onSubmit recorders (the TS harness pushes into arrays).
+    let on_change: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let on_submit: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    {
+        let log = on_change.clone();
+        editor.on_change = Some(Box::new(move |text: &str| {
+            log.borrow_mut().push(text.to_string());
+        }));
+    }
+    {
+        let log = on_submit.clone();
+        editor.on_submit = Some(Box::new(move |text: &str| {
+            log.borrow_mut().push(text.to_string());
+        }));
+    }
+
+    if input["focused"].as_bool().unwrap_or(false) {
+        editor.set_focused(true);
+    }
+    if input["disableSubmit"].as_bool().unwrap_or(false) {
+        editor.disable_submit = true;
+    }
+    if let Some(history) = input["history"].as_array() {
+        for h in history {
+            let text = h.as_str().ok_or("history entries must be strings")?;
+            editor.add_to_history(text);
+        }
+    }
+    if let Some(set_text) = input["setText"].as_str() {
+        editor.set_text(set_text);
+    }
+
+    let default_width = input["width"].as_u64().unwrap_or(80) as usize;
+    let mut frames: Vec<Value> = Vec::new();
+    let script = input["script"].as_array().cloned().unwrap_or_default();
+    for op in &script {
+        let obj = op.as_object().ok_or("script op must be an object")?;
+        if let Some(data) = obj.get("input").and_then(Value::as_str) {
+            editor.handle_input(data);
+        } else if let Some(text) = obj.get("setText").and_then(Value::as_str) {
+            editor.set_text(text);
+        } else if let Some(text) = obj.get("insertTextAtCursor").and_then(Value::as_str) {
+            editor.insert_text_at_cursor(text);
+        } else if let Some(text) = obj.get("addToHistory").and_then(Value::as_str) {
+            editor.add_to_history(text);
+        } else if let Some(render) = obj.get("render") {
+            // `{render: true}` renders at the case's default width.
+            let width = match render {
+                Value::Bool(true) => default_width,
+                v => v.as_u64().ok_or("render must be true or a width")? as usize,
+            };
+            let lines = Component::render(&mut editor, width);
+            frames.push(serde_json::json!({ "width": width, "lines": lines }));
+        } else if let Some(tick) = obj.get("tickMs") {
+            let ms = tick.as_u64().ok_or("tickMs must be a number")?;
+            editor.tick_autocomplete_debounce(ms);
+        } else {
+            return Err(format!(
+                "invalid tui-editor script op: {:?}",
+                obj.keys().map(|k| k.as_str()).collect::<Vec<_>>()
+            ));
+        }
+    }
+
+    let (cursor_line, cursor_col) = editor.get_cursor();
+    Ok(serde_json::json!({
+        "name": input["name"].as_str().unwrap_or(""),
+        "text": editor.get_text(),
+        "expandedText": editor.get_expanded_text(),
+        "cursor": { "line": cursor_line, "col": cursor_col },
+        "lines": editor.get_lines(),
+        "frames": frames,
+        "renderRequests": tui.borrow().render_requests,
+        "events": {
+            "onChange": *on_change.borrow(),
+            "onSubmit": *on_submit.borrow(),
+        },
+    }))
 }
