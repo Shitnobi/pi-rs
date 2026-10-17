@@ -608,6 +608,99 @@ async function runModule(tool, args, cwd) {
 			globalThis.clearInterval = origClearInterval;
 		}
 	}
+	if (tool === "tui-editor") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const { Editor } = await import(pathToFileURL(TUI_SRC + "/components/editor.ts").href);
+		// Identity theme (preset "default"): borderColor and every selectList
+		// member are (t) => t — the Rust side mirrors this exactly (like the
+		// tui-components "identity" presets). No chalk anywhere.
+		const identityEditorTheme = {
+			borderColor: (t) => t,
+			selectList: {
+				selectedPrefix: (t) => t,
+				selectedText: (t) => t,
+				description: (t) => t,
+				scrollInfo: (t) => t,
+				noMatch: (t) => t,
+			},
+		};
+		// Deterministic timers: patch setTimeout/clearTimeout so debounce
+		// timers (20ms) never depend on real time. A virtual clock is advanced
+		// by script op {tickMs: n}; due callbacks fire in scheduling order —
+		// mirroring the Rust harness's fire_due_timers().
+		let clock = 0;
+		let timerSeq = 0;
+		const timers = new Map(); // id -> { fn, at, seq }
+		const origSetTimeout = globalThis.setTimeout;
+		const origClearTimeout = globalThis.clearTimeout;
+		globalThis.setTimeout = (fn, delay) => {
+			timerSeq += 1;
+			timers.set(timerSeq, { fn, at: clock + Math.max(0, Number(delay) || 0), seq: timerSeq });
+			return timerSeq;
+		};
+		globalThis.clearTimeout = (id) => {
+			timers.delete(id);
+		};
+		const fireDue = (now) => {
+			for (;;) {
+				let next = null;
+				for (const t of timers.values()) {
+					if (t.at <= now && (next === null || t.seq < next.seq)) next = t;
+				}
+				if (next === null) return;
+				timers.delete(next.seq);
+				next.fn();
+			}
+		};
+		try {
+			// One §6 case per invocation: args = the case itself.
+			const c = args;
+			const fakeTui = {
+				renderRequests: 0,
+				requestRender() {
+					this.renderRequests++;
+				},
+				terminal: { rows: 24, cols: 80 },
+			};
+			const editor = new Editor(fakeTui, identityEditorTheme, c.options ?? {});
+			const onChange = [];
+			const onSubmit = [];
+			editor.onChange = (text) => onChange.push(text);
+			editor.onSubmit = (text) => onSubmit.push(text);
+			if (c.focused) editor.focused = true;
+			if (c.disableSubmit) editor.disableSubmit = true;
+			for (const h of c.history ?? []) editor.addToHistory(h);
+			if (c.setText !== undefined) editor.setText(c.setText);
+			const frames = [];
+			const doRender = (w) => frames.push({ width: w, lines: editor.render(w) });
+			for (const op of c.script ?? []) {
+				if (op.input !== undefined) editor.handleInput(op.input);
+				else if (op.setText !== undefined) editor.setText(op.setText);
+				else if (op.insertTextAtCursor !== undefined) editor.insertTextAtCursor(op.insertTextAtCursor);
+				else if (op.addToHistory !== undefined) editor.addToHistory(op.addToHistory);
+				else if (op.render !== undefined)
+					doRender(op.render === true ? (c.width ?? 80) : op.render);
+				else if (op.tickMs !== undefined) {
+					clock += op.tickMs;
+					fireDue(clock);
+				} else throw new Error("invalid tui-editor script op: " + JSON.stringify(Object.keys(op)));
+			}
+			return {
+				name: c.name,
+				text: editor.getText(),
+				expandedText: editor.getExpandedText(),
+				cursor: editor.getCursor(),
+				lines: editor.getLines(),
+				frames,
+				renderRequests: fakeTui.renderRequests,
+				events: { onChange, onSubmit },
+			};
+		} finally {
+			globalThis.setTimeout = origSetTimeout;
+			globalThis.clearTimeout = origClearTimeout;
+		}
+	}
 	if (tool === "math") {
 		const buf = new ArrayBuffer(8);
 		const view = new DataView(buf);

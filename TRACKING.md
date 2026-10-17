@@ -397,3 +397,13 @@ Remaining, roughly in dependency order:
   write-only upstream, autocomplete `cursor_col` uses char (Unicode
   scalar) indices vs TS UTF-16 code units (no astral-plane engine input
   identified).
+
+## T4 (editor) — in progress
+
+- Wave A landed: editor_word_wrap.rs complete (D2, 30/30 tests); parity
+  tui-editor TS side complete (D3, 118 cases; Rust side pending); editor.rs
+  coordinator foundation (types, struct, sync autocomplete surface, pattern
+  matcher, UTF-16 helpers) + binding-signature stubs for E2-E6/D1b files.
+- pi-tui: 613 tests green; parity 447/447 (tui-editor 0/118 pending Rust
+  harness); zero warnings.
+- Resume point: docs/T4_RESUME.md (next: spawn E2-E6 parallel delegates).

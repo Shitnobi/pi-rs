@@ -4614,6 +4614,177 @@ export const cases = [
 			],
 		},
 	},
+	// --------------------------------------------------------- tui-editor
+	// Event-sequence differential testing of the Editor component
+	// (editor.ts): a scripted input stream drives a fresh Editor built on a
+	// fake TUI (rows=24, cols=80) with the identity theme preset
+	// ("default": borderColor and all selectList members are (t) => t —
+	// the Rust harness mirrors this exactly, like the tui-components
+	// "identity" presets). The compared output is the final editor state
+	// (text/expandedText/cursor/lines), one frame per {render} op, the
+	// fake TUI's render-request counter, and the onChange/onSubmit event
+	// log. Autocomplete (provider presets) is out of scope for this wave.
+	// Case shape + output follow docs/T4_PLAN.md §6; see the "tui-editor"
+	// handler in ts-harness.js for the documented extensions (case-level
+	// `focused` / `disableSubmit`, and `{render: true}` falling back to
+	// case `width ?? 80`).
+	te("typing-ascii", [...ky("hello"), { render: 20 }]),
+	te("typing-umlauts", ky("h", "ä", "l", "l", "ö"), { render: 20 }),
+	te("typing-emoji-astral", ky("a", "😀", "b", "👨‍👩‍👧‍👦", "c")),
+	te("typing-cjk", ky("你", "好", "世", "界"), { render: 20 }),
+	te("typing-cjk-emoji-mixed", ky("日本", "😀", "語", "👨‍👩‍👧‍👦"), { render: 20 }),
+	te("typing-single-chunks", [{ input: "hello" }, { input: " world" }, { input: "!" }]),
+	te("typing-into-settext", [{ input: "!" }], { setText: "hello" }),
+	te("cursor-left-right", ky("hello", "\x1b[D", "\x1b[D", "\x1b[D", "\x1b[C")),
+	te("cursor-clamp-edges", ky("ab", "\x01", "\x1b[D", "\x05", "\x1b[C")),
+	te("cursor-home-end-keys", ky("one two", "\x1b[H", "x", "\x1b[F", "y")),
+	te("cursor-ctrl-a-e", ky("one two", "\x01", "x", "\x05", "y")),
+	te("cursor-word-left", ky("one two three", "\x1b[1;5D", "\x1b[1;5D", "\x1b[1;5D")),
+	te("cursor-word-right", ky("one two three", "\x01", "\x1b[1;5C", "\x1b[1;5C")),
+	te("cursor-word-alt-b-f", ky("one two three", "\x1bb", "\x1bb", "\x1bf")),
+	te("cursor-word-cjk", ky("你好世界 hello 世界", "\x1b[1;5D", "\x1b[1;5D", "\x1b[1;5C", "\x1bb")),
+	te("cursor-word-emoji", ky("a 😀😀 b c", "\x1bb", "\x1bb", "\x1bf")),
+	te("cursor-multiline-up-down", ky("one", "\n", "two", "\n", "three", "\x1b[A", "\x1b[A", "\x1b[B")),
+	te("newline-alt-enter", ky("one", "\x1b\r", "two")),
+	te("newline-ctrl-j", ky("one", "\n", "two")),
+	te("newline-csi-shift-enter", ky("one", "\x1b[13;2~", "two")),
+	te("backslash-enter-newline", ky("foo\\", "\r", "bar")),
+	te("enter-submit", ky("hi there", "\r")),
+	te("enter-submit-clears", ky("hi", "\r", "next")),
+	te("enter-submit-empty", [{ input: "\r" }]),
+	te("enter-submit-multiline", ky("one", "\n", "two", "\r")),
+	te("submit-disabled", ky("hi", "\r", "more"), { disableSubmit: true }),
+	te("backslash-enter-disabled", ky("a\\", "\r"), { disableSubmit: true }),
+	te("backspace-ascii", ky("hello", "\x7f", "\x7f")),
+	te("backspace-emoji", ky("a😀b", "\x7f", "\x7f", "\x7f")),
+	te("backspace-zwj-family", ky("x👨‍👩‍👧‍👦y", "\x7f", "\x7f")),
+	te("backspace-join-lines", ky("ab", "\n", "cd", "\x7f")),
+	te("backspace-at-start-empty", [{ input: "\x7f" }]),
+	te("forward-delete", ky("a😀b", "\x01", "\x1b[3~", "\x1b[3~")),
+	te("forward-delete-end", ky("ab", "\x05", "\x1b[3~")),
+	te("ctrl-w-delete-word", ky("hello world", "\x17")),
+	te("alt-backspace-delete-word", ky("hello world", "\x1b\x7f")),
+	te("alt-d-delete-word-forward", ky("hello world", "\x01", "\x1bd")),
+	te("ctrl-w-punctuation", ky("foo.bar baz", "\x17", "\x17")),
+	te("kill-yank", ky("hello world", "\x17", "\x01", "\x19")),
+	te("kill-yank-midline", ky("one two three", "\x01", "\x1b[1;5C", "\x17", "\x01", "\x19")),
+	te("kill-accumulate", ky("one two three", "\x17", "\x17", "\x01", "\x19")),
+	te("kill-line-start-yank", ky("one two", "\x15", "\x19")),
+	te("yank-pop-cycle", ky("one", "\x15", "two", "\x15", "\x19", "\x1by", "\x1by", "\x1by")),
+	te("yank-empty-ring", ky("abc", "\x19")),
+	te("yank-pop-without-yank", ky("one", "\x15", "two", "\x15", "\x1by")),
+	te("undo-typing-coalesce", ky("h", "e", "l", "l", "o", "\x1f")),
+	te("undo-space-word", ky("one", " ", "two", "\x1f", "\x1f")),
+	te("undo-boundary", ky("ab", "\x1f", "\x1f", "\x1f")),
+	te("undo-newline", ky("a", "\n", "b", "\x1f")),
+	te("undo-delete", ky("abc", "\x7f", "\x1f")),
+	te("undo-yank", ky("one two", "\x17", "\x01", "\x19", "\x1f")),
+	te("undo-paste-small", [{ input: "ab" }, { input: pasteSeq("xy\nz") }, { input: "\x1f" }]),
+	te("undo-settext", [{ setText: "replaced" }, { input: "\x1f" }]),
+	te("undo-after-submit", ky("hi", "\r", "\x1f")),
+	te("undo-retyped-boundary", ky("one", "\x1f", "two", "\x1f", "\x1f")),
+	te("history-up-down", ky("draft", "\x1b[A", "\x1b[A", "\x1b[B", "\x1b[B"), { history: ["first", "second"] }),
+	te("history-draft-restore", ky("draft", "\x1b[A", "\x1b[B"), { history: ["first"] }),
+	te("history-up-from-text", ky("abc", "\x1b[A", "\x1b[A"), { history: ["first"] }),
+	te("history-empty-up-down", ky("\x1b[A", "\x1b[A", "\x1b[B"), { history: ["only"] }),
+	te("history-down-not-browsing", ky("abc", "\x1b[B")),
+	te("history-add-mid-script", [{ addToHistory: "later" }, { input: "x" }, { input: "\x1b[A" }]),
+	te("history-duplicate-skipped", [
+		{ addToHistory: "same" },
+		{ addToHistory: "same" },
+		{ addToHistory: "other" },
+		{ input: "\x1b[A" },
+	]),
+	te("history-blank-skipped", [{ addToHistory: "  " }, { addToHistory: "x" }, { input: "\x1b[A" }]),
+	te("history-multiline-entry", [{ input: "\x1b[A" }], { history: ["one\ntwo"] }),
+	te("history-submit-reads-marker", [{ input: pasteSeq(manyLines(12)) }, { input: "\r" }]),
+	te("jump-forward", ky("foo bar baz", "\x01", "\x1d", { input: "b" }, { input: "\x1d" }, { input: "r" })),
+	te("jump-backward", ky("foo bar baz", "\x05", "\x1b\x1d", { input: "r" })),
+	te("jump-forward-crosses-lines", ky("abc", "\n", "xyz", "\x01", "\x1d", { input: "x" })),
+	te("jump-cancel-repeat", ky("foo", "\x1d", "\x1d", { input: "b" })),
+	te("jump-no-match", ky("foo", "\x05", "\x1d", { input: "z" })),
+	te("jump-cancel-control", ky("foo", "\x01", "\x1d", "\x05", { input: "b" })),
+	te("sticky-column-basic", ky("\x05", "\x1b[A", "\x1b[B"), { setText: "aaaa\nbb\ncccccc" }),
+	te("sticky-column-clamp", ky("\x05", "\x1b[A"), { setText: "aaaaaa\nbb" }),
+	te("sticky-column-reset-typing", ky("\x05", "\x1b[A", { input: "x" }, "\x1b[B"), { setText: "aaaa\nbb" }),
+	te("sticky-column-reset-horizontal", ky("\x05", "\x1b[A", "\x1b[D", "\x1b[B"), { setText: "aaaa\nbb" }),
+	te("wrap-widths", [{ render: 20 }, { render: 40 }, { render: 80 }], {
+		setText: "the quick brown fox jumps over the lazy dog and keeps running far away",
+	}),
+	te("wrap-cjk", [{ render: 10 }, { render: 7 }], { setText: "世界你好世界你好世界こんにちは" }),
+	te("wrap-emoji", [{ render: 9 }, { render: 11 }], { setText: "😀😀😀😀😀😀 family 👨‍👩‍👧‍👦" }),
+	te("wrap-url", [{ render: 30 }, { render: 15 }], {
+		setText: "see https://example.com/a/very/long/path/with/segments?query=1&x=2 for details",
+	}),
+	te("wrap-multiple-spaces", [{ render: 10 }], { setText: "a    b    ccccccccccc    dd" }),
+	te("wrap-long-word", [{ render: 10 }, { render: 6 }], { setText: "aaaaaaaaaa bbbbbbbbbbbbbbbb" }),
+	te("wrap-padding-x", [{ render: 20 }], { setText: "hello world this wraps", options: { paddingX: 2 } }),
+	te("wrap-cursor-middle", ky("\x1b[1;5D", "\x1b[1;5D", { render: 20 }), {
+		setText: "one two three four five six",
+	}),
+	te("wrap-empty", [{ render: 10 }], { setText: "" }),
+	te("wrap-multiline", [{ render: 12 }], {
+		setText: "first line here\nsecond line also long enough to wrap\nthird",
+	}),
+	te("paste-large-lines", [{ input: pasteSeq(manyLines(12)) }, { render: 40 }]),
+	te("paste-large-chars", [{ input: pasteSeq("x".repeat(1001)) }, { render: 40 }]),
+	te("paste-small-multiline", [{ input: pasteSeq("ab\ncd\nef") }]),
+	te("paste-single-line", [{ input: pasteSeq("hello pasted") }]),
+	te("paste-split-inputs", [{ input: "\x1b[200~abc" }, { input: "def\x1b[201~" }, { input: "z" }]),
+	te("paste-trailing-input", [{ input: pasteSeq("xy") + "z" }]),
+	te("paste-marker-navigation", [
+		{ input: pasteSeq(manyLines(12)) },
+		{ input: " tail" },
+		{ input: "\x1b[D" },
+		{ input: "\x1b[D" },
+		{ input: "\x1b[1;5D" },
+		{ input: "\x1b[1;5D" },
+		{ render: 40 },
+	]),
+	te("paste-marker-backspace", [{ input: pasteSeq(manyLines(12)) }, { input: "\x7f" }]),
+	te("paste-marker-forward-delete", [
+		{ input: "pre " },
+		{ input: pasteSeq(manyLines(12)) },
+		{ input: "\x1b[1;5D" },
+		{ input: "\x1b[3~" },
+	]),
+	te("paste-marker-undo", [{ input: pasteSeq(manyLines(12)) }, { input: "\x1f" }]),
+	te("paste-two-markers-renumber", [
+		{ input: pasteSeq(manyLines(12)) },
+		{ input: pasteSeq(manyLines(15)) },
+		{ input: "\x1b[1;5D" },
+		{ input: "\x7f" },
+	]),
+	te("paste-crlf", [{ input: pasteSeq("a\r\nb\r\nc") }]),
+	te("paste-control-filtered", [{ input: pasteSeq("ab\x07c\n\x1b[107;5u d") }]),
+	te("paste-submit-expands", [{ input: pasteSeq(manyLines(12)) }, { input: "\r" }]),
+	te("paste-unterminated", [{ input: "\x1b[200~abc" }]),
+	te("paste-path-space-prepend", [{ input: "hello" }, { input: pasteSeq("/tmp/file") }]),
+	te(
+		"scroll-down-border",
+		[...Array.from({ length: 8 }, () => ({ input: "\x1b[B" })), { render: 40 }],
+		{ setText: manyLines(12) },
+	),
+	te("scroll-top-then-up", ky("\x1b[A", "\x1b[A"), { setText: "one\ntwo" }),
+	te("scroll-page-down", [{ input: "\x1b[6~" }, { input: "\x1b[6~" }, { render: 40 }], { setText: manyLines(15) }),
+	te("scroll-page-up", [{ input: "\x1b[6~" }, { input: "\x1b[5~" }, { render: 40 }], { setText: manyLines(15) }),
+	te(
+		"scroll-border-narrow",
+		[{ render: 12 }, ...Array.from({ length: 8 }, () => ({ input: "\x1b[B" })), { render: 12 }],
+		{ setText: manyLines(12) },
+	),
+	te("settext-crlf-cr", [], { setText: "a\r\nb\rc" }),
+	te("settext-tabs", [], { setText: "a\tb\tc" }),
+	te("insert-at-cursor", ky("hello", "\x1b[D", "\x1b[D", { insertTextAtCursor: "XY" })),
+	te("insert-multiline-crlf", ky("abcd", "\x1b[D", "\x1b[D", { insertTextAtCursor: "1\r\n2" })),
+	te("insert-empty-noop", [{ insertTextAtCursor: "" }, { input: "a" }]),
+	te("csi-u-plain", ky("\x1b[97u", "\x1b[98u")),
+	te("csi-u-shifted", ky("\x1b[97:65;2u", "\x1b[98:66;2u")),
+	te("csi-u-modify-other-keys", ky("\x1b[27;2;98~", "\x1b[27;1;99~")),
+	te("csi-u-ctrl-rejected", ky("x", "\x1b[97;5u", "y")),
+	te("csi-u-emoji-codepoint", ky("\x1b[128512u")),
+	te("tick-no-op", [{ input: "hi" }, { tickMs: 100 }, { render: 20 }]),
+	te("render-focused-cursor-marker", [{ render: 20 }], { setText: "hi", focused: true }),
 ];
 
 // tui-components sub-case builders (hoisted; used by the cases above).
@@ -4694,4 +4865,42 @@ function sitem(value, label, description) {
 }
 function sit(id, label, currentValue, o = {}) {
 	return { id, label, currentValue, ...o };
+}
+
+// tui-editor sub-case builders (hoisted; used by the tui-editor cases).
+// `te` wraps one docs/T4_PLAN.md §6 case: the args object IS the case
+// (passed to the harness as-is); `ky` expands key arguments into one
+// {input} script op each; `pasteSeq` wraps content in bracketed-paste
+// markers; `manyLines` builds multi-line paste/setText content.
+function te(name, script, o = {}) {
+	return {
+		name: "tui-editor/" + name,
+		tool: "tui-editor",
+		args: {
+			name,
+			group: "tui-editor",
+			theme: "default",
+			...(o.width !== undefined ? { width: o.width } : {}),
+			...(o.options ? { options: o.options } : {}),
+			...(o.history ? { history: o.history } : {}),
+			...(o.setText !== undefined ? { setText: o.setText } : {}),
+			...(o.focused !== undefined ? { focused: o.focused } : {}),
+			...(o.disableSubmit !== undefined ? { disableSubmit: o.disableSubmit } : {}),
+			script,
+		},
+	};
+}
+function ky(...inputs) {
+	const script = [];
+	for (const input of inputs) {
+		if (typeof input === "string") script.push({ input });
+		else script.push(input);
+	}
+	return script;
+}
+function pasteSeq(content) {
+	return "\x1b[200~" + content + "\x1b[201~";
+}
+function manyLines(n) {
+	return Array.from({ length: n }, (_, i) => "line " + (i + 1)).join("\n");
 }
