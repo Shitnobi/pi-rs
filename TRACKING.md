@@ -415,9 +415,20 @@ Remaining, roughly in dependency order:
   set_keybindings() races parallel test threads (positive
   shouldSubmitOnBackslashEnter path deferred to the parity differential,
   which is per-process/deterministic; negative Alt+Enter path unit-tested).
-- pi-tui: 802 tests green / 1 ignored; parity 447/447 (tui-editor 0/118
+- Wave C prep landed (D1b + editor_component.rs): editor_autocomplete.rs
+  (1773 lines) — the async pipeline as an explicit state machine
+  (thread-local IN_FLIGHT continuation + DEBOUNCE_ELAPSED mock-timer model;
+  `run_pending_autocomplete_requests()` = flushAutocomplete,
+  `tick_autocomplete_debounce(ms)` = t.mock.timers.tick) + 27 ported async
+  tests (editor.test.ts:2096-3079 + provider-paste 1820); report in
+  docs/t4-reports/report-t4-D1b.md. editor_component.rs — the
+  editor-component.ts (74 lines) extension-surface trait + impl for Editor.
+  Integration fix: trigger/debounce pattern quoted-branch bug — TS
+  `@"[^"]*` requires NO closing quote in BOTH patterns and falls through
+  to the char-class alternative like regex backtracking (broke
+  quoted-CJK-directory re-trigger before the fix).
+- pi-tui: 828 tests green / 1 ignored; parity 447/447 (tui-editor 0/118
   pending Rust harness); zero warnings.
-- Remaining: D1b editor_autocomplete.rs + async tests (editor.test.ts
-  2096-3079) + editor_component.rs trait; Wave C parity harness
-  (`pi-cli harness tui-editor`, target 565/565) + redteams; final gate.
-- Resume point: docs/T4_RESUME.md (steps 1-2 done; next: step 3, D1b).
+- Remaining: Wave C parity harness (`pi-cli harness tui-editor`, target
+  565/565) + redteams; final gate.
+- Resume point: docs/T4_RESUME.md (steps 1-3 done; next: step 4, Wave C).

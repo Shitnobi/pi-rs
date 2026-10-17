@@ -792,7 +792,6 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use crate::component::{TuiMouseButton, TuiMouseEventResult, TuiMouseEventType};
-    use crate::layout_node::ScrollLayoutState as _;
 
     /// Test-only leaf: renders fixed lines; captures mouse events at
     /// local y == 0; counts invalidate() calls.

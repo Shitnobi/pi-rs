@@ -414,32 +414,11 @@ mod tests {
     use crate::components::editor::{AutocompleteMode, EditorTheme};
     use crate::components::select_list::{SelectItem, SelectList, SelectListTheme};
     use crate::test_support::create_test_tui;
-    use crate::test_support::global_test_lock;
-    use crate::keybindings::{
-        set_keybindings, KeybindingsConfig, KeybindingsManager, tui_keybinding_definitions,
-    };
     use std::cell::RefCell;
     use std::rc::Rc;
 
     fn make_editor() -> Editor {
         Editor::new(create_test_tui(), EditorTheme::default())
-    }
-
-    fn keys(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
-    }
-
-    /// Restores the default global keybindings on drop (see
-    /// editor_history.rs — the TS `afterEach` reset).
-    struct RestoreDefaultKeybindings;
-
-    impl Drop for RestoreDefaultKeybindings {
-        fn drop(&mut self) {
-            set_keybindings(KeybindingsManager::new(
-                tui_keybinding_definitions(),
-                KeybindingsConfig::default(),
-            ));
-        }
     }
 
     /// Set up an active autocomplete UI (state + owned SelectList) without

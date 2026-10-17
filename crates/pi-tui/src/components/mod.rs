@@ -5,6 +5,7 @@ pub mod box_component;
 pub mod cancellable_loader;
 pub mod editor;
 pub mod editor_autocomplete;
+pub mod editor_component;
 pub mod editor_cursor;
 pub mod editor_history;
 pub mod editor_input;

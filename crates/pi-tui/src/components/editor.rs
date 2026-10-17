@@ -286,26 +286,34 @@ pub(crate) fn autocomplete_token_pattern_test(
 }
 
 /// Does a trigger/debounce token start at char index `j` and run to the end?
+///
+/// Mirrors the TS alternation `(?:@"[^"]*|[chars]SUFFIX)$` (trigger,
+/// editor.ts:264-270) / `(?:@(?:"[^"]*|SUFFIX)|[chars-without-@]SUFFIX)$`
+/// (debounce, editor.ts:271-278), including regex backtracking: when the
+/// `@"` branch fails, the char-class alternative is tried at the same
+/// position.
 fn token_matches_at(units: &[char], j: usize, trigger_characters: &[char], debounce: bool) -> bool {
     if j >= units.len() {
         return false;
     }
-    // `@"…"` quoted branch. Trigger: `@"[^"]*"` — must terminate with `"`.
-    // Debounce: `@"[^"]*` may be unterminated.
-    if units[j] == '@' && j + 1 < units.len() && units[j + 1] == '"' {
-        let rest = &units[j + 2..];
-        if debounce {
-            return rest.iter().all(|&c| c != '"') || rest.last() == Some(&'"');
-        }
-        return matches!(rest.last(), Some('"')) && rest[..rest.len() - 1].iter().all(|&c| c != '"');
+    // `@"[^"]*` — the quoted branch, identical in BOTH patterns and
+    // unconditional (independent of trigger_characters): no closing quote
+    // is required, but the remainder after `@"` must contain no quote
+    // (`[^"]*` cannot match one, and `$` then fails).
+    if units[j] == '@' && units.get(j + 1) == Some(&'"') && units[j + 2..].iter().all(|&c| c != '"') {
+        return true;
     }
-    // `@` unquoted branch (debounce only): `@SUFFIX`.
-    if units[j] == '@' && debounce {
-        return units[j + 1..].iter().all(|&c| !is_autocomplete_separator(c));
+    // `SUFFIX` — the remainder after the trigger char is a non-separator run.
+    let suffix_ok = units[j + 1..].iter().all(|&c| !is_autocomplete_separator(c));
+    // `[chars]SUFFIX` — the debounce char class excludes `@` (it has its
+    // own alternatives).
+    let in_class = trigger_characters.contains(&units[j]) && !(debounce && units[j] == '@');
+    if in_class {
+        return suffix_ok;
     }
-    // `[chars]SUFFIX` — trigger char then a non-separator run to the end.
-    if trigger_characters.contains(&units[j]) {
-        return units[j + 1..].iter().all(|&c| !is_autocomplete_separator(c));
+    // Debounce-only unquoted `@SUFFIX` alternative.
+    if debounce && units[j] == '@' {
+        return suffix_ok;
     }
     false
 }

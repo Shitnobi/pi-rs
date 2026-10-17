@@ -1313,6 +1313,9 @@ mod tests {
         track_style: Option<Rc<dyn Fn(&str) -> String>>,
         thumb_style: Option<Rc<dyn Fn(&str) -> String>>,
         scrollbar: ScrollViewScrollbar,
+        // Mirrors TS `hideDelayMs` (stored upstream; the Rust model
+        // expires `hide_timer_armed` explicitly instead of sleeping).
+        #[allow(dead_code)]
         hide_delay_ms: i64,
         scroll_top: i64,
         content_height: i64,

@@ -135,15 +135,20 @@ Per-delegate test assignments (editor.test.ts line ranges):
 802 passed / 0 failed / 1 ignored; build zero warnings; reports preserved
 to docs/t4-reports/.
 
-### 3. D1b — editor_autocomplete.rs + async tests
+### 3. D1b — editor_autocomplete.rs + async tests — ✅ DONE
 
-Single delegate (or coordinator) implementing the async pipeline as an
-explicit state machine (`run_pending_autocomplete_requests` consumes the
-pending queue — model of the TS promise chain; TS tests' `flushAutocomplete()`
-= one flush call). Port async test block editor.test.ts:2096-3079 (~30
-tests) + "undoes autocomplete" (2096) + provider-paste test (1820). Needs a
-scriptable FakeProvider implementing `AutocompleteProvider`. Also port
-`editor-component.ts` (74 lines) as `components/editor_component.rs` trait.
+Delegate D1b landed 1773 lines (implementation + 27 ported async tests,
+828 total green after coordinator fixes). See report-t4-D1b.md for the
+flush/timer modeling. Coordinator fixes during integration: (a) trigger
+pattern quoted-branch bug — TS `@"[^"]*` requires NO closing quote in
+BOTH patterns and must fall through to the char-class alternative like
+regex backtracking (this broke quoted-CJK-directory re-trigger);
+(b) `run_pending_autocomplete_requests` made `pub` (host-facing flush API
+alongside `tick_autocomplete_debounce`) which also clears the dead-code
+warnings. `editor_component.rs` (editor-component.ts, 74 lines) ported by
+coordinator: `EditorComponent: Component` trait (required
+get_text/set_text/handle_input; optional members as default no-op /
+fallback methods) + impl for Editor.
 
 ### 4. Wave C — Rust parity harness (tui-editor)
 
