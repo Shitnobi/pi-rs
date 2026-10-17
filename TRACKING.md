@@ -180,8 +180,8 @@ Remaining, roughly in dependency order:
 | G8 | async | `NestedToolCallRunner` (drives the agent tool pipeline) and `file-mutation-queue.ts` (global registration queue + per-realpath mutation queues) need an async runtime and the agent session layer; deferred with the agent-loop tranche. `NestedCallRecorder` — the persisted half — is ported | 3+ |
 ## Parity suite status
 
-- 292/292 cases pass (stable across repeated runs)
-- 225 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
+- 434/434 cases pass (stable across repeated runs)
+- 509 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
   plus fuzz corpora: ansi 2010 cases, decoder 800 cases, pi-photon
   byte-parity, segmenter corpus 1208 cases)
 - `cargo clippy --all-targets` clean
@@ -302,6 +302,25 @@ Remaining, roughly in dependency order:
   Notable bug fixed en route: BytesTrie/UCharsTrie `branch_next` binary
   search must increment pos in the comparison (`u[pos++]` in JS) before
   jump/skip-delta — otherwise wide trie branches never match.
+- TUI tranche 2 (input): COMPLETE. `keys.rs` (~2450 lines, all 61 upstream
+  tests; JS number semantics — i64 codepoints, i32 modifiers with wrapping
+  ops; 5 TS regexes hand-ported to greedy parsers), `stdin_buffer.rs`
+  (~1700 lines, 86 tests — 76 upstream + 4 astral/WTF-16 lock-ins; Vec<u16>
+  internals because TS splits astral chars into per-surrogate data events;
+  timers → `PendingTimeout` + `fire_timeout()`), `keybindings.rs` (47
+  bindings, conflict detection, global manager — SHIP verdict, no fixes),
+  `terminal.rs` (~1800 lines, 27 tests; kitty negotiation state machine with
+  injectable clock/I/O; hand-declared termios externs, pure std),
+  `native_modifiers.rs`/`native_module_path.rs`/`native_platform.rs`
+  (behavior port per gaps T3/T4: Linux clipboard via wl-paste/wl-copy/
+  xclip/xsel with timeout + 50 MB cap + pipe-hang/EPIPE hardening; win32/
+  darwin cleanly unavailable). Validation: 335 pi-tui unit tests + parity
+  groups `tui-keys` (378 sub-cases) and `tui-stdin-buffer` (12 entries,
+  chunk scripts + fire-timeout steps vs mocked-timer TS) — 434/434 parity.
+  Fleet-built: parallel builder + redteam subagents; redteam findings fixed
+  (empty-string SSH env falsy, fractional escape-timeout ceil, native
+  modifier seam wired, env-dimension floor, clipboard writer pipe-hang,
+  Wayland-only sessions, empty DISPLAY gates). Reports in /tmp/report-*.md.
 - **ICU engine-factory trajectory semantics** (matters for any differential
   test of word segmentation): ICU's `ICULanguageBreakFactory` engine cache is
   process-global and warms lazily on the first *dictionary dispatch*. A

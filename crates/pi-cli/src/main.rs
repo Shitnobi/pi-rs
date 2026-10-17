@@ -106,6 +106,8 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
         "tui-program-status" => return run_tui_program_status_harness(&input),
         "tui-colors" => return run_tui_colors_harness(&input),
         "tui-terminal-colors" => return run_tui_terminal_colors_harness(&input),
+        "tui-keys" => return run_tui_keys_harness(&input),
+        "tui-stdin-buffer" => return run_tui_stdin_buffer_harness(&input),
         "math" => return run_math_harness(&input),
         _ => {}
     }
@@ -463,6 +465,134 @@ fn color_to_value(c: pi_tui::colors::Color) -> Value {
             "kind": "oklch", "l": js_num(l), "c": js_num(c), "h": js_num(h)
         }),
     }
+}
+
+/// `tui-keys` module-level harness entry: drives the pure parser functions
+/// of `packages/tui/src/keys.ts` (mirrored on the TS side by ts-harness.js).
+///
+/// Input: `{ cases: [{ input, kitty?, keyIds? }] }`. For each sub-case the
+/// global kitty-protocol flag is set from `kitty` (this is a fresh process,
+/// and the flag is reset after each sub-case so ordering can never leak),
+/// then parseKey / matchesKey (per keyIds) / decodePrintableKey /
+/// decodeKittyPrintable / isKeyRelease / isKeyRepeat are evaluated and
+/// serialized as `{ results: [...] }` with `None` as `null`.
+fn run_tui_keys_harness(input: &Value) -> Result<Value, String> {
+    use pi_tui::keys;
+    let cases = input["cases"].as_array().ok_or("missing cases array")?;
+    let mut results = Vec::new();
+    for case in cases {
+        let data = case["input"].as_str().ok_or("missing input string")?;
+        keys::set_kitty_protocol_active(case["kitty"].as_bool().unwrap_or(false));
+        let mut entry = serde_json::json!({
+            "parseKey": keys::parse_key(data),
+            "decodePrintableKey": keys::decode_printable_key(data),
+            "decodeKittyPrintable": keys::decode_kitty_printable(data),
+            "isKeyRelease": keys::is_key_release(data),
+            "isKeyRepeat": keys::is_key_repeat(data),
+        });
+        if let Some(ids) = case["keyIds"].as_array() {
+            let mut matches = serde_json::Map::new();
+            for id in ids {
+                let id = id.as_str().ok_or("keyIds entries must be strings")?;
+                matches.insert(id.to_string(), serde_json::json!(keys::matches_key(data, id)));
+            }
+            entry["matches"] = Value::Object(matches);
+        }
+        keys::set_kitty_protocol_active(false);
+        results.push(entry);
+    }
+    Ok(serde_json::json!({ "results": results }))
+}
+
+/// `tui-stdin-buffer` module-level harness entry: drives
+/// `packages/tui/src/stdin-buffer.ts` (mirrored on the TS side by
+/// ts-harness.js).
+///
+/// Input: `{ cases: [{ name, kitty?, timeoutMs?, escapeTimeoutMs?,
+/// script: { chunks: [string | {units:[u16]} | {bytes:[u8]}],
+/// fireTimeoutAfterEachChunk?, fireTimeoutAt?: [chunk indices] } }] }`.
+/// Both sides run the SAME chunk script: construct the buffer with the
+/// explicit options, process chunks in order, fire the pending timeout
+/// only where the script says (the TS harness patches setTimeout so the
+/// real timer callback runs synchronously at exactly the same points),
+/// then serialize the ordered event log (data/paste with UTF-16 unit
+/// arrays), the final buffer units, and the pending-timeout kind.
+fn run_tui_stdin_buffer_harness(input: &Value) -> Result<Value, String> {
+    use pi_tui::keys;
+    use pi_tui::stdin_buffer::{PendingTimeout, StdinBuffer, StdinBufferEvent, StdinBufferOptions};
+    let cases = input["cases"].as_array().ok_or("missing cases array")?;
+    let mut results = Vec::new();
+    for case in cases {
+        keys::set_kitty_protocol_active(case["kitty"].as_bool().unwrap_or(false));
+        let options = StdinBufferOptions {
+            timeout_ms: case["timeoutMs"].as_u64().unwrap_or(50),
+            escape_timeout_ms: case["escapeTimeoutMs"].as_u64().unwrap_or(10),
+        };
+        let script = &case["script"];
+        let chunks = script["chunks"].as_array().ok_or("missing chunks array")?;
+        let fire_after_each = script["fireTimeoutAfterEachChunk"].as_bool().unwrap_or(false);
+        let fire_at: Vec<usize> = script["fireTimeoutAt"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|u| u as usize))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut buffer = StdinBuffer::new(options);
+        for (i, chunk) in chunks.iter().enumerate() {
+            match chunk {
+                Value::String(s) => buffer.process(s),
+                Value::Object(o) if o.get("units").map(Value::is_array).unwrap_or(false) => {
+                    let units: Vec<u16> = o["units"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|v| v.as_u64().and_then(|u| u16::try_from(u).ok()))
+                        .collect();
+                    buffer.process_units(&units);
+                }
+                Value::Object(o) if o.get("bytes").map(Value::is_array).unwrap_or(false) => {
+                    let bytes: Vec<u8> = o["bytes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|v| v.as_u64().and_then(|u| u8::try_from(u).ok()))
+                        .collect();
+                    buffer.process_bytes(&bytes);
+                }
+                _ => return Err("invalid chunk: expected string, {units}, or {bytes}".to_string()),
+            }
+            if fire_after_each || fire_at.contains(&i) {
+                buffer.fire_timeout();
+            }
+        }
+        let events: Vec<Value> = buffer
+            .take_events()
+            .into_iter()
+            .map(|event| match event {
+                StdinBufferEvent::Data(units) => {
+                    serde_json::json!({ "type": "data", "units": units })
+                }
+                StdinBufferEvent::Paste(units) => {
+                    serde_json::json!({ "type": "paste", "units": units })
+                }
+            })
+            .collect();
+        let pending = match buffer.pending_timeout() {
+            Some(PendingTimeout::Escape) => serde_json::json!("escape"),
+            Some(PendingTimeout::Sequence) => serde_json::json!("sequence"),
+            None => Value::Null,
+        };
+        results.push(serde_json::json!({
+            "events": events,
+            "buffer": buffer.buffer().to_vec(),
+            "pendingTimeout": pending,
+        }));
+        buffer.destroy();
+        keys::set_kitty_protocol_active(false);
+    }
+    Ok(serde_json::json!({ "results": results }))
 }
 
 /// `tui-colors` entry. Expected errors are reported in-band as

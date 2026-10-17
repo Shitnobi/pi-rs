@@ -229,6 +229,105 @@ async function runModule(tool, args, cwd) {
 			return { error: String(e.message) };
 		}
 	}
+	if (tool === "tui-keys") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const k = await import(pathToFileURL(TUI_SRC + "/keys.ts").href);
+		const results = [];
+		for (const c of args.cases || []) {
+			// Set the global kitty flag per sub-case, then reset it so case
+			// ordering can never leak state (mirrors the Rust harness).
+			k.setKittyProtocolActive(!!c.kitty);
+			const entry = {
+				parseKey: k.parseKey(c.input) ?? null,
+				decodePrintableKey: k.decodePrintableKey(c.input) ?? null,
+				decodeKittyPrintable: k.decodeKittyPrintable(c.input) ?? null,
+				isKeyRelease: k.isKeyRelease(c.input),
+				isKeyRepeat: k.isKeyRepeat(c.input),
+			};
+			if (Array.isArray(c.keyIds)) {
+				entry.matches = {};
+				for (const id of c.keyIds) entry.matches[id] = k.matchesKey(c.input, id);
+			}
+			results.push(entry);
+			k.setKittyProtocolActive(false);
+		}
+		return { results };
+	}
+	if (tool === "tui-stdin-buffer") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const { StdinBuffer } = await import(pathToFileURL(TUI_SRC + "/stdin-buffer.ts").href);
+		const k = await import(pathToFileURL(TUI_SRC + "/keys.ts").href);
+		// Deterministic timers: patch setTimeout/clearTimeout (the module only
+		// touches them inside process()/flush(), so patching after import is
+		// safe) so scheduled timeouts never depend on real time. The pending
+		// timer's callback is invoked synchronously exactly where the case
+		// script says — mirroring the Rust harness's fire_timeout().
+		let pendingTimerFn = null;
+		const origSetTimeout = globalThis.setTimeout;
+		const origClearTimeout = globalThis.clearTimeout;
+		globalThis.setTimeout = (fn) => {
+			pendingTimerFn = fn;
+			return 1;
+		};
+		globalThis.clearTimeout = (id) => {
+			if (id === 1) pendingTimerFn = null;
+		};
+		const toUnits = (s) => {
+			const out = [];
+			for (let i = 0; i < s.length; i++) out.push(s.charCodeAt(i));
+			return out;
+		};
+		try {
+			const results = [];
+			for (const c of args.cases || []) {
+				k.setKittyProtocolActive(!!c.kitty);
+				const buffer = new StdinBuffer({
+					timeout: c.timeoutMs,
+					escapeTimeout: c.escapeTimeoutMs,
+				});
+				const events = [];
+				buffer.on("data", (s) => events.push({ type: "data", units: toUnits(s) }));
+				buffer.on("paste", (s) => events.push({ type: "paste", units: toUnits(s) }));
+				const script = c.script || {};
+				const chunks = script.chunks || [];
+				const fireAfterEach = !!script.fireTimeoutAfterEachChunk;
+				const fireAt = new Set(script.fireTimeoutAt || []);
+				const fire = () => {
+					if (pendingTimerFn) {
+						const fn = pendingTimerFn;
+						pendingTimerFn = null;
+						fn();
+					}
+				};
+				for (let i = 0; i < chunks.length; i++) {
+					const chunk = chunks[i];
+					if (typeof chunk === "string") buffer.process(chunk);
+					else if (chunk && Array.isArray(chunk.units))
+						buffer.process(String.fromCharCode(...chunk.units));
+					else if (chunk && Array.isArray(chunk.bytes)) buffer.process(Buffer.from(chunk.bytes));
+					else throw new Error("invalid chunk");
+					if (fireAfterEach || fireAt.has(i)) fire();
+				}
+				results.push({
+					events,
+					buffer: toUnits(buffer.getBuffer()),
+					pendingTimeout: pendingTimerFn
+						? buffer.getBuffer() === "\x1b"
+							? "escape"
+							: "sequence"
+						: null,
+				});
+				buffer.destroy();
+				k.setKittyProtocolActive(false);
+			}
+			return { results };
+		} finally {
+			globalThis.setTimeout = origSetTimeout;
+			globalThis.clearTimeout = origClearTimeout;
+		}
+	}
 	if (tool === "tui-terminal-colors") {
 		const { pathToFileURL } = require("url");
 		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";

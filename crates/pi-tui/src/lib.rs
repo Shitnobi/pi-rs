@@ -7,11 +7,21 @@
 pub mod colors;
 pub mod fdlibm;
 pub mod fuzzy;
+pub mod keys;
+pub mod keybindings;
 pub mod kill_ring;
+pub mod native_modifiers;
+pub mod native_module_path;
+pub mod native_platform;
 pub mod oklab;
 pub mod program_status;
+pub mod stdin_buffer;
+pub mod terminal;
 pub mod terminal_colors;
 pub mod unicode;
 pub mod word_navigation;
 pub mod undo_stack;
 pub mod utils;
+
+#[cfg(test)]
+pub mod test_support;
