@@ -354,6 +354,22 @@ pub trait Component {
     fn layout_node(&mut self) -> Option<LayoutNode> {
         None
     }
+
+    /// The TS `Focusable` type guard `"focused" in component`
+    /// (tui.ts:186-188). Components implementing [`Focusable`] override
+    /// this to expose their focus state; the T5 renderer's `setFocus`
+    /// toggles `focused` through it. Default `None` = "not focusable".
+    fn as_focusable(&mut self) -> Option<&mut dyn Focusable> {
+        None
+    }
+
+    /// TS `root instanceof Container` (tui.ts:695): expose the `Container`
+    /// child list for the overlay focus machinery's `containsComponent`
+    /// walk. Only [`Container`] (and T5 screens, which own one) return
+    /// `Some`. Default `None` = "not a Container".
+    fn as_container(&self) -> Option<&Container> {
+        None
+    }
 }
 
 // =============================================================================
@@ -379,11 +395,11 @@ pub trait TuiHost {
 /// `CURSOR_MARKER` at the cursor position in its render output; the TUI
 /// finds the marker and positions the hardware cursor there.
 ///
-/// The TS type guard is `"focused" in component`; the Rust bridge for that
-/// check lands with the T5 renderer (via `Any` downcasting), where
-/// `setFocus` is implemented.
-pub trait Focusable {
-    /// Set by TUI when focus changes. Component should emit CURSOR_MARKER
+/// The TS type guard is `"focused" in component`; the Rust bridge is
+/// [`Component::as_focusable`] (T5): `is_focusable(component)` ⇔
+/// `component.as_focusable().is_some()`, and `setFocus` toggles the flag
+/// through it.
+pub trait Focusable {    /// Set by TUI when focus changes. Component should emit CURSOR_MARKER
     /// when true.
     fn focused(&self) -> bool;
     fn set_focused(&mut self, focused: bool);
@@ -408,18 +424,10 @@ pub fn render_fake_cursor(text: &str) -> String {
     format!("{FAKE_CURSOR_START}{text}{FAKE_CURSOR_END}")
 }
 
-/// Port of `isImageLine` (terminal-image.ts:207-214; the rest of
-/// terminal-image lands in T6 — the prefixes are stable).
-pub fn is_image_line(line: &str) -> bool {
-    const KITTY_PREFIX: &str = "\x1b_G";
-    const ITERM2_PREFIX: &str = "\x1b]1337;File=";
-    // Fast path: sequence at line start (single-row images); slow path:
-    // sequence elsewhere (multi-row images have cursor-up prefix).
-    line.starts_with(KITTY_PREFIX)
-        || line.starts_with(ITERM2_PREFIX)
-        || line.contains(KITTY_PREFIX)
-        || line.contains(ITERM2_PREFIX)
-}
+/// Port of `isImageLine` (terminal-image.ts:207-214). Promoted to
+/// [`crate::terminal_image`] in T5; re-exported here for the existing
+/// call sites.
+pub use crate::terminal_image::is_image_line;
 
 /// `SEGMENT_RESET` (tui.ts:421).
 const SEGMENT_RESET: &str = "\x1b[0m\x1b]8;;\x07";
@@ -533,6 +541,11 @@ impl Container {
 }
 
 impl Component for Container {
+    /// A `Container` is itself (tui.ts:695 `instanceof Container`).
+    fn as_container(&self) -> Option<&Container> {
+        Some(self)
+    }
+
     fn render(&mut self, width: usize) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
         let mut mouse_children: Vec<(ComponentRef, i64)> = Vec::new();

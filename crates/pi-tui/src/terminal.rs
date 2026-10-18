@@ -31,9 +31,9 @@ use std::rc::Rc;
 
 use crate::keys::{env_get, set_kitty_protocol_active};
 use crate::program_status::{
-    format_program_status, is_program_status_reply, ProgramState, ProgramStatus,
-    PROGRAM_STATUS_QUERY,
+    format_program_status, is_program_status_reply, ProgramState, PROGRAM_STATUS_QUERY,
 };
+pub use crate::program_status::ProgramStatus;
 use crate::stdin_buffer::{units_to_string, StdinBuffer, StdinBufferEvent, StdinBufferOptions};
 use crate::utils::is_js_whitespace;
 

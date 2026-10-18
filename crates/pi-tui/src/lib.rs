@@ -5,6 +5,7 @@
 //! original TypeScript implementation; see `docs/TUI_PORT_PLAN.md`.
 
 pub mod colors;
+pub mod clock;
 pub mod component;
 pub mod components;
 pub mod fdlibm;
@@ -22,6 +23,10 @@ pub mod program_status;
 pub mod stdin_buffer;
 pub mod terminal;
 pub mod terminal_colors;
+pub mod terminal_image;
+pub mod tui;
+pub mod tui_overlay;
+pub mod wheel_scroll;
 pub mod unicode;
 pub mod word_navigation;
 pub mod undo_stack;

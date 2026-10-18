@@ -44,11 +44,12 @@
 //!   upstream `await sleep(30)` with an explicit timer-expiry call on the
 //!   test fixture).
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 use crate::component::{composite_tui_line, is_image_line, ComponentRef, CURSOR_MARKER};
+use crate::terminal_image::{crop_kitty_image_line, get_kitty_image_metadata};
 use crate::layout_node::{
     Basis, LayoutNode, LayoutViewport, ScrollLayoutNode, ScrollLayoutState, StackAlign,
     StackType,
@@ -617,135 +618,6 @@ fn paint_scrollbar(box_: &LayoutBox, screen: &mut Vec<String>, total_width: i64)
             replace_scrollbar_cell(&base, geometry.column, total_width, &replacement, preserve_target_background);
     }
 }
-
-// =============================================================================
-// [T6] Kitty image helpers (terminal-image.ts:326-480, minimal surface)
-// =============================================================================
-
-/// `KittyImageMetadata` (terminal-image.ts:326-334). [T6]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct KittyImageMetadata {
-    image_id: i64,
-    columns: i64,
-    rows: i64,
-    width_px: i64,
-    height_px: i64,
-}
-
-/// [T6] Internal registry entry (terminal-image.ts:336-346). Insertion order
-/// is preserved with a `Vec`; the >1000 cap evicts the oldest entry.
-struct RegisteredKittyImageMetadata {
-    metadata: KittyImageMetadata,
-    #[allow(dead_code)] // [T6] parity field, read when terminal-image lands
-    transmission_generation: i64,
-}
-
-thread_local! {
-    static KITTY_IMAGE_METADATA: RefCell<Vec<RegisteredKittyImageMetadata>> = const { RefCell::new(Vec::new()) };
-    static KITTY_TRANSMISSION_GENERATION: Cell<i64> = const { Cell::new(0) };
-}
-
-/// `registerKittyImageMetadata` (terminal-image.ts:349-359). [T6]
-#[allow(dead_code)] // wired up when terminal-image rendering lands (T6)
-fn register_kitty_image_metadata(metadata: KittyImageMetadata) {
-    KITTY_TRANSMISSION_GENERATION.with(|generation| generation.set(generation.get() + 1));
-    let transmission_generation = KITTY_TRANSMISSION_GENERATION.with(|generation| generation.get());
-    KITTY_IMAGE_METADATA.with(|registry| {
-        let mut registry = registry.borrow_mut();
-        registry.retain(|entry| entry.metadata.image_id != metadata.image_id);
-        registry.push(RegisteredKittyImageMetadata {
-            metadata,
-            transmission_generation,
-        });
-        if registry.len() > 1000 {
-            registry.remove(0);
-        }
-    });
-}
-
-/// `/\x1b_G([^;]*);/` — the first Kitty control block in the line, as
-/// `(byte start, byte match length, controls)` (terminal-image.ts:380-384,
-/// 458-460). [T6]
-fn find_kitty_controls(line: &str) -> Option<(usize, usize, &str)> {
-    let start = line.find("\x1b_G")?;
-    let controls_start = start + "\x1b_G".len();
-    let semi = controls_start + line[controls_start..].find(';')?;
-    Some((start, semi + 1 - start, &line[controls_start..semi]))
-}
-
-/// `getRegisteredKittyImageMetadataFromControls` (terminal-image.ts:361-363):
-/// `/(?:^|,)i=(\d+)(?:,|$)/` over the controls. [T6]
-fn registered_metadata_from_controls(controls: &str) -> Option<KittyImageMetadata> {
-    for part in controls.split(',') {
-        if let Some(value) = part.strip_prefix("i=") {
-            // The regex requires the digits to run to the ',' or end.
-            if value.is_empty() || !value.chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
-            let image_id: i64 = value.parse().ok()?;
-            return KITTY_IMAGE_METADATA.with(|registry| {
-                registry
-                    .borrow()
-                    .iter()
-                    .find(|entry| entry.metadata.image_id == image_id)
-                    .map(|entry| entry.metadata)
-            });
-        }
-    }
-    None
-}
-
-/// `getKittyImageMetadata` (terminal-image.ts:380-388). [T6]
-fn get_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
-    let (_, _, controls) = find_kitty_controls(line)?;
-    registered_metadata_from_controls(controls)
-}
-
-/// `cropKittyImageLine` (terminal-image.ts:458-478). [T6]
-fn crop_kitty_image_line(line: &str, hidden_rows: i64, visible_rows: i64) -> String {
-    let metadata = match get_kitty_image_metadata(line) {
-        Some(metadata) => metadata,
-        None => return line.to_string(),
-    };
-    let (start, match_len, controls) = match find_kitty_controls(line) {
-        Some(found) => found,
-        None => return line.to_string(),
-    };
-    if hidden_rows < 0 || hidden_rows >= metadata.rows || visible_rows <= 0 {
-        return line.to_string();
-    }
-    let cropped_rows = visible_rows.min(metadata.rows - hidden_rows);
-    if hidden_rows == 0 && cropped_rows == metadata.rows {
-        return line.to_string();
-    }
-    let source_y = ((metadata.height_px as f64 * hidden_rows as f64) / metadata.rows as f64).floor();
-    let source_end =
-        ((metadata.height_px as f64 * (hidden_rows + cropped_rows) as f64) / metadata.rows as f64).ceil();
-    let source_height = 1f64.max((metadata.height_px as f64).min(source_end) - source_y);
-    let mut rebuilt = controls
-        .split(',')
-        .filter(|control| {
-            !control.starts_with("y=") && !control.starts_with("h=") && !control.starts_with("r=")
-        })
-        .collect::<Vec<&str>>()
-        .join(",");
-    if !rebuilt.is_empty() || !controls.is_empty() {
-        rebuilt.push(',');
-    }
-    rebuilt.push_str(&format!(
-        "y={},h={},r={}",
-        source_y as i64,
-        source_height as i64,
-        cropped_rows
-    ));
-    format!(
-        "{}\x1b_G{};{}",
-        &line[..start],
-        rebuilt,
-        &line[start + match_len..]
-    )
-}
-
 // =============================================================================
 // paintBox (layout.ts:265-314)
 // =============================================================================
@@ -990,6 +862,7 @@ mod tests {
     use crate::component::Component;
     use crate::components::stack::{allocate_stack_sizes, visible_stack_entries};
     use crate::layout_node::{LayoutViewport, Overscroll, StackLayoutEntry, StackLayoutNode};
+    use crate::terminal_image::{register_kitty_image_metadata, KittyImageMetadata};
     use crate::utils::{
         apply_background_to_line, js_trim, strip_terminal_sequences, wrap_text_with_ansi,
     };

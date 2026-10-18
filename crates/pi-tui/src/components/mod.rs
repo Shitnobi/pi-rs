@@ -1,6 +1,7 @@
 //! Ports of `packages/tui/src/components/*` — one module per TS component.
 
 pub mod autocomplete;
+pub mod alt_screen_flash;
 pub mod box_component;
 pub mod cancellable_loader;
 pub mod editor;
