@@ -447,7 +447,7 @@ Remaining, roughly in dependency order:
     sync provider trait) rather than after a microtask hop —
     unobservable through the public surface.
 
-## T5 — TUI alt-screen (in progress; last updated 2026-10-18)
+## T5 — TUI alt-screen (COMPLETE; last updated 2026-10-18)
 
 - Waves A+B complete and committed (latest: 91d7970).
   - Wave A (c15deac, 683f3a2 skeletons): tui_main_screen.rs (D-A2),
@@ -527,11 +527,12 @@ Remaining, roughly in dependency order:
        after one tick (selection-autoscroll-edge off-by-one).
    - Debug pattern kept: node /tmp/casediff.mjs <tool> <case-substring>
      [show] runs one case on both sides and prints field diffs.
-2. Redteams R1 (overlay/focus state machine), R2 (main-screen diff
-   algorithm vs write stream), R3 (alt-screen selection + search) —
-   report-first to /tmp/report-t5-R*.md; verify claims against TS
-   before changing impl (delegate/redteam expectations are frequently
-   wrong — always probe TS ground truth first).
+2. ~~Redteams R1-R3~~ **COMPLETE** (committed with the R3 hardening;
+   reports in docs/report-t5-R{1,2,3}.md): all three subsystems clean.
+   R3 hardened one unreachable seam (JS `matches[-1] === undefined` vs
+   Rust `.max(0)` fallback in update_search_query + reveal lookup).
+   T5 is now DONE (harness + 100 cases + redteams; 665/665 parity,
+   1000/1000 tests).
 3. After T5: T6 markdown/latex/terminal-image remainder + marked-lex
    decision; T7 batter framework; ~123 pre-existing pi-tui clippy
    warnings or correct TRACKING.md claims.
