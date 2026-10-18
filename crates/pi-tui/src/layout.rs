@@ -169,6 +169,24 @@ pub trait ScrollViewState: ScrollLayoutState {
     fn scroll_to_end(&mut self);
     /// `setScrollbarActive(active)` (scroll-view.ts).
     fn set_scrollbar_active(&mut self, active: bool);
+    /// Port machinery (no TS counterpart): fire the modeled
+    /// `scrollbarHideTimer` when its virtual-clock deadline is due.
+    /// Returns whether it fired.
+    fn fire_due_scrollbar_hide_timer(&mut self) -> bool;
+}
+
+/// Port machinery (no TS counterpart): fire every live scroll view's
+/// due `scrollbarHideTimer` (the TS `setTimeout` callbacks run off the
+/// shared event loop; here the clock owner pumps the registry).
+pub fn pump_scrollbar_hide_timers() {
+    let states: Vec<ScrollViewRef> = SCROLL_VIEW_STATES.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.retain(|_, weak| weak.strong_count() > 0);
+        registry.values().filter_map(|weak| weak.upgrade()).collect()
+    });
+    for state in states {
+        state.borrow_mut().fire_due_scrollbar_hide_timer();
+    }
 }
 
 /// Shared handle to a scroll view's state (the TS `ScrollView` object
@@ -1281,6 +1299,10 @@ mod tests {
             self.render_requested = true;
         }
 
+        fn fire_due_scrollbar_hide_timer(&mut self) -> bool {
+            false
+        }
+
         fn set_scrollbar_active(&mut self, active: bool) {
             if active == self.scrollbar_active {
                 return;
@@ -1452,6 +1474,10 @@ mod tests {
             let max = (self.content_height - self.viewport_height).max(0);
             self.scroll_top = max;
             self.following_end = self.follow_end;
+        }
+
+        fn fire_due_scrollbar_hide_timer(&mut self) -> bool {
+            false
         }
 
         fn set_scrollbar_active(&mut self, active: bool) {

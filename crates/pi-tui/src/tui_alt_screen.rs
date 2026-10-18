@@ -646,6 +646,9 @@ impl TuiAltScreen {
     /// (TS: `setInterval(() => this.autoScrollSelection(), 50)`).
     fn pump_screen_timers(&mut self) {
         crate::alt_screen_selection::pump_selection_auto_scroll(self);
+        // TS: flash-expiry `setTimeout` callbacks remove the entry and
+        // request a render (alt-screen-flash.ts:22-29).
+        self.flashes.tick();
     }
 
     /// `readonly mode = "fullscreen"`.

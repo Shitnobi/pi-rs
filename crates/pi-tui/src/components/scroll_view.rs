@@ -158,8 +158,10 @@ pub struct ScrollViewStateData {
     /// `private scrollbarActive` (scroll-view.ts:38).
     scrollbar_active: bool,
     /// `private scrollbarHideTimer` (scroll-view.ts:39) — modeled as the
-    /// armed flag (see module notes).
+    /// armed flag plus the virtual-clock deadline the pump compares
+    /// against (see module notes).
     hide_timer_armed: bool,
+    hide_timer_deadline: Option<f64>,
 }
 
 impl ScrollViewStateData {
@@ -197,6 +199,7 @@ impl ScrollViewStateData {
             transient_scrollbar_visible: false,
             scrollbar_active: false,
             hide_timer_armed: false,
+            hide_timer_deadline: None,
         }
     }
 
@@ -285,11 +288,14 @@ impl ScrollViewStateData {
         self.transient_scrollbar_visible = true;
         // `clearTimeout(this.scrollbarHideTimer)` (scroll-view.ts:130-133).
         self.hide_timer_armed = false;
+        self.hide_timer_deadline = None;
         if self.scrollbar_active {
             return;
         }
-        // `setTimeout(...)` + `unref()` (scroll-view.ts:135-141).
+        // `setTimeout(...)` + `unref()` (scroll-view.ts:135-141): the
+        // deadline feeds the clock pump.
         self.hide_timer_armed = true;
+        self.hide_timer_deadline = Some(crate::clock::now_ms() + self.hide_delay_ms as f64);
     }
 
     /// `private hideTransientScrollbar()` (scroll-view.ts:140-146).
@@ -299,6 +305,7 @@ impl ScrollViewStateData {
             return;
         }
         self.hide_timer_armed = false;
+        self.hide_timer_deadline = None;
     }
 
     /// [divergence] Fires the modeled hide timer
@@ -308,9 +315,23 @@ impl ScrollViewStateData {
     pub fn expire_scrollbar_hide_timer(&mut self) {
         if self.hide_timer_armed {
             self.hide_timer_armed = false;
+            self.hide_timer_deadline = None;
             self.transient_scrollbar_visible = false;
             self.request_render();
         }
+    }
+
+    /// Clock-pump entry (no TS counterpart): fire the modeled hide timer
+    /// only once the virtual clock reaches its deadline.
+    fn fire_due_scrollbar_hide_timer(&mut self) -> bool {
+        let due = self.hide_timer_armed
+            && self
+                .hide_timer_deadline
+                .is_some_and(|deadline| crate::clock::now_ms() >= deadline);
+        if due {
+            self.expire_scrollbar_hide_timer();
+        }
+        due
     }
 
     /// `setScrollbar(scrollbar)` (scroll-view.ts:86-93).
@@ -574,6 +595,10 @@ impl crate::layout::ScrollViewState for ScrollViewStateData {
 
     fn set_scrollbar_active(&mut self, active: bool) {
         ScrollViewStateData::set_scrollbar_active(self, active)
+    }
+
+    fn fire_due_scrollbar_hide_timer(&mut self) -> bool {
+        ScrollViewStateData::fire_due_scrollbar_hide_timer(self)
     }
 }
 

@@ -1329,6 +1329,7 @@ macro_rules! impl_tui_surface {
             /// timers and color-query timeouts.
             pub fn advance_clock(&mut self, ms: f64) {
                 $crate::clock::advance_ms(ms);
+                $crate::layout::pump_scrollbar_hide_timers();
                 self.pump_screen_timers();
                 self.run_pending_ticks();
                 while self.base.fire_due_render_timer() {
