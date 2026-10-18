@@ -12,3 +12,4 @@ repository = "https://github.com/earendil-works/pi-rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 unicode-normalization = "0.1"
+fancy-regex = "0.19"

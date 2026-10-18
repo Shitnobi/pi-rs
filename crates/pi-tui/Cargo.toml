@@ -6,3 +6,6 @@ license.workspace = true
 description = "Rust port of @earendil-works/pi-tui (terminal UI library with differential rendering)"
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+fancy-regex = { workspace = true }

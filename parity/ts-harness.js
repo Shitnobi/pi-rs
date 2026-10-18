@@ -328,6 +328,19 @@ async function runModule(tool, args, cwd) {
 			globalThis.clearTimeout = origClearTimeout;
 		}
 	}
+	if (tool === "tui-markdown-lex") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const md = await import(pathToFileURL(TUI_SRC + "/components/markdown.ts").href);
+		switch (args.fn) {
+			case "lex":
+				// Token trees are plain JSON: undefined fields vanish under
+				// JSON.stringify, matching the Rust serialization contract.
+				return { result: md.lexMarkdown(args.source) };
+			default:
+				throw new Error("unknown tui-markdown-lex fn: " + args.fn);
+		}
+	}
 	if (tool === "tui-terminal-image") {
 		const { pathToFileURL } = require("url");
 		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
