@@ -447,7 +447,7 @@ Remaining, roughly in dependency order:
     sync provider trait) rather than after a microtask hop —
     unobservable through the public surface.
 
-## T5 — TUI alt-screen (in progress; last updated 2026-10-17)
+## T5 — TUI alt-screen (in progress; last updated 2026-10-18)
 
 - Waves A+B complete and committed (latest: 91d7970).
   - Wave A (c15deac, 683f3a2 skeletons): tui_main_screen.rs (D-A2),
@@ -463,7 +463,7 @@ Remaining, roughly in dependency order:
     fake-cursor resolution, kitty image cache, indicator/flash
     compositing). Worktrees wt-B1/B2/B3 + branches removed after merge.
 - Status: pi-tui 1000 tests green / 0 warnings (lib + release);
-  parity 565/565; cargo build --release clean.
+  parity 665/665; cargo build --release clean.
 - Real TS bugs found & fixed during integration (probe-verified):
   - tui_overlay.rs clamp order: TS does `max(marginTop, min(row,
     termHeight - marginBottom - effectiveHeight))` — inner min FIRST
@@ -493,14 +493,40 @@ Remaining, roughly in dependency order:
   reconstruct the pre-reset frame applySelection receives.
 
 ### Remaining T5 work (resume here)
-1. Wave C: parity harness tui-main + tui-alt tools both sides
-   (RecordingTerminal, script ops per T5_PLAN, base64 write-stream
-   frames) + case authoring from upstream tests (tui-render.test.ts
-   1024 LOC, tui-alt-screen.test.ts 2100 LOC, wheel-scroll 47,
-   tui-overlay-style-leak 81, tui-shrink 45, tui-cell-size-input 82).
-   Reuse the run_tui_editor_harness pattern in pi-cli/src/main.rs
-   (~line 1982) and the parity runner (parity/run-parity.mjs, run from
-   pi-rs/parity; cargo build --release first).
+1. ~~Wave C~~ **COMPLETE** (commits d452785, 187510c, 1872c4d):
+   - Harness 'tui-main'/'tui-alt' both sides (script ops: addChild,
+     input, terminalReply, setFocus, showOverlay/hideOverlay,
+     requestRender/renderNow, resize, tickMs, start, stop; alt-only
+     setLayoutRoot, scrollBy, flash). Frames split at \x1b[?2026h.
+   - 100 cases authored in parity/wavec/ (shared builders in
+     wavec-helpers.mjs): main-cases.mjs (32, ports of tui-render/
+     tui-shrink/tui-cell-size-input), alt-cases.mjs (43, ports of
+     tui-alt-screen behaviors), interaction-cases.mjs (25, ports of
+     wheel-scroll/tui-overlay-style-leak/overlay-options/
+     overlay-non-capturing). All validated against TS before merge.
+   - Final: parity 665/665; pi-tui tests 1000/1000.
+   - Real Rust bugs found & fixed by the cases (all TS-probed first):
+     - Input/Editor lacked Component::as_focusable → setFocus never set
+       the focused flag → missing hardware-cursor writes.
+     - consume_cell_size_response re-borrowed the surface during input
+       dispatch (RefCell panic) → deferred via cell_size_invalidate_
+       pending drained in run_pending_ticks.
+     - Loader/CancellableLoader setInterval never fired (TS arms a real
+       interval in restartAnimation) → LoaderClock registry pumped by
+       advance_clock's early tier.
+     - HStack/VStack lacked container_children → dispatchMouseToLayout
+       skip rule (inherited Container.handleMouse) wrongly dispatched
+       clicks through stacks.
+     - Scroll-view requestRenderCallback seam (scroll-view.ts:192) was
+       dropped in the port → setScrollbarActive/hide-timer expiry
+       renders went nowhere; now parked in a thread-local and drained
+       into request_render in TuiBase::drain_parked_render_request
+       (fixes scrollbar reveal/hide frames).
+     - pump_screen_timers_until didn't report selection auto-scroll
+       fires → advance_clock's defensive break stopped the interval
+       after one tick (selection-autoscroll-edge off-by-one).
+   - Debug pattern kept: node /tmp/casediff.mjs <tool> <case-substring>
+     [show] runs one case on both sides and prints field diffs.
 2. Redteams R1 (overlay/focus state machine), R2 (main-screen diff
    algorithm vs write stream), R3 (alt-screen selection + search) —
    report-first to /tmp/report-t5-R*.md; verify claims against TS

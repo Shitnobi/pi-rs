@@ -1297,12 +1297,18 @@ impl TuiAltScreen {
             return;
         }
         // `search.anchorRow = selected?.segments[0]?.row ?? scrollTop`.
-        let anchor_row = search
-            .matches
-            .get(search.selected_index.max(0) as usize)
-            .and_then(|selected| selected.segments.first())
-            .map(|segment| segment.row as i64)
-            .unwrap_or(primary_top);
+        // JS `search.matches[search.selectedIndex]` with a negative index
+        // is `undefined` — it must NOT fall back to `matches[0]`.
+        let anchor_row = if search.selected_index >= 0 {
+            search
+                .matches
+                .get(search.selected_index as usize)
+                .and_then(|selected| selected.segments.first())
+                .map(|segment| segment.row as i64)
+        } else {
+            None
+        }
+        .unwrap_or(primary_top);
         search.anchor_row = anchor_row;
         search.query = query.to_string();
         search.selection_mode = SearchSelectionMode::Query;
@@ -1496,8 +1502,13 @@ impl TuiAltScreen {
             return false;
         }
 
-        // Reveal the selected match (tui-alt-screen.ts:650-663).
-        let selected = matches.get(selected_index.max(0) as usize);
+        // Reveal the selected match (tui-alt-screen.ts:650-663). JS
+        // `matches[selectedIndex]` with a negative index is `undefined`.
+        let selected = if selected_index >= 0 {
+            matches.get(selected_index as usize)
+        } else {
+            None
+        };
         let first_segment = selected.and_then(|selected| selected.segments.first());
         let last_segment = selected.and_then(|selected| selected.segments.last());
         let viewport_height = scroll_view.borrow().viewport_height();
