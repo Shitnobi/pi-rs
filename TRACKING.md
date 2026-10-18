@@ -180,13 +180,19 @@ Remaining, roughly in dependency order:
 | G8 | async | `NestedToolCallRunner` (drives the agent tool pipeline) and `file-mutation-queue.ts` (global registration queue + per-realpath mutation queues) need an async runtime and the agent session layer; deferred with the agent-loop tranche. `NestedCallRecorder` — the persisted half — is ported | 3+ |
 ## Parity suite status
 
-- 565/565 cases pass (stable across repeated runs; the `tui-components`
-  render-line differential group from TUI tranche 3 plus the
-  `tui-editor` event-sequence differential group added in T4)
-- 1005 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
+- 1077/1077 cases pass (stable across repeated runs; includes the built-in
+  tools, core-runtime modules, and the TUI groups: `tui-utils`,
+  `tui-colors`, `math`, `tui-word-navigation`, `tui-keys`,
+  `tui-stdin-buffer`, `tui-components`, `tui-editor`, `tui-main`,
+  `tui-alt`, `tui-terminal-colors`, `tui-terminal-image`,
+  `tui-markdown-lex`, `tui-latex`, `tui-markdown-render`)
+- 1303 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
   plus fuzz corpora: ansi 2010 cases, decoder 800 cases, pi-photon
   byte-parity, segmenter corpus 1208 cases)
-- `cargo clippy --all-targets` clean
+- `cargo clippy --all-targets`: 0 errors, ~190 warnings. The warnings are
+  predominantly intentional: ~56 non_snake_case mirrors of TS field names
+  (e.g. markdown token fields) and small style lints in faithful-port code;
+  the fdlibm constants/idioms are `allow`-annotated with justification.
 
 ## Changelog
 
@@ -536,3 +542,48 @@ Remaining, roughly in dependency order:
 3. After T5: T6 markdown/latex/terminal-image remainder + marked-lex
    decision; T7 batter framework; ~123 pre-existing pi-tui clippy
    warnings or correct TRACKING.md claims.
+
+## T6 — Media: terminal-image, marked, markdown, latex (COMPLETE; last updated 2026-10-18)
+
+- **terminal-image remainder** (062c9e3): `encodeKitty`, `encodeITerm2`,
+  image-dimension parsers (PNG/GIF/WebP), `calculateImage*`,
+  `renderImage`, `hyperlink`, `imageFallback` — the T5 slice had covered
+  capabilities/detection/crop only. 67 parity cases
+  (`tui-terminal-image`).
+- **Marked decision resolved → option (a), hand-port** (a336c30, be941aa,
+  86b4fd5): the full `marked` lexer/tokenizer was hand-ported to
+  `pi-tui/src/marked.rs` — rules generated from a live Node regex dump,
+  JS-semantics helpers, and the token model exactly as `markdown.ts`
+  consumes it. Validated by the `tui-markdown-lex` differential entry:
+  124 cases, TS-validated before merge; full suite 856/856 at the time.
+- **Image component** (b6d9d19): `components/image.rs` port with the
+  registered seams; latex/markdown stubs at that point.
+- **latex renderer** (54fdf12): full port of `latex.ts` (1506 LOC) →
+  `pi-tui/src/latex.rs` — the Unicode-text math renderer (symbols,
+  scripts, fractions, sqrt, matrices, accents, …).
+- **markdown renderer** (8340a70): full port of `components/markdown.ts`
+  (1038 LOC) → `pi-tui/src/components/markdown.rs` — block layout over
+  the marked token stream, theme callbacks, options
+  (`preserveOrderedListMarkers`, `preserveBackslashEscapes`,
+  `renderLatex`), inline styling.
+- **Wave D parity cases** (this commit): `parity/waved/latex-cases.mjs`
+  (125 cases; `tui-latex` — drawn from latex.test.ts plus the
+  CommonMark/LaTeX shapes markdown relies on) and
+  `parity/waved/markdown-render-cases.mjs` (96 cases;
+  `tui-markdown-render` — headings, emphasis, links, code, quotes,
+  lists, tables, HTML, streaming/partial-fence shapes, options matrix,
+  under a deterministic marker theme identical on both sides). Harness
+  entries wired on both sides (`pi-cli harness tool tui-latex|
+  tui-markdown-render`, TS dynamic-imports the sources). Final:
+  **parity 1077/1077, 1303 Rust tests, clippy 0 errors.**
+- Clippy error fixes (pre-existing, surfaced by rustc 1.97 lints):
+  fdlibm.rs now `allow`s `approx_constant`/`excessive_precision`/`eq_op`
+  with justification (verbatim fdlibm literals and the `x - x` NaN
+  idiom); `tui_main_screen.rs` `total_lines <= 0` → `== 0` (usize —
+  behavior-identical). The remaining ~190 warnings are documented in
+  the parity-status section above (mostly intentional TS-field-name
+  mirrors); the "clippy clean" claim was corrected rather than
+  mechanically renaming ported fields.
+- Remaining after T6: T7 batter framework (seeded generators + shrinker,
+  see TUI_PORT_PLAN.md); agent-session layer (Phase 3 continuation:
+  `file-mutation-queue`, MCP/extensions, `agent-session*`, providers).

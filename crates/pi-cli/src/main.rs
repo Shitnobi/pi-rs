@@ -108,6 +108,8 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
         "tui-terminal-colors" => return run_tui_terminal_colors_harness(&input),
         "tui-terminal-image" => return run_tui_terminal_image_harness(&input),
         "tui-markdown-lex" => return run_tui_markdown_lex_harness(&input),
+        "tui-latex" => return run_tui_latex_harness(&input),
+        "tui-markdown-render" => return run_tui_markdown_render_harness(&input),
         "tui-keys" => return run_tui_keys_harness(&input),
         "tui-stdin-buffer" => return run_tui_stdin_buffer_harness(&input),
         "tui-components" => return run_tui_components_harness(&input),
@@ -798,6 +800,76 @@ fn run_tui_markdown_lex_harness(input: &Value) -> Result<Value, String> {
             }))
         }
         _ => Err(format!("unknown tui-markdown-lex fn: {fn_name}")),
+    }
+}
+
+fn run_tui_latex_harness(input: &Value) -> Result<Value, String> {
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    match fn_name {
+        "render" => {
+            let source = input["source"]
+                .as_str()
+                .ok_or("missing source")?
+                .to_string();
+            let display = input["display"].as_bool().unwrap_or(false);
+            let result = pi_tui::latex::render_latex(
+                &source,
+                &pi_tui::latex::RenderLatexOptions {
+                    display: Some(display),
+                },
+            );
+            // null (not absent) so both sides serialize identically.
+            Ok(serde_json::json!({ "result": result }))
+        }
+        _ => Err(format!("unknown tui-latex fn: {fn_name}")),
+    }
+}
+
+fn run_tui_markdown_render_harness(input: &Value) -> Result<Value, String> {
+    use pi_tui::components::markdown::{Markdown, MarkdownOptions, MarkdownTheme};
+
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    match fn_name {
+        "render" => {
+            let source = input["source"]
+                .as_str()
+                .ok_or("missing source")?
+                .to_string();
+            let padding_x = input["paddingX"].as_u64().unwrap_or(0) as usize;
+            let padding_y = input["paddingY"].as_u64().unwrap_or(0) as usize;
+            let width = input["width"].as_u64().unwrap_or(40) as usize;
+            // Deterministic marker theme shared 1:1 with the TS harness.
+            let theme = MarkdownTheme {
+                heading: Box::new(|t: &str| format!("#<{t}>")),
+                link: Box::new(|t: &str| format!("L<{t}>")),
+                link_url: Box::new(|t: &str| format!("U<{t}>")),
+                code: Box::new(|t: &str| format!("C<{t}>")),
+                code_block: Box::new(|t: &str| format!("CB<{t}>")),
+                code_block_border: Box::new(|t: &str| format!("B<{t}>")),
+                quote: Box::new(|t: &str| format!("Q<{t}>")),
+                quote_border: Box::new(|_t: &str| "|".to_string()),
+                hr: Box::new(|t: &str| format!("-{t}-")),
+                list_bullet: Box::new(|t: &str| format!("*{t}")),
+                bold: Box::new(|t: &str| format!("**{t}**")),
+                italic: Box::new(|t: &str| format!("_{t}_")),
+                strikethrough: Box::new(|t: &str| format!("~{t}~")),
+                underline: Box::new(|t: &str| format!("_<{t}>_")),
+                highlight_code: None,
+                code_block_indent: None,
+            };
+            let mut options = MarkdownOptions::default();
+            if let Some(o) = input.get("options") {
+                options.preserve_ordered_list_markers =
+                    o["preserveOrderedListMarkers"].as_bool();
+                options.preserve_backslash_escapes = o["preserveBackslashEscapes"].as_bool();
+                options.render_latex = o["renderLatex"].as_bool();
+            }
+            let mut component =
+                Markdown::new(source, padding_x, padding_y, theme, None, Some(options));
+            let lines = pi_tui::component::Component::render(&mut component, width);
+            Ok(serde_json::json!({ "result": lines }))
+        }
+        _ => Err(format!("unknown tui-markdown-render fn: {fn_name}")),
     }
 }
 

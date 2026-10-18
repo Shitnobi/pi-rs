@@ -18,6 +18,16 @@
 //! fdlibm license (Sun Microsystems, freely granted) applies to the algorithm;
 //! V8 modifications are Copyright 2016 the V8 project authors.
 
+#![allow(
+    // The constants below are verbatim fdlibm literals (20+ significant digits,
+    // several of which approximate multiples of π); rewriting them to std's
+    // shorter consts or truncating digits would break the bit-exact port.
+    clippy::approx_constant,
+    clippy::excessive_precision,
+    // `x - x` is fdlibm's canonical way of producing NaN/±0 for inf/NaN inputs.
+    clippy::eq_op
+)]
+
 // --- bit-level helpers (mirrors of the fdlibm C macros) ----------------------
 
 #[inline]

@@ -982,7 +982,7 @@ impl TuiMainScreen {
             self.base.terminal.borrow_mut().hide_cursor();
             return;
         };
-        if total_lines <= 0 {
+        if total_lines == 0 {
             self.base.terminal.borrow_mut().hide_cursor();
             return;
         }

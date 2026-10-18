@@ -1,0 +1,159 @@
+// T6 differential parity cases — LaTeX renderer (Unicode text output).
+//
+// The Rust `latex.rs` port must reproduce `renderLatex` exactly (string or
+// null). Cases drawn from /tmp/pi-repo/packages/tui/test/latex.test.ts plus
+// the CommonMark/LaTeX shapes the markdown renderer relies on.
+
+/** `name` shorthand for the tui-latex tool. */
+const lx = (name, source, display = false) => ({
+	name: `tui-latex/${name}`,
+	tool: "tui-latex",
+	args: { fn: "render", source, display },
+});
+
+export const latexCases = [
+	// ------------------------------------------------------------- basics
+	lx("plain-text", "hello world"),
+	lx("single-letter", "x"),
+	lx("empty", ""),
+	lx("spaces-only", "   "),
+	lx("plus", "a + b"),
+	lx("minus", "a - b"),
+	lx("implicit-multiply", "ab"),
+	lx("equals", "E = mc^2"),
+	lx("digits", "123 + 456"),
+	lx("unicode-input", "café"),
+
+	// ------------------------------------------------------------ symbols
+	lx("alpha", "\\alpha"),
+	lx("beta-gamma", "\\beta \\gamma"),
+	lx("greek-alphabet", "\\alpha\\beta\\gamma\\delta\\epsilon\\zeta\\eta\\theta"),
+	lx("uppercase-greek", "\\Gamma\\Delta\\Theta\\Lambda\\Xi\\Pi\\Sigma"),
+	lx("var-epsilon", "\\varepsilon"),
+	lx("var-theta", "\\vartheta"),
+	lx("omega", "\\omega"),
+	lx("infty", "\\infty"),
+	lx("partial", "\\partial"),
+	lx("nabla", "\\nabla"),
+	lx("hbar", "\\hbar"),
+	lx("cdot", "a \\cdot b"),
+	lx("times", "a \\times b"),
+	lx("div", "a \\div b"),
+	lx("pm", "\\pm"),
+	lx("leq-geq", "a \\leq b \\geq c"),
+	lx("neq", "a \\neq b"),
+	lx("approx", "x \\approx y"),
+	lx("equiv", "a \\equiv b"),
+	lx("in-subset", "x \\in S"),
+	lx("to-arrow", "x \\to y"),
+	lx("rightarrow", "A \\Rightarrow B"),
+	lx("leftarrow", "A \\leftarrow B"),
+	lx("mapsto", "x \\mapsto y"),
+	lx("propto", "a \\propto b"),
+	lx("perp", "a \\perp b"),
+	lx("parallel", "a \\parallel b"),
+	lx("bullet-symbol", "\\bullet"),
+	lx("dots", "a \\dots b"),
+	lx("ldots-cdots", "a \\ldots b \\cdots c"),
+
+	// ------------------------------------------------------- script forms
+	lx("superscript", "x^2"),
+	lx("superscript-multi", "x^{10}"),
+	lx("subscript", "x_1"),
+	lx("subscript-multi", "x_{n+1}"),
+	lx("sub-sup", "x_1^2"),
+	lx("sup-sub", "x^2_1"),
+	lx("sup-unknown-char", "x^q"),
+	lx("sub-unknown-char", "x_q"),
+	lx("nested-script", "x^{y^z}"),
+	lx("prime", "f'(x)"),
+	lx("double-prime", "f''(x)"),
+
+	// --------------------------------------------------------- structures
+	lx("fraction", "\\frac{a}{b}"),
+	lx("fraction-display", "\\frac{a}{b}", true),
+	lx("fraction-numeric", "\\frac{1}{2}"),
+	lx("fraction-nested", "\\frac{a}{\\frac{b}{c}}"),
+	lx("fraction-in-expression", "x + \\frac{y}{z} - 1"),
+	lx("sqrt", "\\sqrt{x}"),
+	lx("sqrt-expression", "\\sqrt{x+1}"),
+	lx("sqrt-nth", "\\sqrt[3]{x}"),
+	lx("sum", "\\sum_{i=1}^n i"),
+	lx("sum-display", "\\sum_{i=1}^n i", true),
+	lx("sum-no-limits", "\\sum i"),
+	lx("product", "\\prod_{i=1}^n x_i"),
+	lx("product-display", "\\prod_{i=1}^n x_i", true),
+	lx("integral", "\\int_0^1 f(x)\\,dx"),
+	lx("integral-display", "\\int_0^1 f(x)\\,dx", true),
+	lx("lim", "\\lim_{x \\to 0} f(x)"),
+	lx("lim-display", "\\lim_{x \\to 0} f(x)", true),
+	lx("max-min", "\\max_{x \\in S} x"),
+	lx("sup-op", "\\sup_{x \\in S} x"),
+
+	// ------------------------------------------------------------- fonts
+	lx("mathbb", "\\mathbb{R}"),
+	lx("mathbb-n", "\\mathbb{N}"),
+	lx("mathbb-mixed", "\\mathbb{R}^d"),
+	lx("mathcal", "\\mathcal{L}"),
+	lx("mathbf", "\\mathbf{x}"),
+	lx("mathrm", "\\mathrm{d}x"),
+	lx("text", "\\text{hello world}"),
+	lx("text-with-spaces", "\\text{force = mass}"),
+	lx("text-mixed", "\\text{if } x > 0"),
+	lx("operatorname", "\\operatorname{sgn}(x)"),
+	lx("bold-font-switch", "{\\bf x}"),
+	lx("italic-font-switch", "{\\it x}"),
+	lx("tt-font-switch", "{\\tt code}"),
+
+	// ---------------------------------------------------------- matrices
+	lx("matrix", "\\begin{matrix}a&b\\\\c&d\\end{matrix}"),
+	lx("pmatrix", "\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}"),
+	lx("bmatrix", "\\begin{bmatrix}1&2\\\\3&4\\end{bmatrix}"),
+	lx("cases", "\\begin{cases}a & x>0\\\\b & x\\leq 0\\end{cases}"),
+	lx("matrix-display", "\\begin{matrix}a&b\\\\c&d\\end{matrix}", true),
+	lx("vector", "\\begin{pmatrix}x\\\\y\\\\z\\end{pmatrix}"),
+
+	// ------------------------------------------------------------ accents
+	lx("hat", "\\hat{x}"),
+	lx("bar", "\\bar{x}"),
+	lx("vec", "\\vec{v}"),
+	lx("dot", "\\dot{x}"),
+	lx("ddot", "\\ddot{x}"),
+	lx("tilde", "\\tilde{n}"),
+
+	// ----------------------------------------------------------- spacing
+	lx("thin-space", "a\\,b"),
+	lx("quad", "a\\quad b"),
+	lx("qquad", "a\\qquad b"),
+	lx("neg-thin-space", "a\\!b"),
+	lx("escaped-space", "a\\ b"),
+
+	// ------------------------------------------------------ grouping etc
+	lx("braces", "{a+b}"),
+	lx("parentheses", "(a+b)"),
+	lx("brackets", "[a+b]"),
+	lx("angle-brackets", "\\langle a \\rangle"),
+	lx("floor", "\\lfloor x \\rfloor"),
+	lx("ceil", "\\lceil x \\rceil"),
+	lx("absolute", "|x|"),
+	lx("norm", "\\|x\\|"),
+	lx("unknown-command", "\\foo{x}"),
+	lx("unknown-plain-command", "\\barbaz"),
+	lx("backslash-alone", "\\"),
+	lx("unbalanced-open", "\\frac{a}"),
+	lx("unmatched-brace", "{a"),
+	lx("empty-braces", "{}"),
+	lx("nested-groups", "{a{b}c}"),
+	lx("overset", "\\overset{a}{b}"),
+	lx("underset", "\\underset{a}{b}"),
+
+	// ------------------------------------------------ display-mode diffs
+	lx("display-fraction-sqrt", "\\frac{\\sqrt{a}}{b}", true),
+	lx("display-sum-product", "\\sum_i \\prod_j", true),
+	lx("display-lim-inf", "\\liminf_{n \\to \\infty} a_n", true),
+	lx("display-inline-contrast", "\\frac{1}{2} + \\frac{1}{3}"),
+	lx("display-inline-contrast-d", "\\frac{1}{2} + \\frac{1}{3}", true),
+	lx("display-mixed-structures", "\\sum_{k=0}^{n} \\binom{n}{k}", true),
+	lx("binom", "\\binom{n}{k}"),
+	lx("binom-display", "\\binom{n}{k}", true),
+];

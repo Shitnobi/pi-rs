@@ -341,6 +341,64 @@ async function runModule(tool, args, cwd) {
 				throw new Error("unknown tui-markdown-lex fn: " + args.fn);
 		}
 	}
+	if (tool === "tui-latex") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const lx = await import(pathToFileURL(TUI_SRC + "/latex.ts").href);
+		switch (args.fn) {
+			case "render":
+				// null (not undefined) so both sides serialize identically.
+				return { result: lx.renderLatex(args.source, args.display ? { display: true } : {}) ?? null };
+			default:
+				throw new Error("unknown tui-latex fn: " + args.fn);
+		}
+	}
+	if (tool === "tui-markdown-render") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const md = await import(pathToFileURL(TUI_SRC + "/components/markdown.ts").href);
+		switch (args.fn) {
+			case "render": {
+				// Deterministic marker theme shared 1:1 with the Rust harness.
+				const theme = {
+					heading: (t) => `#<${t}>`,
+					link: (t) => `L<${t}>`,
+					linkUrl: (t) => `U<${t}>`,
+					code: (t) => `C<${t}>`,
+					codeBlock: (t) => `CB<${t}>`,
+					codeBlockBorder: (t) => `B<${t}>`,
+					quote: (t) => `Q<${t}>`,
+					quoteBorder: (t) => `|`,
+					hr: (t) => `-${t}-`,
+					listBullet: (t) => `*${t}`,
+					bold: (t) => `**${t}**`,
+					italic: (t) => `_${t}_`,
+					strikethrough: (t) => `~${t}~`,
+					underline: (t) => `_<${t}>_`,
+				};
+				const options = {};
+				if (args.options) {
+					if (args.options.preserveOrderedListMarkers !== undefined)
+						options.preserveOrderedListMarkers = args.options.preserveOrderedListMarkers;
+					if (args.options.preserveBackslashEscapes !== undefined)
+						options.preserveBackslashEscapes = args.options.preserveBackslashEscapes;
+					if (args.options.renderLatex !== undefined)
+						options.renderLatex = args.options.renderLatex;
+				}
+				const component = new md.Markdown(
+					args.source,
+					args.paddingX ?? 0,
+					args.paddingY ?? 0,
+					theme,
+					undefined,
+					options,
+				);
+				return { result: component.render(args.width ?? 40) };
+			}
+			default:
+				throw new Error("unknown tui-markdown-render fn: " + args.fn);
+		}
+	}
 	if (tool === "tui-terminal-image") {
 		const { pathToFileURL } = require("url");
 		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
