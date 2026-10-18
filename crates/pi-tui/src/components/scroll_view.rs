@@ -551,6 +551,30 @@ impl crate::layout::ScrollViewState for ScrollViewStateData {
     fn is_following_end(&self) -> bool {
         ScrollViewStateData::is_following_end(self)
     }
+
+    fn scroll_by(&mut self, lines: i64) -> i64 {
+        ScrollViewStateData::scroll_by(self, lines)
+    }
+
+    fn scroll_to(
+        &mut self,
+        scroll_top: i64,
+        options: crate::components::scroll_view::ScrollViewScrollToOptions,
+    ) {
+        ScrollViewStateData::scroll_to(self, scroll_top, options)
+    }
+
+    fn scroll_to_start(&mut self) {
+        ScrollViewStateData::scroll_to_start(self)
+    }
+
+    fn scroll_to_end(&mut self) {
+        ScrollViewStateData::scroll_to_end(self)
+    }
+
+    fn set_scrollbar_active(&mut self, active: bool) {
+        ScrollViewStateData::set_scrollbar_active(self, active)
+    }
 }
 
 // =============================================================================

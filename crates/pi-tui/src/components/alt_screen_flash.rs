@@ -96,7 +96,7 @@ mod tests {
     fn flash_renders_reverse_video_and_expires() {
         crate::clock::reset_for_test();
         let renders = std::rc::Rc::new(Cell::new(0));
-        let mut flash_renders = renders.clone();
+        let flash_renders = renders.clone();
         let mut flashes = AltScreenFlashContainer::new(Some(Box::new(move || {
             flash_renders.set(flash_renders.get() + 1)
         })));

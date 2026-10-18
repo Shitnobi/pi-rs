@@ -13,7 +13,6 @@
 //! carry a monotonic `entry_id` (see [`crate::tui::OverlayHandle`]) and
 //! `ComponentRef` identity is `Rc::ptr_eq`.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::component::{
@@ -681,9 +680,14 @@ impl TuiBase {
             col += offset_x;
         }
 
-        // Clamp to terminal bounds (respecting margins).
-        row = row.max(margin_top).min(term_height - margin_bottom - effective_height);
-        col = col.max(margin_left).min(term_width - margin_right - width);
+        // Clamp to terminal bounds (respecting margins) — `Math.max(marginTop,
+        // Math.min(row, ...))`: the inner min runs FIRST (tui.ts:1303-1306).
+        row = row
+            .min(term_height - margin_bottom - effective_height)
+            .max(margin_top);
+        col = col
+            .min(term_width - margin_right - width)
+            .max(margin_left);
 
         (width, row, col, max_height)
     }
@@ -900,6 +904,8 @@ mod tests {
     use crate::terminal::{ProgramStatus, Terminal};
     use crate::tui::{TuiInputListenerResult, TuiMode, TuiStopOptions, TuiSurface};
     use crate::test_support::global_test_lock;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     /// Recording terminal double with a settable size.
     struct TestTerminal {
@@ -1002,6 +1008,7 @@ mod tests {
         fn after_terminal_start(&mut self) {}
         fn before_terminal_stop(&mut self, _options: &TuiStopOptions) {}
         fn after_terminal_stop(&mut self, _options: &TuiStopOptions) {}
+        fn pump_screen_timers(&mut self) {}
         fn mode(&self) -> TuiMode {
             TuiMode::Regular
         }
@@ -1481,7 +1488,7 @@ mod tests {
     fn resolve_mouse_focus_target_prefers_visible_overlay_container() {
         let _lock = global_test_lock();
         let screen = TestScreen::new_rc(80, 24);
-        let overlay = TestComponent::plain("ov");
+        let _overlay = TestComponent::plain("ov");
         let nested = TestComponent::plain("nested");
         // Put the nested component inside the overlay via a Container.
         let container = Rc::new(RefCell::new(Container::new()));

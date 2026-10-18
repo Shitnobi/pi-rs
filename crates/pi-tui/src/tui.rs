@@ -274,6 +274,8 @@ impl OverlayHandle {
 /// `OverlayStackEntry` (tui.ts:326-333) + port `entry_id` identity.
 #[derive(Clone)]
 pub(crate) struct OverlayStackEntry {
+    /// Mirrors the TS entry identity; kept for debug/harness use.
+    #[allow(dead_code)]
     pub(crate) entry_id: u64,
     pub(crate) component: ComponentRef,
     pub(crate) options: Option<OverlayOptions>,
@@ -288,6 +290,8 @@ pub(crate) struct OverlayStackEntry {
 /// if the stack mutates before the next render).
 #[derive(Clone)]
 pub(crate) struct RenderedOverlayLayout {
+    /// Mirrors the TS entry identity; kept for debug/harness use.
+    #[allow(dead_code)]
     pub(crate) entry_id: u64,
     pub(crate) component: ComponentRef,
     pub(crate) row: i64,
@@ -672,6 +676,7 @@ impl TuiBase {
     }
 
     /// Test-only probe of the `renderRequested` flag (tui.ts:529).
+    #[cfg(test)]
     pub(crate) fn render_requested_probe(&self) -> bool {
         self.render_requested
     }
@@ -755,6 +760,9 @@ impl TuiBase {
 
     /// The base part of `stop()` (tui.ts:985-997) — hook calls happen at
     /// the screen level.
+    /// Reserved for the Wave C parity harness (terminal-facing tail of
+    /// `stop()`); no internal caller yet.
+    #[allow(dead_code)]
     pub(crate) fn stop_terminal(&mut self) {
         // The terminal-facing tail of `stop()` (tui.ts:985-997); the
         // screen-level macro method calls the hooks around this.
@@ -837,6 +845,8 @@ impl TuiBase {
         }
     }
 
+    /// Test/harness probe for the `process.nextTick` queue.
+    #[allow(dead_code)]
     pub(crate) fn has_pending_ticks(&self) -> bool {
         !self.next_tick_queue.is_empty()
     }
@@ -1269,6 +1279,7 @@ macro_rules! impl_tui_surface {
             }
 
             /// `removeChild` (tui.ts:367-373) — keeps `mountedRoots` in sync.
+            #[allow(dead_code)] // TS `removeChild` parity; not yet exercised
             pub fn remove_child(&mut self, component: &$crate::component::ComponentRef) {
                 self.base.container.borrow_mut().remove_child(component);
                 self.refresh_mounted_roots();
@@ -1318,6 +1329,7 @@ macro_rules! impl_tui_surface {
             /// timers and color-query timeouts.
             pub fn advance_clock(&mut self, ms: f64) {
                 $crate::clock::advance_ms(ms);
+                self.pump_screen_timers();
                 self.run_pending_ticks();
                 while self.base.fire_due_render_timer() {
                     self.do_render();

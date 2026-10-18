@@ -155,6 +155,20 @@ pub trait ScrollViewState: ScrollLayoutState {
     /// `ScrollView` object the alt screen holds via its primary scroll
     /// view, so the port surfaces it on the shared-state trait.
     fn is_following_end(&self) -> bool;
+    /// `scrollBy(lines)` (scroll-view.ts) — returns the consumed delta.
+    fn scroll_by(&mut self, lines: i64) -> i64;
+    /// `scrollTo(scrollTop, options)` (scroll-view.ts).
+    fn scroll_to(
+        &mut self,
+        scroll_top: i64,
+        options: crate::components::scroll_view::ScrollViewScrollToOptions,
+    );
+    /// `scrollToStart()` (scroll-view.ts).
+    fn scroll_to_start(&mut self);
+    /// `scrollToEnd()` (scroll-view.ts).
+    fn scroll_to_end(&mut self);
+    /// `setScrollbarActive(active)` (scroll-view.ts).
+    fn set_scrollbar_active(&mut self, active: bool);
 }
 
 /// Shared handle to a scroll view's state (the TS `ScrollView` object
@@ -1408,6 +1422,40 @@ mod tests {
 
         fn is_following_end(&self) -> bool {
             self.following_end
+        }
+
+        fn scroll_by(&mut self, lines: i64) -> i64 {
+            let max = (self.content_height - self.viewport_height).max(0);
+            let next = (self.scroll_top + lines).clamp(0, max);
+            let consumed = next - self.scroll_top;
+            self.scroll_top = next;
+            self.following_end = self.follow_end && next >= max;
+            consumed
+        }
+
+        fn scroll_to(
+            &mut self,
+            scroll_top: i64,
+            _options: crate::components::scroll_view::ScrollViewScrollToOptions,
+        ) {
+            let max = (self.content_height - self.viewport_height).max(0);
+            self.scroll_top = scroll_top.clamp(0, max);
+            self.following_end = self.follow_end && self.scroll_top >= max;
+        }
+
+        fn scroll_to_start(&mut self) {
+            self.scroll_top = 0;
+            self.following_end = self.follow_end && self.content_height <= self.viewport_height;
+        }
+
+        fn scroll_to_end(&mut self) {
+            let max = (self.content_height - self.viewport_height).max(0);
+            self.scroll_top = max;
+            self.following_end = self.follow_end;
+        }
+
+        fn set_scrollbar_active(&mut self, active: bool) {
+            self.scrollbar_active = active;
         }
     }
 

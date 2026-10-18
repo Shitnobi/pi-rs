@@ -641,6 +641,13 @@ impl TuiAltScreen {
         crate::alt_screen_input::after_terminal_stop(self, options);
     }
 
+    /// Port machinery (no TS counterpart): `advanceClock` pumps the
+    /// selection auto-scroll interval modeled on the virtual clock
+    /// (TS: `setInterval(() => this.autoScrollSelection(), 50)`).
+    fn pump_screen_timers(&mut self) {
+        crate::alt_screen_selection::pump_selection_auto_scroll(self);
+    }
+
     /// `readonly mode = "fullscreen"`.
     fn mode(&self) -> TuiMode {
         TuiMode::Fullscreen

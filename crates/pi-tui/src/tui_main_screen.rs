@@ -27,12 +27,12 @@ use std::rc::Rc;
 
 use crate::clock::now_ms;
 use crate::component::{
-    Component, ComponentMouseResult, ComponentRef, TuiMouseEvent, CURSOR_MARKER,
+    Component, ComponentMouseResult, ComponentRef, TuiMouseEvent,
 };
 use crate::terminal::Terminal;
 use crate::terminal_image::{delete_kitty_image, is_image_line, EnvLookup, KITTY_PREFIX};
 use crate::tui::{TuiBase, TuiInputListenerResult, TuiMode, TuiStopOptions};
-use crate::utils::{js_trim, utf16_len, visible_width};
+use crate::utils::{js_trim, visible_width};
 
 use crate::impl_tui_surface;
 
@@ -1029,6 +1029,7 @@ impl TuiMainScreen {
 
     /// `afterTerminalStop()` (tui.ts:593) — no main-screen override.
     fn after_terminal_stop(&mut self, _options: &TuiStopOptions) {}
+    fn pump_screen_timers(&mut self) {}
 
     /// `render(width)` — inherited from `Container` (tui.ts:363+).
     fn render_children(&mut self, width: usize) -> Vec<String> {
@@ -1209,10 +1210,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::Component;
+    use crate::component::{Component, CURSOR_MARKER};
     use crate::terminal::{InputHandler, ProgramStatus, ResizeHandler};
     use crate::test_support::global_test_lock;
     use crate::tui::TuiSurface;
+    use crate::utils::utf16_len;
     use std::cell::Cell;
 
     /// Recording terminal double (pattern from tui_overlay.rs tests), with
