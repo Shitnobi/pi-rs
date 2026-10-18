@@ -52,9 +52,7 @@ pub enum NumOrStr {
 /// Tri-state for `title`: `None` = field absent (TS `undefined`), `Some(None)`
 /// = JSON `null` (TS `title: null` from `e.title || null`), `Some(Some(s))` =
 /// string.
-pub type OptStr = Option<String>;
-
-/// A marked token. One struct with optional fields: `JSON.stringify` on the
+pub type OptStr = Option<String>;/// A marked token. One struct with optional fields: `JSON.stringify` on the
 /// TS side drops `undefined` fields, and `Token::to_json` skips `None` fields
 /// to match that contract exactly.
 #[derive(Debug, Clone, Default)]
@@ -70,8 +68,8 @@ pub struct Token {
     pub task: Option<bool>,
     pub checked: Option<bool>,
     pub items: Option<Vec<Token>>,
-    pub header: Option<Vec<Token>>,
-    pub rows: Option<Vec<Token>>,
+    pub header: Option<Vec<TableCell>>,
+    pub rows: Option<Vec<Vec<TableCell>>>,
     pub align: Option<Vec<Option<String>>>,
     pub tokens: Option<TokenList>,
     pub href: Option<String>,
@@ -80,6 +78,55 @@ pub struct Token {
     pub pre: Option<bool>,
     pub block: Option<bool>,
     pub pending: Option<bool>,
+    /// inlineText tokens: `escaped: this.lexer.state.inRawBlock`.
+    pub escaped: Option<bool>,
+    /// inline html (tag) tokens: `inLink` / `inRawBlock` post-state-dance.
+    pub in_link: Option<bool>,
+    pub in_raw_block: Option<bool>,
+    /// Indented code blocks: `codeBlockStyle: "indented"`.
+    pub code_block_style: Option<String>,
+}
+
+/// A table cell — marked v18 table cells are `{text, tokens, header, align}`
+/// objects (no type/raw), unlike every other token shape.
+#[derive(Debug, Clone)]
+pub struct TableCell {
+    pub text: String,
+    pub tokens: TokenList,
+    pub header: bool,
+    /// `"left" | "center" | "right"` or `None` (JSON `null`).
+    pub align: Option<String>,
+}
+
+impl TableCell {
+    pub fn to_json(&self) -> Value {
+        let mut m = Map::new();
+        m.insert("text".into(), Value::String(self.text.clone()));
+        m.insert(
+            "tokens".into(),
+            Value::Array(self.tokens.borrow().iter().map(Token::to_json).collect()),
+        );
+        m.insert("header".into(), Value::Bool(self.header));
+        m.insert(
+            "align".into(),
+            match &self.align {
+                Some(s) => Value::String(s.clone()),
+                None => Value::Null,
+            },
+        );
+        Value::Object(m)
+    }
+
+    pub fn deep_clone(&self) -> TableCell {
+        TableCell {
+            text: self.text.clone(),
+            tokens: new_token_list_with(
+                self.tokens.borrow().iter().map(Token::deep_clone).collect(),
+            ),
+            header: self.header,
+            align: self.align.clone(),
+        }
+    }
 }
 
 impl Token {
@@ -134,11 +181,18 @@ impl Token {
         if let Some(v) = &self.header {
             m.insert(
                 "header".into(),
-                Value::Array(v.iter().map(Self::to_json).collect()),
+                Value::Array(v.iter().map(TableCell::to_json).collect()),
             );
         }
         if let Some(v) = &self.rows {
-            m.insert("rows".into(), Value::Array(v.iter().map(Self::to_json).collect()));
+            m.insert(
+                "rows".into(),
+                Value::Array(
+                    v.iter()
+                        .map(|row| Value::Array(row.iter().map(TableCell::to_json).collect()))
+                        .collect(),
+                ),
+            );
         }
         if let Some(v) = &self.align {
             m.insert(
@@ -183,6 +237,18 @@ impl Token {
         if let Some(v) = self.pending {
             m.insert("pending".into(), Value::Bool(v));
         }
+        if let Some(v) = self.escaped {
+            m.insert("escaped".into(), Value::Bool(v));
+        }
+        if let Some(v) = self.in_link {
+            m.insert("inLink".into(), Value::Bool(v));
+        }
+        if let Some(v) = self.in_raw_block {
+            m.insert("inRawBlock".into(), Value::Bool(v));
+        }
+        if let Some(v) = &self.code_block_style {
+            m.insert("codeBlockStyle".into(), Value::String(v.clone()));
+        }
         Value::Object(m)
     }
 
@@ -193,10 +259,14 @@ impl Token {
             t.items = Some(items.iter().map(Self::deep_clone).collect());
         }
         if let Some(header) = &self.header {
-            t.header = Some(header.iter().map(Self::deep_clone).collect());
+            t.header = Some(header.iter().map(TableCell::deep_clone).collect());
         }
         if let Some(rows) = &self.rows {
-            t.rows = Some(rows.iter().map(Self::deep_clone).collect());
+            t.rows = Some(
+                rows.iter()
+                    .map(|row| row.iter().map(TableCell::deep_clone).collect())
+                    .collect(),
+            );
         }
         if let Some(list) = &self.tokens {
             t.tokens = Some(new_token_list_with(
@@ -229,6 +299,10 @@ impl Token {
             pre: self.pre,
             block: self.block,
             pending: self.pending,
+            escaped: self.escaped,
+            in_link: self.in_link,
+            in_raw_block: self.in_raw_block,
+            code_block_style: self.code_block_style.clone(),
         }
     }
 }
@@ -455,7 +529,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "enable once the block/inline/lexer ports land"]
     fn lex_markdown_smoke() {
         // Full lexer port lands with the block/inline/lexer modules; this
         // only exercises the entry plumbing once those are implemented.

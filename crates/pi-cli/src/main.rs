@@ -107,6 +107,7 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
         "tui-colors" => return run_tui_colors_harness(&input),
         "tui-terminal-colors" => return run_tui_terminal_colors_harness(&input),
         "tui-terminal-image" => return run_tui_terminal_image_harness(&input),
+        "tui-markdown-lex" => return run_tui_markdown_lex_harness(&input),
         "tui-keys" => return run_tui_keys_harness(&input),
         "tui-stdin-buffer" => return run_tui_stdin_buffer_harness(&input),
         "tui-components" => return run_tui_components_harness(&input),
@@ -783,6 +784,23 @@ fn run_math_harness(input: &Value) -> Result<Value, String> {
     }
     Ok(serde_json::json!({ "results": results }))
 }
+fn run_tui_markdown_lex_harness(input: &Value) -> Result<Value, String> {
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    match fn_name {
+        "lex" => {
+            let source = input["source"]
+                .as_str()
+                .ok_or("missing source")?
+                .to_string();
+            let tokens = pi_tui::marked::lex_markdown(&source);
+            Ok(serde_json::json!({
+                "result": pi_tui::marked::tokens_to_json(&tokens),
+            }))
+        }
+        _ => Err(format!("unknown tui-markdown-lex fn: {fn_name}")),
+    }
+}
+
 fn run_tui_terminal_image_harness(input: &Value) -> Result<Value, String> {
     use pi_tui::terminal_image::{
         self, calculate_image_cell_size, calculate_image_rows, encode_iterm2, encode_kitty,

@@ -66,6 +66,7 @@ import { mainCases } from "./wavec/main-cases.mjs";
 import { altCases } from "./wavec/alt-cases.mjs";
 import { interactionCases } from "./wavec/interaction-cases.mjs";
 import { terminalImageCases } from "./waved/terminal-image-cases.mjs";
+import { markdownLexCases } from "./waved/markdown-lex-cases.mjs";
 
 export const cases = [
 	// ---------------------------------------------------------------- read
@@ -4798,6 +4799,7 @@ export const cases = [
 	...altCases,
 	...interactionCases,
 	...terminalImageCases,
+	...markdownLexCases,
 ];
 
 // tui-components sub-case builders (hoisted; used by the cases above).

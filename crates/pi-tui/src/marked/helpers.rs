@@ -18,7 +18,7 @@ use super::{Lexer, LinkDef, Token, TokenList};
 // JS string/regex semantics helpers
 // ---------------------------------------------------------------------------
 
-fn next_char_boundary(text: &str, pos: usize) -> usize {
+pub(crate) fn next_char_boundary(text: &str, pos: usize) -> usize {
     if pos >= text.len() {
         return text.len();
     }
