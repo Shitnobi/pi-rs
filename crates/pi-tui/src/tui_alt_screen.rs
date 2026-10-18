@@ -547,6 +547,19 @@ impl TuiAltScreen {
         crate::alt_screen_selection::get_active_selection_text(self).is_some()
     }
 
+    /// `copyActiveSelectionToClipboard()` (tui-alt-screen.ts:309-312) —
+    /// delegates to **D-B2**. The TS promise resolves synchronously in the
+    /// pure-std port.
+    pub fn copy_active_selection_to_clipboard(&mut self) -> bool {
+        crate::alt_screen_selection::copy_active_selection_to_clipboard(self)
+    }
+
+    /// `resetTextSelection()` (tui-alt-screen.ts:314-317) — delegates to
+    /// **D-B2**.
+    pub fn reset_text_selection(&mut self) {
+        crate::alt_screen_selection::reset_text_selection(self);
+    }
+
     /// `getScreenLines()` (tui-alt-screen.ts:320-322): the lines of the
     /// last rendered frame, one per terminal row, as written.
     pub fn get_screen_lines(&self) -> Vec<String> {

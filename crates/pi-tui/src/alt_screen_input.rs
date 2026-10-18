@@ -70,3 +70,15 @@ pub(crate) fn handle_viewport_input(
 ) -> Option<TuiInputListenerResult> {
     None
 }
+
+/// `refreshSearch(layout)` (tui-alt-screen.ts:595) — TODO(D-B1): re-run
+/// the active search corpus/index against the new layout. Returns whether
+/// the caller (the doRender pipeline, **D-B3**) must re-layout because the
+/// search UI state changed. Called by
+/// [`crate::alt_screen_render::do_render`] before highlighting.
+pub(crate) fn refresh_search(
+    _screen: &mut TuiAltScreen,
+    _layout: &crate::layout::LayoutFrame,
+) -> bool {
+    false
+}
