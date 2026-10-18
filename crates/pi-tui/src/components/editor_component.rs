@@ -16,7 +16,7 @@ use std::rc::Rc;
 use crate::components::autocomplete::AutocompleteProvider;
 use crate::component::Component;
 
-use super::editor::Editor;
+use super::editor::{Editor, EditorCallback};
 
 pub trait EditorComponent: Component {
 	// =========================================================================
@@ -39,10 +39,10 @@ pub trait EditorComponent: Component {
 
 	/// `onSubmit?: (text: string) => void` — called when the user submits
 	/// (e.g. Enter key).
-	fn set_on_submit(&mut self, _callback: Option<Box<dyn FnMut(&str)>>) {}
+	fn set_on_submit(&mut self, _callback: Option<EditorCallback>) {}
 
 	/// `onChange?: (text: string) => void` — called when the text changes.
-	fn set_on_change(&mut self, _callback: Option<Box<dyn FnMut(&str)>>) {}
+	fn set_on_change(&mut self, _callback: Option<EditorCallback>) {}
 
 	// =========================================================================
 	// History support (optional)

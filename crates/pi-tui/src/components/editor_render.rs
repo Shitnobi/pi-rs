@@ -203,7 +203,7 @@ impl Editor {
             forwarded.height = self.rendered_autocomplete_height as i64;
             return self
                 .forward_mouse_to_autocomplete_list(&forwarded)
-                .map(|result| ComponentMouseResult::Result(result));
+                .map(ComponentMouseResult::Result);
         }
 
         // Leave press/drag/release unhandled so the renderer's screen-level
@@ -290,9 +290,7 @@ impl Editor {
         &mut self,
         event: &TuiMouseEvent,
     ) -> Option<TuiMouseEventResult> {
-        let Some(list) = self.autocomplete_list.take() else {
-            return None;
-        };
+        let list = self.autocomplete_list.take()?;
         let typed = Rc::new(RefCell::new(list));
         let result = {
             let untyped: ComponentRef = typed.clone();

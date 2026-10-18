@@ -180,9 +180,10 @@ Remaining, roughly in dependency order:
 | G8 | async | `NestedToolCallRunner` (drives the agent tool pipeline) and `file-mutation-queue.ts` (global registration queue + per-realpath mutation queues) need an async runtime and the agent session layer; deferred with the agent-loop tranche. `NestedCallRecorder` — the persisted half — is ported | 3+ |
 ## Parity suite status
 
-- 447/447 cases pass (stable across repeated runs; includes the
-  `tui-components` render-line differential group added in TUI tranche 3)
-- 757 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
+- 565/565 cases pass (stable across repeated runs; the `tui-components`
+  render-line differential group from TUI tranche 3 plus the
+  `tui-editor` event-sequence differential group added in T4)
+- 1005 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
   plus fuzz corpora: ansi 2010 cases, decoder 800 cases, pi-photon
   byte-parity, segmenter corpus 1208 cases)
 - `cargo clippy --all-targets` clean
@@ -398,37 +399,50 @@ Remaining, roughly in dependency order:
   scalar) indices vs TS UTF-16 code units (no astral-plane engine input
   identified).
 
-## T4 (editor) — in progress
+## T4 (editor) — COMPLETE
 
-- Wave A landed (commit cfafe3c): editor_word_wrap.rs complete (D2, 30/30
-  tests); parity tui-editor TS side complete (D3, 118 cases; Rust side
-  pending); editor.rs coordinator foundation (types, struct, sync
-  autocomplete surface, pattern matcher, UTF-16 helpers) +
-  binding-signature stubs for E2-E6/D1b files.
-- Wave B landed (E2-E6 fleet): editor_text.rs (1952), editor_cursor.rs
-  (1596), editor_history.rs (1962), editor_render.rs (825), editor_input.rs
-  (~940) — full editor.ts port minus the async autocomplete pipeline (D1b
-  stubs remain). Fleet reports in docs/t4-reports/report-t4-E{2..6}.md.
-  Integration fixes: 2 wrong derived E6 tests corrected (Alt+Enter ≠ Enter
-  for shouldSubmitOnBackslashEnter; undo of "abb" → "" via word-char
-  coalescing). Removed a unit test that remapped global keybindings —
-  set_keybindings() races parallel test threads (positive
-  shouldSubmitOnBackslashEnter path deferred to the parity differential,
-  which is per-process/deterministic; negative Alt+Enter path unit-tested).
-- Wave C prep landed (D1b + editor_component.rs): editor_autocomplete.rs
-  (1773 lines) — the async pipeline as an explicit state machine
-  (thread-local IN_FLIGHT continuation + DEBOUNCE_ELAPSED mock-timer model;
-  `run_pending_autocomplete_requests()` = flushAutocomplete,
-  `tick_autocomplete_debounce(ms)` = t.mock.timers.tick) + 27 ported async
-  tests (editor.test.ts:2096-3079 + provider-paste 1820); report in
-  docs/t4-reports/report-t4-D1b.md. editor_component.rs — the
-  editor-component.ts (74 lines) extension-surface trait + impl for Editor.
-  Integration fix: trigger/debounce pattern quoted-branch bug — TS
-  `@"[^"]*` requires NO closing quote in BOTH patterns and falls through
-  to the char-class alternative like regex backtracking (broke
-  quoted-CJK-directory re-trigger before the fix).
-- pi-tui: 828 tests green / 1 ignored; parity 447/447 (tui-editor 0/118
-  pending Rust harness); zero warnings.
-- Remaining: Wave C parity harness (`pi-cli harness tui-editor`, target
-  565/565) + redteams; final gate.
-- Resume point: docs/T4_RESUME.md (steps 1-3 done; next: step 4, Wave C).
+- Full port of editor.ts (2473 lines) + editor-component.ts across
+  editor.rs (coordinator foundation: types/struct/ctor/accessors/sync
+  autocomplete surface/token pattern matcher/UTF-16 helpers),
+  editor_word_wrap.rs [D2], editor_text.rs [E2], editor_cursor.rs [E3],
+  editor_history.rs [E4], editor_render.rs [E5], editor_input.rs [E6],
+  editor_autocomplete.rs [D1b: the TS promise chain as an explicit state
+  machine — thread-local per-editor continuation maps; host surface
+  run_pending_autocomplete_requests() = flushAutocomplete,
+  tick_autocomplete_debounce(ms) = mock-timer tick], and
+  editor_component.rs (extension-surface trait).
+- Fleet model that worked: coordinator writes the struct + types +
+  binding-signature todo!() stubs, then ONE FILE PER DELEGATE in
+  parallel; delegates write reports incrementally to /tmp (all result
+  channels failed; all work landed). Fleet reports preserved in
+  docs/t4-reports/.
+- Parity: `pi-cli harness tool tui-editor` (run_tui_editor_harness)
+  mirrors ts-harness.js per docs/T4_PLAN.md §6 → 447 + 118 = 565/565.
+- pi-tui: 831 tests + 1 ignored; workspace 1005 passed / 0 failed;
+  zero warnings.
+- Redteams (3 scopes: text-ops/input, render/layout/mouse,
+  history/kill/undo/autocomplete; reports in docs/t4-reports/):
+  text-ops and render scopes verified faithful; the autocomplete-scope
+  redteam found 5 issues, all fixed with regression tests (commit
+  056b0c1): cancel_autocomplete_request now aborts the in-flight
+  continuation at cancel time (cancelled requests could previously
+  resurrect on flush and even auto-apply completions); pipeline slots
+  are per-editor (IN_FLIGHT/DEBOUNCE_ELAPSED keyed by editor identity,
+  matching the TS per-instance autocompleteRequestTask/setTimeout);
+  removed the dead autocomplete_aborted field.
+- Documented divergences / faithfully replicated upstream quirks:
+  - wordWrapLine recurses infinitely when a single grapheme's visible
+    width exceeds maxWidth (e.g. "你" at width 1) — TS stack-overflows
+    identically; unreachable by upstream tests (widths >= 8).
+  - Forward-deleting a paste marker leaves a stale pastes-registry
+    entry in both implementations (upstream quirk, ported faithfully).
+  - The positive shouldSubmitOnBackslashEnter path (plain Enter with
+    remapped tui.input.submit = shift+enter) is covered by the parity
+    differential only — unit-testing it requires mutating the
+    process-global keybindings, which races cargo test's parallel
+    test threads (see editor_input.rs note). The negative path
+    (Alt+Enter) is unit-tested.
+  - The async pipeline aborts eagerly at cancel time (TS parity) but
+    the provider call happens synchronously at request start (Rust's
+    sync provider trait) rather than after a microtask hop —
+    unobservable through the public surface.

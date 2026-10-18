@@ -318,6 +318,7 @@ impl Editor {
 
     /// `insertCharacter(char, skipUndoCoalescing?)` (editor.ts:1201-1258).
     /// `char` is a full grapheme string (from `decodePrintableKey`).
+    #[allow(clippy::if_same_then_else)] // TS if/else-if ladder with identical bodies (editor.ts:1247-1253)
     pub(crate) fn insert_character(&mut self, char_str: &str, skip_undo_coalescing: bool) {
         self.exit_history_browsing();
 
@@ -532,6 +533,7 @@ impl Editor {
     }
 
     /// `handleBackspace()` (editor.ts:1380-1467).
+    #[allow(clippy::if_same_then_else)] // TS if/else-if ladder with identical bodies (editor.ts:1455-1461)
     pub(crate) fn handle_backspace(&mut self) {
         self.exit_history_browsing();
         self.last_action = None;
@@ -548,8 +550,18 @@ impl Editor {
             let last_grapheme = graphemes.last();
             let grapheme_length = last_grapheme.map(|g| utf16_len(&g.segment)).unwrap_or(1);
             // `PASTE_MARKER_SINGLE.exec(lastGrapheme.segment)` (editor.ts:1395)
-            let is_pasted_segmented =
-                last_grapheme.and_then(|g| match_paste_marker_at(&g.segment));
+            // — the BOTH-ends-anchored regex. Segments reaching here are
+            // either single grapheme clusters (which can never contain a
+            // multi-char ASCII marker prefix, so no match either way) or
+            // atomic-merged markers (exact marker text, so prefix == full
+            // match); the exact-length filter is therefore equivalent on
+            // all reachable inputs and keeps this call site faithful to
+            // the anchored regex even if segment shapes ever change
+            // (redteam R1 open question, resolved).
+            let is_pasted_segmented = last_grapheme.and_then(|g| {
+                match_paste_marker_at(&g.segment)
+                    .filter(|(len, _, _)| *len == g.segment.len())
+            });
 
             if let Some((_, target_id, _)) = is_pasted_segmented {
                 // This contains the id part e.g 4 from [paste #4 +123 lines]
@@ -807,6 +819,7 @@ impl Editor {
     }
 
     /// `handleForwardDelete()` (editor.ts:1779-1834) — Delete key.
+    #[allow(clippy::if_same_then_else)] // TS if/else-if ladder with identical bodies (editor.ts:1819-1825)
     pub(crate) fn handle_forward_delete(&mut self) {
         self.exit_history_browsing();
         self.last_action = None;

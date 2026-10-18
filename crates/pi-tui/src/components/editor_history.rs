@@ -200,6 +200,7 @@ impl Editor {
             // for (let i = 1; i < lines.length - 1; i++) {
             //   this.state.lines.splice(this.state.cursorLine + i, 0, lines[i] || "");
             // }
+            #[allow(clippy::needless_range_loop)] // index drives the splice position (cursor_line + i)
             for i in 1..lines.len() - 1 {
                 self.state
                     .lines

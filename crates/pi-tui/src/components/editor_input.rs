@@ -393,7 +393,7 @@ impl Editor {
         }
 
         // Regular characters (editor.ts:995-998)
-        if char_code_0.map_or(false, |c| c >= 32) {
+        if char_code_0.is_some_and(|c| c >= 32) {
             self.insert_character(data, false);
         }
     }
@@ -767,9 +767,10 @@ mod tests {
     /// `matchesKey(data, "enter")`, so `shouldSubmitOnBackslashEnter`
     /// returns false even before a backslash → plain newline.
     ///
-    /// NOTE: the *positive* `shouldSubmitOnBackslashEnter` path (plain Enter
-    /// + remapped `tui.input.submit` = shift+enter → backspace + submit,
-    /// editor.ts:1353-1362) requires mutating the process-global keybindings,
+    /// NOTE: the *positive* `shouldSubmitOnBackslashEnter` path (plain
+    /// Enter + remapped `tui.input.submit` = shift+enter → backspace +
+    /// submit, editor.ts:1353-1362) requires mutating the process-global
+    /// keybindings,
     /// which races with the parallel test threads — it is covered by the
     /// tui-editor parity differential instead (per-process, deterministic;
     /// see docs/T4_RESUME.md Wave C).

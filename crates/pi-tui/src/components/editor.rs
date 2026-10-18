@@ -352,6 +352,10 @@ pub(crate) fn create_scroll_border(direction: char, hidden_line_count: usize, wi
 // Editor struct (editor.ts:297-383)
 // =============================================================================
 
+/// TS `(text: string) => void` — the public `onSubmit` / `onChange`
+/// callback properties (editor.ts:390-391).
+pub type EditorCallback = Box<dyn FnMut(&str)>;
+
 pub struct Editor {
     /// `EditorState` (editor.ts:299-303). `cursor_col` is UTF-16 units.
     pub(crate) state: EditorState,
@@ -429,8 +433,8 @@ pub struct Editor {
     pub(crate) undo_stack: UndoStack<EditorSnapshot>,
 
     /// TS public optional callbacks / fields (editor.ts:390-392).
-    pub on_submit: Option<Box<dyn FnMut(&str)>>,
-    pub on_change: Option<Box<dyn FnMut(&str)>>,
+    pub on_submit: Option<EditorCallback>,
+    pub on_change: Option<EditorCallback>,
     pub disable_submit: bool,
 }
 
@@ -453,7 +457,7 @@ impl Editor {
         };
         // `Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5`
         let autocomplete_max_visible = match options.autocomplete_max_visible {
-            Some(v) if v.is_finite() => (v.floor().max(3.0).min(20.0)) as usize,
+            Some(v) if v.is_finite() => (v.floor().clamp(3.0, 20.0)) as usize,
             _ => 5,
         };
         Editor {
@@ -545,7 +549,7 @@ impl Editor {
     /// `setAutocompleteMaxVisible(maxVisible)` (editor.ts:410-416).
     pub fn set_autocomplete_max_visible(&mut self, max_visible: f64) {
         let new_max_visible = if max_visible.is_finite() {
-            (max_visible.floor().max(3.0).min(20.0)) as usize
+            (max_visible.floor().clamp(3.0, 20.0)) as usize
         } else {
             5
         };
@@ -667,7 +671,7 @@ impl Editor {
         // TS: `!beforeCursor.trimStart().includes(" ")` — JS trimStart
         // semantics (leading whitespace only).
         let trimmed_start: String =
-            before_cursor.trim_start_matches(|c| is_js_whitespace(c)).to_string();
+            before_cursor.trim_start_matches(is_js_whitespace).to_string();
         if self.is_in_slash_command_context(&before_cursor) && !trimmed_start.contains(' ') {
             self.handle_slash_command_completion();
         } else {
