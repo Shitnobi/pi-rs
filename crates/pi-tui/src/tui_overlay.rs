@@ -896,7 +896,7 @@ fn parse_percent(value: &str) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::impl_tui_surface;
-    use crate::component::{ComponentMouseResult, Focusable, CURSOR_MARKER};
+    use crate::component::{Component, ComponentMouseResult, Container, Focusable, CURSOR_MARKER};
     use crate::terminal::{ProgramStatus, Terminal};
     use crate::tui::{TuiInputListenerResult, TuiMode, TuiStopOptions, TuiSurface};
     use crate::test_support::global_test_lock;

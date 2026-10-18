@@ -37,7 +37,7 @@ use std::rc::{Rc, Weak};
 
 use crate::clock::now_ms;
 use crate::component::{
-    Component, ComponentRef, Container, Focusable, TuiMouseEvent, CURSOR_MARKER,
+    Component, ComponentRef, Container, TuiMouseEvent, CURSOR_MARKER,
     FAKE_CURSOR_END, FAKE_CURSOR_START,
 };
 use crate::keys::{is_key_release, matches_key};
