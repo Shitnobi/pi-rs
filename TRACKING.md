@@ -446,3 +446,66 @@ Remaining, roughly in dependency order:
     the provider call happens synchronously at request start (Rust's
     sync provider trait) rather than after a microtask hop —
     unobservable through the public surface.
+
+## T5 — TUI alt-screen (in progress; last updated 2026-10-17)
+
+- Waves A+B complete and committed (latest: 91d7970).
+  - Wave A (c15deac, 683f3a2 skeletons): tui_main_screen.rs (D-A2),
+    alt_screen_search.rs (D-A3), TuiAltScreen core/shared container/
+    park-render bridge, cross-module seams.
+  - Wave B (91d7970, ~6.2k LOC): alt_screen_input.rs (D-B1: SGR mouse/
+    wheel parsing, viewport input pipeline, scrollbar interactions,
+    scroll-to-prompt, scroll-to-end indicator, lifecycle ESC),
+    alt_screen_selection.rs (D-B2: selection state machine — character/
+    word/line granularity, multi-click, applySelection/Highlight, active
+    text, copy-on-select, virtual-clock auto-scroll), alt_screen_render.rs
+    (D-B3: doRender differential writes, line resets, OSC133 strip +
+    fake-cursor resolution, kitty image cache, indicator/flash
+    compositing). Worktrees wt-B1/B2/B3 + branches removed after merge.
+- Status: pi-tui 1000 tests green / 0 warnings (lib + release);
+  parity 565/565; cargo build --release clean.
+- Real TS bugs found & fixed during integration (probe-verified):
+  - tui_overlay.rs clamp order: TS does `max(marginTop, min(row,
+    termHeight - marginBottom - effectiveHeight))` — inner min FIRST
+    (tui.ts:1303-1306). Rust had max-then-min, shifting oversized
+    overlays up one row (found via do_render_height_slice test + probe).
+  - Selection auto-scroll interval (TS setInterval 50ms) is modeled as a
+    virtual-clock deadline; pump wired into advance_clock via new
+    pump_screen_timers hook on impl_tui_surface! (all 3 surfaces
+    implement it; alt screen pumps selection auto-scroll).
+- Key TS ground-truth facts re-learned via node probes (keep
+  /tmp/probe-sel.mjs, probe-scrollbar.mjs, probe-render.mjs,
+  probe-prompt.mjs patterns):
+  - TuiAltScreen's implicit ScrollView uses scrollbar:'hidden' — scrollbar
+    tests need an explicit layout-root ScrollView with scrollbar:'always'
+    (upstream tui-alt-screen.test.ts:481-507); transient 'auto'
+    scrollbars only appear after markScrollbarActivity.
+  - doRender differential writes ONLY changed rows (changedRows map).
+  - scrollToPrompt's scrollTo clamps to maxScrollTop (contentHeight -
+    viewportHeight): a "next prompt" below the max scroll is unreachable.
+  - TS overlay height-slice keeps the LAST termHeight rows of the padded
+    working frame.
+- Test-helper invariants: set alt_screen_active=true in new_screen;
+  SGR input coords 1-based in feed(); Text pads every line to width;
+  drag clears lastClick/pressedUrl; second press within
+  DOUBLE_CLICK_INTERVAL_MS (500ms virtual clock) = word selection;
+  document_frame() strips the applyLineResets SEGMENT_RESET suffix to
+  reconstruct the pre-reset frame applySelection receives.
+
+### Remaining T5 work (resume here)
+1. Wave C: parity harness tui-main + tui-alt tools both sides
+   (RecordingTerminal, script ops per T5_PLAN, base64 write-stream
+   frames) + case authoring from upstream tests (tui-render.test.ts
+   1024 LOC, tui-alt-screen.test.ts 2100 LOC, wheel-scroll 47,
+   tui-overlay-style-leak 81, tui-shrink 45, tui-cell-size-input 82).
+   Reuse the run_tui_editor_harness pattern in pi-cli/src/main.rs
+   (~line 1982) and the parity runner (parity/run-parity.mjs, run from
+   pi-rs/parity; cargo build --release first).
+2. Redteams R1 (overlay/focus state machine), R2 (main-screen diff
+   algorithm vs write stream), R3 (alt-screen selection + search) —
+   report-first to /tmp/report-t5-R*.md; verify claims against TS
+   before changing impl (delegate/redteam expectations are frequently
+   wrong — always probe TS ground truth first).
+3. After T5: T6 markdown/latex/terminal-image remainder + marked-lex
+   decision; T7 batter framework; ~123 pre-existing pi-tui clippy
+   warnings or correct TRACKING.md claims.
