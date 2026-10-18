@@ -64,6 +64,7 @@ const smHeader = (version) => ({
 
 import { mainCases } from "./wavec/main-cases.mjs";
 import { altCases } from "./wavec/alt-cases.mjs";
+import { interactionCases } from "./wavec/interaction-cases.mjs";
 
 export const cases = [
 	// ---------------------------------------------------------------- read
@@ -4794,6 +4795,7 @@ export const cases = [
 	// tui-alt-screen tests — see wavec/*.mjs for provenance).
 	...mainCases,
 	...altCases,
+	...interactionCases,
 ];
 
 // tui-components sub-case builders (hoisted; used by the cases above).
