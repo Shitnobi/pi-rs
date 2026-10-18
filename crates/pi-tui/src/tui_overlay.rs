@@ -1008,7 +1008,13 @@ mod tests {
         fn after_terminal_start(&mut self) {}
         fn before_terminal_stop(&mut self, _options: &TuiStopOptions) {}
         fn after_terminal_stop(&mut self, _options: &TuiStopOptions) {}
-        fn pump_screen_timers(&mut self) {}
+        fn next_screen_timer_deadline(&self) -> Option<f64> {
+            None
+        }
+
+        fn pump_screen_timers_until(&mut self, _bound: f64) -> bool {
+            false
+        }
         fn mode(&self) -> TuiMode {
             TuiMode::Regular
         }

@@ -605,15 +605,18 @@ pub(crate) fn stop_selection_auto_scroll(screen: &mut TuiAltScreen) {
 /// [`auto_scroll_selection`] while the virtual clock has passed the
 /// deadline, re-arming the 50 ms cadence after each fire (the interval
 /// survives until `stopSelectionAutoScroll` clears it).
-pub(crate) fn pump_selection_auto_scroll(screen: &mut TuiAltScreen) {
+pub(crate) fn pump_selection_auto_scroll_until(screen: &mut TuiAltScreen, bound: f64) {
+    // TS `setInterval` semantics: the callback fires once per period —
+    // each re-arm is `deadline + period`, not `now + period`, so a large
+    // clock jump fires the callback for every elapsed period.
     while let Some(deadline) = screen.selection_auto_scroll_timer {
-        if now_ms() < deadline {
+        if bound < deadline {
             break;
         }
         auto_scroll_selection(screen);
         if screen.selection_auto_scroll_timer.is_some() {
             screen.selection_auto_scroll_timer =
-                Some(now_ms() + SELECTION_AUTO_SCROLL_INTERVAL_MS);
+                Some(deadline + SELECTION_AUTO_SCROLL_INTERVAL_MS);
         }
     }
 }
@@ -1753,14 +1756,14 @@ mod tests {
 
         // Not due yet: the pump is a no-op before the deadline.
         advance_ms(10.0);
-        pump_selection_auto_scroll(&mut screen.borrow_mut());
+        pump_selection_auto_scroll_until(&mut screen.borrow_mut(), now_ms());
         assert!(screen.borrow().selection_auto_scroll_timer.is_some());
 
         // At the deadline the pump fires autoScrollSelection. The view
         // cannot scroll (interim scroll seam, see the module docs), so the
         // drag stops itself exactly as TS does at a scroll edge.
         advance_ms(40.0);
-        pump_selection_auto_scroll(&mut screen.borrow_mut());
+        pump_selection_auto_scroll_until(&mut screen.borrow_mut(), now_ms());
         {
             let borrowed = screen.borrow();
             assert!(borrowed.selection_auto_scroll_timer.is_none());

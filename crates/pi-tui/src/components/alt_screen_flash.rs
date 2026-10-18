@@ -45,13 +45,19 @@ impl AltScreenFlashContainer {
         }
     }
 
-    /// Fire expired entries (the TS `setTimeout` callbacks). Returns `true`
-    /// when at least one entry expired (the TS callback also requests a
-    /// render in that case).
-    pub fn tick(&mut self) -> bool {
-        let now = now_ms();
+    /// Earliest expiry deadline among live entries (the next due TS
+    /// `setTimeout`), if any.
+    pub fn next_deadline(&self) -> Option<f64> {
+        self.entries.iter().map(|entry| entry.expires_at).reduce(f64::min)
+    }
+
+    /// Fire entries expiring at or before `bound` (the TS `setTimeout`
+    /// callbacks — each entry has its own timer, so only entries whose
+    /// deadline has actually passed expire). Returns `true` when at least
+    /// one entry expired (the TS callback also requests a render).
+    pub fn tick_until(&mut self, bound: f64) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|entry| entry.expires_at > now);
+        self.entries.retain(|entry| entry.expires_at > bound);
         let expired = self.entries.len() != before;
         if expired {
             if let Some(cb) = self.request_render.as_mut() {
@@ -59,6 +65,12 @@ impl AltScreenFlashContainer {
             }
         }
         expired
+    }
+
+    /// Fire expired entries at the current virtual clock.
+    pub fn tick(&mut self) -> bool {
+        let now = now_ms();
+        self.tick_until(now)
     }
 
     /// `dispose()` — drop every entry and cancel the pending timers.

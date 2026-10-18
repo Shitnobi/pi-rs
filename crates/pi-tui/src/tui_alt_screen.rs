@@ -359,7 +359,8 @@ pub struct TuiAltScreen {
     /// `altScreenActive: boolean`.
     pub(crate) alt_screen_active: bool,
     /// `imageProtocol: ImageProtocol`.
-    pub(crate) image_protocol: ImageProtocol,
+    /// `imageProtocol: ImageProtocol | null` — `None` is TS `null`.
+    pub(crate) image_protocol: Option<ImageProtocol>,
     /// `savedCapabilities?: TerminalCapabilities` — restored on stop when
     /// iTerm2 image support was masked at start.
     pub(crate) saved_capabilities: Option<TerminalCapabilities>,
@@ -472,7 +473,7 @@ impl TuiAltScreen {
             implicit_scroll_view_state,
             flashes,
             alt_screen_active: false,
-            image_protocol: ImageProtocol::Kitty, // `null` — placeholder until start
+            image_protocol: None, // TS `null` — set from capabilities at start
             saved_capabilities: None,
             uploaded_kitty_images: HashMap::new(),
             selection_anchor: None,
@@ -644,11 +645,23 @@ impl TuiAltScreen {
     /// Port machinery (no TS counterpart): `advanceClock` pumps the
     /// selection auto-scroll interval modeled on the virtual clock
     /// (TS: `setInterval(() => this.autoScrollSelection(), 50)`).
-    fn pump_screen_timers(&mut self) {
-        crate::alt_screen_selection::pump_selection_auto_scroll(self);
+    /// The next deadline among the screen-owned timers: the selection
+    /// auto-scroll `setInterval` and the flash-expiry `setTimeout`s.
+    fn next_screen_timer_deadline(&self) -> Option<f64> {
+        [self.selection_auto_scroll_timer, self.flashes.next_deadline()]
+            .into_iter()
+            .flatten()
+            .reduce(f64::min)
+    }
+
+    /// Fire the screen-owned timers due at or before `bound`.
+    fn pump_screen_timers_until(&mut self, bound: f64) -> bool {
+        // TS: the selection auto-scroll `setInterval` callback
+        // (tui-alt-screen.ts:1290).
+        crate::alt_screen_selection::pump_selection_auto_scroll_until(self, bound);
         // TS: flash-expiry `setTimeout` callbacks remove the entry and
         // request a render (alt-screen-flash.ts:22-29).
-        self.flashes.tick();
+        self.flashes.tick_until(bound)
     }
 
     /// `readonly mode = "fullscreen"`.

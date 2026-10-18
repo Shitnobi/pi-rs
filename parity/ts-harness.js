@@ -701,6 +701,442 @@ async function runModule(tool, args, cwd) {
 			globalThis.clearTimeout = origClearTimeout;
 		}
 	}
+	if (tool === "tui-main" || tool === "tui-alt") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const tui = await import(pathToFileURL(TUI_SRC + "/tui.ts").href);
+		const mainMod = await import(pathToFileURL(TUI_SRC + "/tui-main-screen.ts").href);
+		const altMod = await import(pathToFileURL(TUI_SRC + "/tui-alt-screen.ts").href);
+		const tiMod = await import(pathToFileURL(TUI_SRC + "/terminal-image.ts").href);
+		const load = (name) => import(pathToFileURL(TUI_SRC + "/components/" + name + ".ts").href);
+		const [textMod, ttMod, spacerMod, boxMod, hsMod, vsMod, loaderMod, clMod, mrMod, svMod, inputMod, slMod, stlMod] =
+			await Promise.all([
+				load("text"), load("truncated-text"), load("spacer"), load("box"), load("h-stack"), load("v-stack"),
+				load("loader"), load("cancellable-loader"), load("mouse-region"), load("scroll-view"), load("input"),
+				load("select-list"), load("settings-list"),
+			]);
+		const bgPreset = (preset) => {
+			if (preset === "identity") return (t) => t;
+			if (preset === "bracket") return (t) => `[${t}]`;
+			return undefined;
+		};
+		const stylePreset = () => (t) => t;
+
+		// Deterministic environment: the TS screens read TERM/TMUX/ZELLIJ/
+		// STY (mouse sequence), TERMUX_VERSION (main screen), WEZTERM_PANE/
+		// TERM_PROGRAM (WezTerm interleave), SSH_* (wheel scroll), and the
+		// PI_* overrides (capabilities). The harness pins an empty env on
+		// both sides (T5_PLAN divergences) and pins capabilities explicitly.
+		const ENV_KEYS = [
+			"TERM", "TMUX", "ZELLIJ", "STY", "TERMUX_VERSION", "WEZTERM_PANE", "TERM_PROGRAM",
+			"COLORTERM", "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY",
+			"PI_IMAGE_PROTOCOL", "PI_TRUE_COLOR", "PI_HYPERLINKS",
+			"PI_TUI_DEBUG", "PI_TUI_DEBUG_REDRAW",
+		];
+		const savedEnv = {};
+		for (const key of ENV_KEYS) {
+			if (process.env[key] !== undefined) savedEnv[key] = process.env[key];
+			delete process.env[key];
+		}
+
+		// Virtual clock: performance.now / Date.now / setTimeout /
+		// clearTimeout / setInterval / clearInterval / process.nextTick are
+		// all patched. `tickMs` advances the clock; due callbacks fire in
+		// (deadline, scheduling order) with the nextTick queue drained after
+		// each callback — mirroring Node's event loop and the Rust
+		// harness's advance_clock().
+		let clock = 0;
+		let timerSeq = 0;
+		const timeouts = new Map(); // id -> { fn, at, seq }
+		const intervals = new Map(); // id -> { fn, period, nextAt, seq }
+		const nextTicks = [];
+		const origSetTimeout = globalThis.setTimeout;
+		const origClearTimeout = globalThis.clearTimeout;
+		const origSetInterval = globalThis.setInterval;
+		const origClearInterval = globalThis.clearInterval;
+		const origNextTick = process.nextTick.bind(process);
+		const origPerfNow = globalThis.performance.now.bind(globalThis.performance);
+		const origDateNow = Date.now;
+		const handleOf = (id) => ({ __harnessTimerId: id, unref() {}, ref() {} });
+		const idOf = (h) => (typeof h === "object" && h !== null && "__harnessTimerId" in h ? h.__harnessTimerId : h);
+		globalThis.setTimeout = (fn, delay) => {
+			timerSeq += 1;
+			timeouts.set(timerSeq, { fn, at: clock + Math.max(0, Number(delay) || 0), seq: timerSeq });
+			return handleOf(timerSeq);
+		};
+		globalThis.clearTimeout = (h) => {
+			timeouts.delete(idOf(h));
+		};
+		globalThis.setInterval = (fn, period) => {
+			timerSeq += 1;
+			const p = Math.max(1, Number(period) || 0);
+			intervals.set(timerSeq, { fn, period: p, nextAt: clock + p, seq: timerSeq });
+			return handleOf(timerSeq);
+		};
+		globalThis.clearInterval = (h) => {
+			intervals.delete(idOf(h));
+		};
+		process.nextTick = (fn, ...args) => {
+			nextTicks.push(() => fn(...args));
+		};
+		globalThis.performance.now = () => clock;
+		Date.now = () => Math.floor(clock);
+		const drainNextTicks = () => {
+			while (nextTicks.length) {
+				const batch = nextTicks.splice(0, nextTicks.length);
+				for (const fn of batch) fn();
+			}
+		};
+		const advance = (ms) => {
+			clock += ms;
+			for (;;) {
+				drainNextTicks();
+				let best = null;
+				for (const [id, t] of timeouts) {
+					if (t.at <= clock && (best === null || t.at < best.at || (t.at === best.at && t.seq < best.seq)))
+						best = { kind: "timeout", id, at: t.at, seq: t.seq };
+				}
+				for (const [id, t] of intervals) {
+					if (t.nextAt <= clock && (best === null || t.nextAt < best.at || (t.nextAt === best.at && t.seq < best.seq)))
+						best = { kind: "interval", id, at: t.nextAt, seq: t.seq };
+				}
+				if (best === null) return;
+				if (best.kind === "timeout") {
+					const t = timeouts.get(best.id);
+					timeouts.delete(best.id);
+					if (t) t.fn();
+				} else {
+					const t = intervals.get(best.id);
+					if (!t) continue;
+					t.nextAt += t.period;
+					t.fn();
+				}
+			}
+		};
+
+		// RecordingTerminal: implements the TS Terminal interface with the
+		// same observability as upstream's VirtualTerminal — only write()
+		// lands in the recorded stream; hideCursor/showCursor are counted;
+		// everything else is a black hole. kittyProtocolActive mirrors the
+		// VirtualTerminal (always true).
+		class RecordingTerminal {
+			constructor(cols, rows) {
+				this._cols = cols;
+				this._rows = rows;
+				this.writes = [];
+				this.hideCount = 0;
+				this.showCount = 0;
+				this.inputHandler = undefined;
+				this.resizeHandler = undefined;
+			}
+			start(onInput, onResize) {
+				this.inputHandler = onInput;
+				this.resizeHandler = onResize;
+			}
+			async drainInput() {}
+			stop() {
+				this.inputHandler = undefined;
+				this.resizeHandler = undefined;
+			}
+			write(data) {
+				this.writes.push(data);
+			}
+			get columns() {
+				return this._cols;
+			}
+			get rows() {
+				return this._rows;
+			}
+			get kittyProtocolActive() {
+				return true;
+			}
+			moveBy() {}
+			hideCursor() {
+				this.hideCount++;
+			}
+			showCursor() {
+				this.showCount++;
+			}
+			clearLine() {}
+			clearFromCursor() {}
+			clearScreen() {}
+			setTitle() {}
+			setProgress() {}
+			setProgramStatus() {}
+			sendInput(data) {
+				if (this.inputHandler) this.inputHandler(data);
+			}
+			resize(cols, rows) {
+				if (cols === this._cols && rows === this._rows) return;
+				this._cols = cols;
+				this._rows = rows;
+				if (this.resizeHandler) this.resizeHandler();
+			}
+		}
+
+		try {
+			// One case per invocation: args = the case itself.
+			const c = args;
+			const caps = c.capabilities ?? { images: null, trueColor: true, hyperlinks: true };
+			tiMod.setCapabilities({
+				images: caps.images ?? null,
+				trueColor: caps.trueColor ?? true,
+				hyperlinks: caps.hyperlinks ?? true,
+			});
+
+			// Component spec builder (same vocabulary as the tui-components
+			// tool, plus scroll-view scrollbar options). Every built
+			// component is registered under an auto ref ("c0", "c1", …) in
+			// build order so script ops can reference it (setFocus) and the
+			// output can name the focused component.
+			const registry = new Map();
+			const build = (spec) => {
+				const register = (component) => {
+					const ref = "c" + registry.size;
+					registry.set(ref, component);
+					return component;
+				};
+				switch (spec.type) {
+					case "text":
+						return register(new textMod.Text(spec.text ?? "", spec.paddingX ?? 1, spec.paddingY ?? 1, bgPreset(spec.bg)));
+					case "truncated-text":
+						return register(new ttMod.TruncatedText(spec.text ?? "", spec.paddingX ?? 0, spec.paddingY ?? 0));
+					case "spacer":
+						return register(new spacerMod.Spacer(spec.lines ?? 1));
+					case "box": {
+						const box = new boxMod.Box(spec.paddingX ?? 1, spec.paddingY ?? 1, bgPreset(spec.bg));
+						for (const child of spec.children || []) box.addChild(build(child));
+						return register(box);
+					}
+					case "h-stack":
+					case "v-stack": {
+						const children = (spec.entries || []).map((entry) => {
+							const component = build(entry.component);
+							const opts = {};
+							if (entry.basis !== undefined) opts.basis = entry.basis;
+							if (entry.grow !== undefined) opts.grow = entry.grow;
+							if (entry.shrink !== undefined) opts.shrink = entry.shrink;
+							if (entry.minSize !== undefined) opts.minSize = entry.minSize;
+							if (entry.maxSize !== undefined) opts.maxSize = entry.maxSize;
+							if (entry.visible !== undefined)
+								opts.visible = entry.visible === "always" ? () => true : () => false;
+							return Object.keys(opts).length ? { component, ...opts } : component;
+						});
+						const options = {};
+						if (spec.gap !== undefined) options.gap = spec.gap;
+						if (spec.align !== undefined) options.align = spec.align;
+						return register(
+							spec.type === "h-stack" ? new hsMod.HStack(children, options) : new vsMod.VStack(children, options),
+						);
+					}
+					case "loader":
+						return register(
+							new loaderMod.Loader(null, stylePreset(), stylePreset(), spec.message ?? "Loading...", {
+								...(spec.frames !== undefined ? { frames: spec.frames } : {}),
+								...(spec.intervalMs !== undefined ? { intervalMs: spec.intervalMs } : {}),
+							}),
+						);
+					case "cancellable-loader":
+						return register(
+							new clMod.CancellableLoader(null, stylePreset(), stylePreset(), spec.message ?? "Loading...", undefined),
+						);
+					case "mouse-region":
+						return register(new mrMod.MouseRegion(build(spec.child), () => undefined));
+					case "scroll-view": {
+						const options = {};
+						if (spec.follow !== undefined) options.follow = spec.follow;
+						if (spec.primary !== undefined) options.primary = spec.primary;
+						if (spec.overscroll !== undefined) options.overscroll = spec.overscroll;
+						if (spec.scrollbar !== undefined) options.scrollbar = spec.scrollbar;
+						if (spec.scrollbarTrackStyle === "identity") options.scrollbarTrackStyle = stylePreset();
+						if (spec.scrollbarThumbStyle === "identity") options.scrollbarThumbStyle = stylePreset();
+						if (spec.scrollbarHideDelayMs !== undefined) options.scrollbarHideDelayMs = spec.scrollbarHideDelayMs;
+						return register(new svMod.ScrollView(build(spec.child), options));
+					}
+					case "input": {
+						const input = new inputMod.Input({
+							...(spec.prompt !== undefined ? { prompt: spec.prompt } : {}),
+							...(spec.placeholder !== undefined ? { placeholder: spec.placeholder } : {}),
+						});
+						if (spec.focused) input.focused = true;
+						return register(input);
+					}
+					case "select-list": {
+						const items = (spec.items || []).map((it) => ({
+							value: it.value,
+							label: it.label,
+							...(it.description !== undefined ? { description: it.description } : {}),
+						}));
+						const theme = {
+							selectedPrefix: (t) => t,
+							selectedText: (t) => t,
+							description: (t) => t,
+							scrollInfo: (t) => t,
+							noMatch: (t) => t,
+						};
+						return register(new slMod.SelectList(items, spec.maxVisible ?? 5, theme, {}));
+					}
+					case "settings-list": {
+						const items = (spec.items || []).map((it) => ({
+							id: it.id,
+							label: it.label,
+							currentValue: it.currentValue,
+							...(it.description !== undefined ? { description: it.description } : {}),
+							...(it.values !== undefined ? { values: it.values } : {}),
+						}));
+						const theme = { label: (t) => t, value: (t) => t, description: (t) => t, cursor: "> ", hint: (t) => t };
+						return register(
+							new stlMod.SettingsList(items, spec.maxVisible ?? 5, theme, () => {}, () => {}, {
+								enableSearch: spec.enableSearch ?? false,
+							}),
+						);
+					}
+					default:
+						throw new Error("unknown tui-main/tui-alt component type: " + spec.type);
+				}
+			};
+			const refOf = (spec) => {
+				if (spec.ref !== undefined) {
+					const component = registry.get(spec.ref);
+					if (!component) throw new Error("unknown component ref: " + spec.ref);
+					return component;
+				}
+				return build(spec.component ?? spec);
+			};
+			const overlayOptions = (o) => {
+				const out = {};
+				if (!o) return out;
+				if (o.width !== undefined) out.width = o.width;
+				if (o.minWidth !== undefined) out.minWidth = o.minWidth;
+				if (o.maxHeight !== undefined) out.maxHeight = o.maxHeight;
+				if (o.anchor !== undefined) out.anchor = o.anchor;
+				if (o.offsetX !== undefined) out.offsetX = o.offsetX;
+				if (o.offsetY !== undefined) out.offsetY = o.offsetY;
+				if (o.row !== undefined) out.row = o.row;
+				if (o.col !== undefined) out.col = o.col;
+				if (o.margin !== undefined) out.margin = o.margin;
+				if (o.visible === "always") out.visible = () => true;
+				if (o.nonCapturing !== undefined) out.nonCapturing = o.nonCapturing;
+				return out;
+			};
+
+			const term = new RecordingTerminal(c.cols ?? 80, c.rows ?? 24);
+			let screen;
+			if (tool === "tui-alt") {
+				const o = c.altOptions ?? {};
+				const options = {};
+				if (o.wheelScrollLines !== undefined) options.wheelScrollLines = o.wheelScrollLines;
+				if (o.mouse !== undefined) options.mouse = o.mouse;
+				if (o.searchMatchStyle === "identity") options.searchMatchStyle = (t) => t;
+				if (o.searchCurrentMatchStyle === "identity") options.searchCurrentMatchStyle = (t) => t;
+				if (o.copyOnSelect !== undefined) options.copyOnSelect = o.copyOnSelect;
+				screen = new altMod.TuiAltScreen(term, c.showHardwareCursor ?? false, undefined, options);
+			} else {
+				screen = new mainMod.TuiMainScreen(term, c.showHardwareCursor ?? false, undefined);
+			}
+			if (c.clearOnShrink) screen.setClearOnShrink(true);
+
+			for (const op of c.script ?? []) {
+				switch (op.type) {
+					case "addChild":
+						screen.addChild(build(op.component));
+						break;
+					case "input":
+					case "terminalReply":
+						term.sendInput(op.data);
+						break;
+					case "setFocus":
+						screen.setFocus(op.ref === null ? null : refOf({ ref: op.ref }));
+						break;
+					case "showOverlay":
+						screen.showOverlay(build(op.component), overlayOptions(op.options));
+						break;
+					case "hideOverlay":
+						screen.hideOverlay();
+						break;
+					case "requestRender":
+						screen.requestRender(op.force ?? false);
+						break;
+					case "renderNow":
+						screen.renderNow(op.force ?? false);
+						break;
+					case "resize":
+						term.resize(op.cols, op.rows);
+						break;
+					case "tickMs":
+						advance(op.n);
+						break;
+					case "start":
+						screen.start();
+						break;
+					case "stop":
+						screen.stop({ preserveScreen: op.preserveScreen ?? false });
+						break;
+					case "setLayoutRoot":
+						if (tool !== "tui-alt") throw new Error("setLayoutRoot is alt-only");
+						screen.setLayoutRoot(op.component ? build(op.component) : undefined);
+						break;
+					case "scrollBy":
+						if (tool !== "tui-alt") throw new Error("scrollBy is alt-only");
+						screen.scrollBy(op.lines);
+						break;
+					case "flash":
+						if (tool !== "tui-alt") throw new Error("flash is alt-only");
+						screen.flash(op.message, op.durationMs);
+						break;
+					default:
+						throw new Error("invalid " + tool + " script op: " + JSON.stringify(Object.keys(op)));
+				}
+				drainNextTicks();
+			}
+
+			// Frames: the concatenated write stream split at every
+			// synchronized-output begin marker — one segment per render
+			// (plus any pre-first-render writes as a leading segment).
+			const BEGIN = "\x1b[?2026h";
+			const stream = term.writes.join("");
+			const parts = stream.split(BEGIN);
+			const frames = [];
+			if (parts[0] !== "") frames.push(parts[0]);
+			for (let i = 1; i < parts.length; i++) frames.push(BEGIN + parts[i]);
+			let focused = null;
+			const focusedComponent = screen.getFocusedComponent();
+			if (focusedComponent) {
+				for (const [ref, component] of registry) {
+					if (component === focusedComponent) {
+						focused = ref;
+						break;
+					}
+				}
+			}
+			const out = {
+				name: c.name,
+				frames,
+				writes: term.writes.slice(),
+				fullRedraws: screen.fullRedraws,
+				hideCursor: term.hideCount,
+				showCursor: term.showCount,
+				focused,
+			};
+			if (tool === "tui-alt") {
+				out.viewportTop = screen.viewportTop;
+				out.followingOutput = screen.isFollowingOutput;
+				if (c.screenLines) out.screenLines = screen.getScreenLines();
+			}
+			return out;
+		} finally {
+			globalThis.setTimeout = origSetTimeout;
+			globalThis.clearTimeout = origClearTimeout;
+			globalThis.setInterval = origSetInterval;
+			globalThis.clearInterval = origClearInterval;
+			process.nextTick = origNextTick;
+			globalThis.performance.now = origPerfNow;
+			Date.now = origDateNow;
+			for (const key of ENV_KEYS) delete process.env[key];
+			for (const [key, value] of Object.entries(savedEnv)) process.env[key] = value;
+			tiMod.resetCapabilitiesCache();
+		}
+	}
 	if (tool === "math") {
 		const buf = new ArrayBuffer(8);
 		const view = new DataView(buf);

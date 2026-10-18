@@ -423,6 +423,7 @@ pub trait TuiSurface: Component {
     fn stop(&mut self, options: &TuiStopOptions);
     fn handle_terminal_input(&mut self, data: &str);
 
+    fn add_child(&mut self, component: ComponentRef);
     fn get_focused_component(&self) -> Option<ComponentRef>;
     fn set_focus(&mut self, component: Option<ComponentRef>);
     fn show_overlay(&mut self, component: ComponentRef, options: OverlayOptions) -> OverlayHandle;
@@ -851,6 +852,11 @@ impl TuiBase {
         !self.next_tick_queue.is_empty()
     }
 
+    /// The armed render-timer deadline, if any (`renderTimer`).
+    pub(crate) fn render_timer_deadline(&self) -> Option<f64> {
+        self.render_timer
+    }
+
     /// Whether the render timer is due at the current clock (consumes the
     /// timer and the `renderRequested` flag exactly like the TS callback).
     pub(crate) fn fire_due_render_timer(&mut self) -> bool {
@@ -1112,14 +1118,25 @@ impl TuiBase {
 
     /// Fire due color-query timeouts (the TS `setTimeout` callbacks) —
     /// called from the clock pump.
-    pub(crate) fn fire_due_color_query_timeouts(&mut self) {
-        let now = now_ms();
+    /// The earliest armed color-query timeout deadline, if any.
+    pub(crate) fn next_color_query_deadline(&self) -> Option<f64> {
+        self.pending_color_queries
+            .iter()
+            .filter_map(|query| query.timer)
+            .reduce(f64::min)
+    }
+
+    /// Fire color-query timeouts whose deadline is at or before `bound`.
+    /// Returns whether any timeout fired.
+    pub(crate) fn fire_due_color_query_timeouts_until(&mut self, bound: f64) -> bool {
+        let mut fired = false;
         for query in self.pending_color_queries.iter_mut() {
             let Some(deadline) = query.timer else { continue };
-            if now < deadline {
+            if bound < deadline {
                 continue;
             }
             query.timer = None;
+            fired = true;
             // `query.deliver = onLateReply; resolve(result)`.
             if let Some(mut deliver) = query.deliver.take() {
                 let result = Self::terminal_color_query_result(query);
@@ -1129,6 +1146,7 @@ impl TuiBase {
                 query.deliver = query.deliver_on_timeout.take();
             }
         }
+        fired
     }
 
     // ----- cursor markers (tui.ts:1417-1462) -----
@@ -1325,19 +1343,60 @@ macro_rules! impl_tui_surface {
                 }
             }
 
-            /// Advance the virtual clock, drain microtasks, fire due render
-            /// timers and color-query timeouts.
+            /// Advance the virtual clock and fire due timers in TS event-
+            /// loop order. In TS every deferred callback — the render
+            /// timer, scrollbar hide timers, selection auto-scroll and
+            /// flash expiry — is a `setTimeout`/`setInterval` on the shared
+            /// event loop, so they fire by (deadline, scheduling order):
+            /// drain microtasks first (`process.nextTick` priority), then
+            /// fire the earliest due deadline, repeating. The screen-owned
+            /// timers (selection/flash) and scrollbar-hide timers are
+            /// armed before the render timer in the flows that queue both,
+            /// so ties fire them before the render timer.
             pub fn advance_clock(&mut self, ms: f64) {
                 $crate::clock::advance_ms(ms);
-                $crate::layout::pump_scrollbar_hide_timers();
-                self.pump_screen_timers();
-                self.run_pending_ticks();
-                while self.base.fire_due_render_timer() {
-                    self.do_render();
-                    self.base.rearm_after_timer_render();
+                loop {
                     self.run_pending_ticks();
+                    let now = $crate::clock::now_ms();
+                    let render = self.base.render_timer_deadline().filter(|d| *d <= now);
+                    let early = [
+                        $crate::layout::next_scrollbar_hide_deadline().filter(|d| *d <= now),
+                        self.next_screen_timer_deadline().filter(|d| *d <= now),
+                        self.base.next_color_query_deadline().filter(|d| *d <= now),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .reduce(f64::min);
+                    // Ties (equal deadlines) fire the early tier first:
+                    // those timers are armed before the render timer in
+                    // the flows that queue both, matching TS scheduling
+                    // order.
+                    let fire_render = match (early, render) {
+                        (Some(e), Some(r)) => r < e,
+                        (None, Some(_)) => true,
+                        _ => false,
+                    };
+                    if fire_render {
+                        if self.base.fire_due_render_timer() {
+                            self.do_render();
+                            self.base.rearm_after_timer_render();
+                        }
+                        continue;
+                    }
+                    if let Some(bound) = early {
+                        let fired = $crate::layout::pump_scrollbar_hide_timers_until(bound);
+                        let fired_screen = self.pump_screen_timers_until(bound);
+                        let fired_query =
+                            self.base.fire_due_color_query_timeouts_until(bound);
+                        if !fired && !fired_screen && !fired_query {
+                            // A due deadline whose owner fired nothing
+                            // (defensive): avoid spinning.
+                            break;
+                        }
+                        continue;
+                    }
+                    break;
                 }
-                self.base.fire_due_color_query_timeouts();
             }
 
             /// `start()` (tui.ts:924-937).
@@ -1528,6 +1587,10 @@ macro_rules! impl_tui_surface {
             }
             fn handle_terminal_input(&mut self, data: &str) {
                 self.handle_terminal_input(data)
+            }
+
+            fn add_child(&mut self, component: $crate::component::ComponentRef) {
+                self.add_child(component)
             }
 
             fn get_focused_component(&self) -> Option<$crate::component::ComponentRef> {

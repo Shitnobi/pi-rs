@@ -1029,7 +1029,15 @@ impl TuiMainScreen {
 
     /// `afterTerminalStop()` (tui.ts:593) — no main-screen override.
     fn after_terminal_stop(&mut self, _options: &TuiStopOptions) {}
-    fn pump_screen_timers(&mut self) {}
+    /// The main screen owns no virtual-clock timers.
+    fn next_screen_timer_deadline(&self) -> Option<f64> {
+        None
+    }
+
+    /// The main screen owns no virtual-clock timers.
+    fn pump_screen_timers_until(&mut self, _bound: f64) -> bool {
+        false
+    }
 
     /// `render(width)` — inherited from `Container` (tui.ts:363+).
     fn render_children(&mut self, width: usize) -> Vec<String> {

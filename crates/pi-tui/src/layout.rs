@@ -172,21 +172,44 @@ pub trait ScrollViewState: ScrollLayoutState {
     /// Port machinery (no TS counterpart): fire the modeled
     /// `scrollbarHideTimer` when its virtual-clock deadline is due.
     /// Returns whether it fired.
-    fn fire_due_scrollbar_hide_timer(&mut self) -> bool;
+    /// The armed `scrollbarHideTimer` deadline, if armed (the next due TS
+    /// `setTimeout`).
+    fn scrollbar_hide_timer_deadline(&self) -> Option<f64>;
+    /// Fire the hide timer when its deadline is at or before `bound`.
+    /// Returns whether it fired.
+    fn fire_due_scrollbar_hide_timer(&mut self, bound: f64) -> bool;
 }
 
-/// Port machinery (no TS counterpart): fire every live scroll view's
-/// due `scrollbarHideTimer` (the TS `setTimeout` callbacks run off the
-/// shared event loop; here the clock owner pumps the registry).
-pub fn pump_scrollbar_hide_timers() {
+/// Port machinery (no TS counterpart): the earliest armed
+/// `scrollbarHideTimer` deadline among live scroll views.
+pub fn next_scrollbar_hide_deadline() -> Option<f64> {
     let states: Vec<ScrollViewRef> = SCROLL_VIEW_STATES.with(|registry| {
         let mut registry = registry.borrow_mut();
         registry.retain(|_, weak| weak.strong_count() > 0);
         registry.values().filter_map(|weak| weak.upgrade()).collect()
     });
+    states
+        .iter()
+        .filter_map(|state| state.borrow().scrollbar_hide_timer_deadline())
+        .reduce(f64::min)
+}
+
+/// Port machinery (no TS counterpart): fire every live scroll view's
+/// `scrollbarHideTimer` whose deadline is at or before `bound` (the TS
+/// `setTimeout` callbacks run off the shared event loop in deadline
+/// order; here the clock owner pumps the registry at each due deadline).
+/// Returns whether any timer fired.
+pub fn pump_scrollbar_hide_timers_until(bound: f64) -> bool {
+    let states: Vec<ScrollViewRef> = SCROLL_VIEW_STATES.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.retain(|_, weak| weak.strong_count() > 0);
+        registry.values().filter_map(|weak| weak.upgrade()).collect()
+    });
+    let mut fired = false;
     for state in states {
-        state.borrow_mut().fire_due_scrollbar_hide_timer();
+        fired |= state.borrow_mut().fire_due_scrollbar_hide_timer(bound);
     }
+    fired
 }
 
 /// Shared handle to a scroll view's state (the TS `ScrollView` object
@@ -1299,7 +1322,11 @@ mod tests {
             self.render_requested = true;
         }
 
-        fn fire_due_scrollbar_hide_timer(&mut self) -> bool {
+        fn scrollbar_hide_timer_deadline(&self) -> Option<f64> {
+            None
+        }
+
+        fn fire_due_scrollbar_hide_timer(&mut self, _bound: f64) -> bool {
             false
         }
 
@@ -1476,7 +1503,11 @@ mod tests {
             self.following_end = self.follow_end;
         }
 
-        fn fire_due_scrollbar_hide_timer(&mut self) -> bool {
+        fn scrollbar_hide_timer_deadline(&self) -> Option<f64> {
+            None
+        }
+
+        fn fire_due_scrollbar_hide_timer(&mut self, _bound: f64) -> bool {
             false
         }
 

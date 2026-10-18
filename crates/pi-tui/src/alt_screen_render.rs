@@ -154,7 +154,7 @@ pub(crate) fn do_render(screen: &mut TuiAltScreen) {
     let is_wezterm = wezterm_env();
     let image_cells_need_redraw = !image_anchors_need_redraw
         && is_wezterm
-        && screen.image_protocol == ImageProtocol::Kitty
+        && screen.image_protocol == Some(ImageProtocol::Kitty)
         && changed_rows.iter().any(|changed| *changed)
         && lines.iter().enumerate().any(|(row, line)| {
             // WezTerm erases intersecting Kitty image cells when a later
@@ -176,7 +176,7 @@ pub(crate) fn do_render(screen: &mut TuiAltScreen) {
     let redraw_images = full_redraw || images_need_redraw;
     let had_uploaded_kitty_images = !screen.uploaded_kitty_images.is_empty();
     let (prepared_lines, evicted_image_deletion) =
-        if redraw_images && screen.image_protocol == ImageProtocol::Kitty {
+        if redraw_images && screen.image_protocol == Some(ImageProtocol::Kitty) {
             prepare_kitty_screen(screen, &lines)
         } else {
             (lines.clone(), String::new())
@@ -187,7 +187,7 @@ pub(crate) fn do_render(screen: &mut TuiAltScreen) {
     if full_redraw {
         screen.base.full_redraw_count += 1;
         let clear_images =
-            if screen.image_protocol == ImageProtocol::Kitty && had_uploaded_kitty_images {
+            if screen.image_protocol == Some(ImageProtocol::Kitty) && had_uploaded_kitty_images {
                 delete_all_kitty_placements().to_string()
             } else {
                 delete_kitty_images(screen)
@@ -195,9 +195,9 @@ pub(crate) fn do_render(screen: &mut TuiAltScreen) {
         buffer.push_str(&clear_images);
         buffer.push_str("\x1b[2J");
     } else if images_need_redraw {
-        if screen.image_protocol == ImageProtocol::Iterm2 {
+        if screen.image_protocol == Some(ImageProtocol::Iterm2) {
             buffer.push_str("\x1b[2J");
-        } else if screen.image_protocol == ImageProtocol::Kitty {
+        } else if screen.image_protocol == Some(ImageProtocol::Kitty) {
             buffer.push_str(delete_all_kitty_placements());
         }
     }
@@ -208,7 +208,7 @@ pub(crate) fn do_render(screen: &mut TuiAltScreen) {
     // text write so nothing later intersects them; preserve the existing
     // interleaved output for text-only frames and every other terminal.
     let draw_kitty_images_last = redraw_images
-        && screen.image_protocol == ImageProtocol::Kitty
+        && screen.image_protocol == Some(ImageProtocol::Kitty)
         && lines.iter().any(|line| is_image_line(line))
         && is_wezterm;
     // `if (!fullRedraw && !imagesNeedRedraw && screen[row] === previous[row])
@@ -609,7 +609,7 @@ fn kitty_cache_order_synced(tui_id: usize, map: &HashMap<i64, CachedKittyImage>)
 /// `deleteKittyImages()` (tui-alt-screen.ts:430-432): delete every
 /// uploaded image (and its data) when the kitty protocol is active.
 fn delete_kitty_images(screen: &TuiAltScreen) -> String {
-    if screen.image_protocol == ImageProtocol::Kitty {
+    if screen.image_protocol == Some(ImageProtocol::Kitty) {
         delete_all_kitty_images().to_string()
     } else {
         String::new()
@@ -827,7 +827,7 @@ mod tests {
     fn do_render_full_redraw_write_sequence() {
         let _guard = global_test_lock();
         let (screen, terminal) = new_screen(20, 3, TuiAltScreenOptions::default(), None);
-        screen.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
         let child = widget(&["hello"]);
         screen.borrow_mut().add_child(child);
 
@@ -851,7 +851,7 @@ mod tests {
     fn do_render_differential_writes_only_changed_rows() {
         let _guard = global_test_lock();
         let (screen, terminal) = new_screen(20, 3, TuiAltScreenOptions::default(), None);
-        screen.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
         let child = widget(&["hello"]);
         screen.borrow_mut().add_child(child.clone());
         screen.borrow_mut().render_now(false);
@@ -878,7 +878,7 @@ mod tests {
     fn do_render_unchanged_frame_writes_cursor_hide_only() {
         let _guard = global_test_lock();
         let (screen, terminal) = new_screen(20, 3, TuiAltScreenOptions::default(), None);
-        screen.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
         screen.borrow_mut().add_child(widget(&["hello"]));
         screen.borrow_mut().render_now(false);
 
@@ -896,7 +896,7 @@ mod tests {
     fn do_render_resize_forces_full_redraw() {
         let _guard = global_test_lock();
         let (screen, terminal) = new_screen(20, 3, TuiAltScreenOptions::default(), None);
-        screen.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
         screen.borrow_mut().add_child(widget(&["hello"]));
         screen.borrow_mut().render_now(false);
 
@@ -952,7 +952,7 @@ mod tests {
     fn reset_render_state_forces_next_full_redraw() {
         let _guard = global_test_lock();
         let (screen, terminal) = new_screen(20, 3, TuiAltScreenOptions::default(), None);
-        screen.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
         screen.borrow_mut().add_child(widget(&["hello"]));
         screen.borrow_mut().render_now(false);
         assert_eq!(screen.borrow().base.full_redraw_count, 1);
@@ -979,7 +979,7 @@ mod tests {
     fn do_render_height_slice_keeps_last_rows() {
         let _guard = global_test_lock();
         let (screen, terminal) = new_screen(20, 3, TuiAltScreenOptions::default(), None);
-        screen.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
         screen.borrow_mut().add_child(widget(&["a", "b", "c"]));
 
         let overlay = widget(&["O1", "O2", "O3", "O4"]);
@@ -1024,7 +1024,7 @@ mod tests {
     fn do_render_strips_osc133_before_fake_cursor_resolution() {
         let _guard = global_test_lock();
         let (screen, terminal) = new_screen(20, 3, TuiAltScreenOptions::default(), None);
-        screen.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
         let line = format!("\x1b]133;A\x07{FAKE_CURSOR_START}${FAKE_CURSOR_END} tail");
         screen.borrow_mut().add_child(widget(&[&line]));
         screen.borrow_mut().render_now(false);
@@ -1044,7 +1044,7 @@ mod tests {
         let _guard = global_test_lock();
         let (screen, terminal) =
             new_screen(20, 3, TuiAltScreenOptions::default(), Some(true));
-        screen.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
         let line = format!("ab{CURSOR_MARKER}cd");
         screen.borrow_mut().add_child(widget(&[&line]));
         screen.borrow_mut().render_now(false);
@@ -1059,7 +1059,7 @@ mod tests {
         // but the cursor stays off.
         let (screen2, terminal2) =
             new_screen(20, 3, TuiAltScreenOptions::default(), Some(false));
-        screen2.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen2.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
         screen2.borrow_mut().add_child(widget(&[&line]));
         screen2.borrow_mut().render_now(false);
         let buffer2 = terminal2.borrow().last_write().to_string();
@@ -1172,7 +1172,7 @@ mod tests {
     fn do_render_applies_search_highlights() {
         let _guard = global_test_lock();
         let (screen, terminal) = new_screen(20, 3, TuiAltScreenOptions::default(), None);
-        screen.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
         screen.borrow_mut().add_child(widget(&["alpha beta gamma"]));
         screen.borrow_mut().render_now(false);
 
@@ -1202,7 +1202,7 @@ mod tests {
             ..Default::default()
         };
         let (screen, terminal) = new_screen(20, 3, options, None);
-        screen.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
 
         // A custom layout root scroll view (follow: end, primary) so the
         // test can drive the follow latch through the shared state.
@@ -1262,7 +1262,7 @@ mod tests {
         let _guard = global_test_lock();
         crate::clock::reset_for_test();
         let (screen, terminal) = new_screen(20, 3, TuiAltScreenOptions::default(), None);
-        screen.borrow_mut().image_protocol = ImageProtocol::Iterm2;
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Iterm2);
         screen.borrow_mut().add_child(widget(&["l5", "l6", "l7"]));
         screen.borrow_mut().render_now(false);
 
@@ -1303,6 +1303,8 @@ mod tests {
         let _guard = global_test_lock();
         terminal_image_module::reset_for_test();
         let (screen, terminal) = new_screen(20, 4, TuiAltScreenOptions::default(), None);
+        // TS: imageProtocol = "kitty" (set here instead of via start()).
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Kitty);
         // imageProtocol stays at the skeleton's Kitty placeholder.
         terminal_image_module::register_kitty_image_metadata(kitty_metadata(9, 3));
         terminal_image_module::register_kitty_image_metadata(kitty_metadata(8, 1));
@@ -1373,6 +1375,8 @@ mod tests {
         let _guard = global_test_lock();
         terminal_image_module::reset_for_test();
         let (screen, terminal) = new_screen(20, 2, TuiAltScreenOptions::default(), None);
+        // TS: imageProtocol = "kitty" (set here instead of via start()).
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Kitty);
         let child = widget(&[]);
         screen.borrow_mut().add_child(child.clone());
 
@@ -1540,6 +1544,8 @@ mod tests {
         std::env::remove_var("TERM_PROGRAM");
         std::env::set_var("WEZTERM_PANE", "0");
         let (screen, terminal) = new_screen(20, 5, TuiAltScreenOptions::default(), None);
+        // TS: imageProtocol = "kitty" (set here instead of via start()).
+        screen.borrow_mut().image_protocol = Some(ImageProtocol::Kitty);
         terminal_image_module::register_kitty_image_metadata(kitty_metadata(9, 3));
         let child = widget(&[]);
         child.borrow_mut().lines = vec![image_line(9, 3), "r1".into(), "r2".into(), "r3".into()];

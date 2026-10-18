@@ -300,11 +300,8 @@ pub(crate) fn before_terminal_start(screen: &mut TuiAltScreen) {
     screen.flashes.dispose();
     screen.alt_screen_active = true;
     let capabilities = terminal_image::get_capabilities();
-    // `this.imageProtocol = capabilities.images` — the skeleton field is a
-    // non-optional `ImageProtocol`, so TS `null` keeps the documented
-    // placeholder `Kitty` (see the report: the field should become
-    // `Option<ImageProtocol>`).
-    screen.image_protocol = capabilities.images.unwrap_or(ImageProtocol::Kitty);
+    // `this.imageProtocol = capabilities.images` (tui-alt-screen.ts:354).
+    screen.image_protocol = capabilities.images;
     screen.uploaded_kitty_images.clear();
     if capabilities.images == Some(ImageProtocol::Iterm2) {
         screen.saved_capabilities = Some(capabilities);
@@ -358,7 +355,7 @@ pub(crate) fn after_terminal_start(_screen: &mut TuiAltScreen) {}
 
 /// `deleteKittyImages()` (tui-alt-screen.ts:429-431).
 fn delete_kitty_images(screen: &TuiAltScreen) -> &'static str {
-    if screen.image_protocol == ImageProtocol::Kitty {
+    if screen.image_protocol == Some(ImageProtocol::Kitty) {
         terminal_image::delete_all_kitty_images()
     } else {
         ""

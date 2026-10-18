@@ -110,6 +110,8 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
         "tui-stdin-buffer" => return run_tui_stdin_buffer_harness(&input),
         "tui-components" => return run_tui_components_harness(&input),
         "tui-editor" => return run_tui_editor_harness(&input),
+        "tui-main" => return run_tui_screen_harness(&input, false),
+        "tui-alt" => return run_tui_screen_harness(&input, true),
         "math" => return run_math_harness(&input),
         _ => {}
     }
@@ -2101,4 +2103,702 @@ fn run_tui_editor_harness(input: &Value) -> Result<Value, String> {
             "onSubmit": *on_submit.borrow(),
         },
     }))
+}
+
+// =============================================================================
+// tui-main / tui-alt harness (T5 Wave C)
+// =============================================================================
+
+/// Input: ONE case — `{ name, cols?, rows?, capabilities?, showHardwareCursor?,
+/// clearOnShrink?, altOptions? (alt), script: [op...], screenLines? (alt) }`.
+///
+/// Mirrors the TS-side `tui-main` / `tui-alt` ts-harness handlers 1:1:
+/// - `RecordingTerminal` implements the `Terminal` trait with the same
+///   observability as upstream `VirtualTerminal` (only `write()` recorded,
+///   hide/showCursor counted, kitty protocol always active).
+/// - Every built component is registered under an auto ref (`c0`, `c1`, …)
+///   in build order (children before parents) so `setFocus` and the
+///   `focused` output can name components.
+/// - Script ops: addChild, input, terminalReply, setFocus, showOverlay,
+///   hideOverlay, requestRender, renderNow, resize, tickMs, start, stop,
+///   and (alt-only) setLayoutRoot, scrollBy, flash.
+/// - Output: `{ name, frames, writes, fullRedraws, hideCursor, showCursor,
+///   focused }` plus (alt) `{ viewportTop, followingOutput, screenLines? }`.
+///   `frames` = the concatenated write stream split at every synchronized-
+///   output begin marker (`\x1b[?2026h`) — one segment per render.
+///
+/// Environment: the case process runs with the TUI-relevant env vars
+/// removed (TERM/TMUX/ZELLIJ/STY/TERMUX_VERSION/WEZTERM_PANE/TERM_PROGRAM/
+/// SSH_*/PI_*) and capabilities pinned via `set_capabilities` — the TS side
+/// does the same, so env detection is deterministic on both sides.
+fn run_tui_screen_harness(input: &Value, alt: bool) -> Result<Value, String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use pi_tui::clock;
+    use pi_tui::component::ComponentRef;
+    use pi_tui::components::box_component::TuiBox;
+    use pi_tui::components::cancellable_loader::CancellableLoader;
+    use pi_tui::components::h_stack::HStack;
+    use pi_tui::components::input::{Input, InputOptions};
+    use pi_tui::components::loader::{Loader, LoaderIndicatorOptions};
+    use pi_tui::components::mouse_region::MouseRegion;
+    use pi_tui::components::scroll_view::{ScrollView, ScrollViewFollow, ScrollViewOptions};
+    use pi_tui::components::select_list::{SelectItem, SelectList, SelectListTheme};
+    use pi_tui::components::settings_list::{
+        SettingItem, SettingsList, SettingsListOptions, SettingsListTheme,
+    };
+    use pi_tui::components::spacer::Spacer;
+    use pi_tui::components::stack::{StackChild, StackEntryOptions, StackOptions};
+    use pi_tui::components::text::{CustomBgFn, Text};
+    use pi_tui::components::truncated_text::TruncatedText;
+    use pi_tui::components::v_stack::VStack;
+    use pi_tui::layout::ScrollViewScrollbar;
+    use pi_tui::layout_node::Overscroll;
+    use pi_tui::layout_node::{Basis, StackAlign};
+    use pi_tui::terminal::{InputHandler, ProgramStatus, ResizeHandler, Terminal};
+    use pi_tui::terminal_image::{set_capabilities, ImageProtocol, TerminalCapabilities};
+    use pi_tui::component::Focusable;
+    use pi_tui::tui::{
+        OverlayAnchor, OverlayMargin, OverlayMarginOrNumber, OverlayOptions, SizeValue, TuiSurface,
+        TuiStopOptions,
+    };
+    use pi_tui::tui_alt_screen::{TuiAltScreen, TuiAltScreenOptions};
+    use pi_tui::tui_main_screen::TuiMainScreen;
+    use pi_tui::wheel_scroll::WheelScrollLines;
+
+    // --- deterministic environment (mirrors the TS handler's ENV_KEYS) ---
+    for key in [
+        "TERM", "TMUX", "ZELLIJ", "STY", "TERMUX_VERSION", "WEZTERM_PANE", "TERM_PROGRAM",
+        "COLORTERM", "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY",
+        "PI_IMAGE_PROTOCOL", "PI_TRUE_COLOR", "PI_HYPERLINKS",
+        "PI_TUI_DEBUG", "PI_TUI_DEBUG_REDRAW",
+    ] {
+        std::env::remove_var(key);
+    }
+
+    // --- capabilities pin ---
+    let caps = input.get("capabilities");
+    let default_caps = serde_json::json!({ "images": null, "trueColor": true, "hyperlinks": true });
+    let caps = caps.unwrap_or(&default_caps);
+    let images = match caps["images"].as_str() {
+        Some("kitty") => Some(ImageProtocol::Kitty),
+        Some("iterm2") => Some(ImageProtocol::Iterm2),
+        _ => None,
+    };
+    set_capabilities(TerminalCapabilities {
+        images,
+        true_color: caps["trueColor"].as_bool().unwrap_or(true),
+        hyperlinks: caps["hyperlinks"].as_bool().unwrap_or(true),
+    });
+
+    clock::set_now_ms(0.0);
+
+    // --- RecordingTerminal (VirtualTerminal observability) ---
+    struct RecordingTerminal {
+        cols: usize,
+        rows: usize,
+        writes: Vec<String>,
+        hide_count: u64,
+        show_count: u64,
+        input_handler: Option<InputHandler>,
+        resize_handler: Option<ResizeHandler>,
+    }
+    impl Terminal for RecordingTerminal {
+        fn start(&mut self, on_input: InputHandler, on_resize: ResizeHandler) {
+            self.input_handler = Some(on_input);
+            self.resize_handler = Some(on_resize);
+        }
+        fn stop(&mut self) {
+            self.input_handler = None;
+            self.resize_handler = None;
+        }
+        fn drain_input(&mut self, _max_ms: u64, _idle_ms: u64) {}
+        fn write(&mut self, data: &str) {
+            self.writes.push(data.to_string());
+        }
+        fn columns(&self) -> usize {
+            self.cols
+        }
+        fn rows(&self) -> usize {
+            self.rows
+        }
+        fn kitty_protocol_active(&self) -> bool {
+            true
+        }
+        fn move_by(&mut self, _lines: i32) {}
+        fn hide_cursor(&mut self) {
+            self.hide_count += 1;
+        }
+        fn show_cursor(&mut self) {
+            self.show_count += 1;
+        }
+        fn clear_line(&mut self) {}
+        fn clear_from_cursor(&mut self) {}
+        fn clear_screen(&mut self) {}
+        fn set_title(&mut self, _title: &str) {}
+        fn set_progress(&mut self, _active: bool) {}
+        fn set_program_status(&mut self, _status: ProgramStatus) {}
+    }
+
+    let cols = input["cols"].as_u64().unwrap_or(80) as usize;
+    let rows = input["rows"].as_u64().unwrap_or(24) as usize;
+    let term = Rc::new(RefCell::new(RecordingTerminal {
+        cols,
+        rows,
+        writes: Vec::new(),
+        hide_count: 0,
+        show_count: 0,
+        input_handler: None,
+        resize_handler: None,
+    }));
+    let term_dyn: Rc<RefCell<dyn Terminal>> = term.clone();
+
+    // --- component spec builder (tui-components vocabulary; children are
+    // registered before parents, matching the TS build order) ---
+    fn bg_preset(preset: Option<&str>) -> Option<CustomBgFn> {
+        match preset {
+            Some("identity") => Some(Box::new(|t: &str| t.to_string())),
+            Some("bracket") => Some(Box::new(|t: &str| format!("[{t}]"))),
+            _ => None,
+        }
+    }
+    fn build_screen_component(
+        spec: &Value,
+        registry: &mut Vec<ComponentRef>,
+    ) -> Result<ComponentRef, String> {
+        let type_ = spec["type"].as_str().ok_or("missing component type")?;
+        let num = |key: &str, default: u64| -> u64 {
+            spec[key].as_f64().map(|f| f.max(0.0) as u64).unwrap_or(default)
+        };
+        let register = |registry: &mut Vec<ComponentRef>, comp: ComponentRef| {
+            registry.push(comp.clone());
+            comp
+        };
+        let comp: ComponentRef = match type_ {
+            "text" => register(
+                registry,
+                Rc::new(RefCell::new(Text::new(
+                    spec["text"].as_str().unwrap_or(""),
+                    num("paddingX", 1) as usize,
+                    num("paddingY", 1) as usize,
+                    bg_preset(spec["bg"].as_str()),
+                ))),
+            ),
+            "truncated-text" => register(
+                registry,
+                Rc::new(RefCell::new(TruncatedText::new(
+                    spec["text"].as_str().unwrap_or(""),
+                    num("paddingX", 0) as usize,
+                    num("paddingY", 0) as usize,
+                ))),
+            ),
+            "spacer" => register(
+                registry,
+                Rc::new(RefCell::new(Spacer::new(num("lines", 1) as usize))),
+            ),
+            "box" => {
+                let mut box_ = TuiBox::new(
+                    num("paddingX", 1) as usize,
+                    num("paddingY", 1) as usize,
+                    bg_preset(spec["bg"].as_str()),
+                );
+                let empty: Vec<Value> = Vec::new();
+                for child in spec["children"].as_array().unwrap_or(&empty) {
+                    box_.add_child(build_screen_component(child, registry)?);
+                }
+                register(registry, Rc::new(RefCell::new(box_)))
+            }
+            "h-stack" | "v-stack" => {
+                let mut children: Vec<StackChild> = Vec::new();
+                let empty: Vec<Value> = Vec::new();
+                for entry in spec["entries"].as_array().unwrap_or(&empty) {
+                    let component = build_screen_component(&entry["component"], registry)?;
+                    let mut options = StackEntryOptions::default();
+                    if entry["basis"].as_str() == Some("auto") {
+                        options.basis = Some(Basis::Auto);
+                    } else if let Some(b) = entry["basis"].as_f64() {
+                        options.basis = Some(Basis::Points(b));
+                    }
+                    if let Some(g) = entry["grow"].as_f64() {
+                        options.grow = Some(g);
+                    }
+                    if let Some(s) = entry["shrink"].as_f64() {
+                        options.shrink = Some(s);
+                    }
+                    if let Some(m) = entry["minSize"].as_f64() {
+                        options.min_size = Some(m);
+                    }
+                    if let Some(m) = entry["maxSize"].as_f64() {
+                        options.max_size = Some(m);
+                    }
+                    match entry["visible"].as_str() {
+                        Some("always") => {
+                            options.visible =
+                                Some(Rc::new(|_vp: &pi_tui::layout_node::LayoutViewport| true));
+                        }
+                        Some("never") => {
+                            options.visible =
+                                Some(Rc::new(|_vp: &pi_tui::layout_node::LayoutViewport| false));
+                        }
+                        _ => {}
+                    }
+                    children.push(StackChild::Entry { component, options });
+                }
+                let mut stack_options = StackOptions::default();
+                if let Some(g) = spec["gap"].as_f64() {
+                    stack_options.gap = Some(g);
+                }
+                if let Some(a) = spec["align"].as_str() {
+                    stack_options.align = Some(match a {
+                        "start" => StackAlign::Start,
+                        "center" => StackAlign::Center,
+                        "end" => StackAlign::End,
+                        _ => StackAlign::Stretch,
+                    });
+                }
+                register(
+                    registry,
+                    if type_ == "h-stack" {
+                        Rc::new(RefCell::new(HStack::new(children, stack_options)))
+                    } else {
+                        Rc::new(RefCell::new(VStack::new(children, stack_options)))
+                    },
+                )
+            }
+            "loader" => {
+                let indicator = if spec.get("frames").is_some() || spec.get("intervalMs").is_some() {
+                    Some(LoaderIndicatorOptions {
+                        frames: spec["frames"].as_array().map(|a| {
+                            a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                        }),
+                        interval_ms: spec["intervalMs"].as_u64(),
+                    })
+                } else {
+                    None
+                };
+                register(
+                    registry,
+                    Rc::new(RefCell::new(Loader::new(
+                        None,
+                        Box::new(|t: &str| t.to_string()),
+                        Box::new(|t: &str| t.to_string()),
+                        spec["message"].as_str().unwrap_or("Loading..."),
+                        indicator,
+                    ))),
+                )
+            }
+            "cancellable-loader" => register(
+                registry,
+                Rc::new(RefCell::new(CancellableLoader::new(
+                    None,
+                    Box::new(|t: &str| t.to_string()),
+                    Box::new(|t: &str| t.to_string()),
+                    spec["message"].as_str().unwrap_or("Loading..."),
+                    None,
+                ))),
+            ),
+            "mouse-region" => {
+                let child = build_screen_component(&spec["child"], registry)?;
+                register(
+                    registry,
+                    Rc::new(RefCell::new(MouseRegion::new(child, Box::new(
+                        |_ev: &pi_tui::component::TuiMouseEvent| None,
+                    )))),
+                )
+            }
+            "scroll-view" => {
+                let child = build_screen_component(&spec["child"], registry)?;
+                let mut options = ScrollViewOptions::default();
+                match spec["follow"].as_str() {
+                    Some("end") => options.follow = Some(ScrollViewFollow::End),
+                    Some("none") => options.follow = Some(ScrollViewFollow::None),
+                    _ => {}
+                }
+                if let Some(p) = spec["primary"].as_bool() {
+                    options.primary = p;
+                }
+                if let Some(o) = spec["overscroll"].as_str() {
+                    options.overscroll = Some(match o {
+                        "contain" => Overscroll::Contain,
+                        _ => Overscroll::Chain,
+                    });
+                }
+                if let Some(s) = spec["scrollbar"].as_str() {
+                    options.scrollbar = Some(match s {
+                        "hidden" => ScrollViewScrollbar::Hidden,
+                        "always" => ScrollViewScrollbar::Always,
+                        _ => ScrollViewScrollbar::Auto,
+                    });
+                }
+                if spec["scrollbarTrackStyle"].as_str() == Some("identity") {
+                    options.scrollbar_track_style =
+                        Some(Rc::new(|t: &str| t.to_string()));
+                }
+                if spec["scrollbarThumbStyle"].as_str() == Some("identity") {
+                    options.scrollbar_thumb_style =
+                        Some(Rc::new(|t: &str| t.to_string()));
+                }
+                if let Some(d) = spec["scrollbarHideDelayMs"].as_f64() {
+                    options.scrollbar_hide_delay_ms = Some(d);
+                }
+                register(registry, Rc::new(RefCell::new(ScrollView::new(child, options))))
+            }
+            "input" => {
+                let mut options = InputOptions::default();
+                if let Some(p) = spec["prompt"].as_str() {
+                    options.prompt = Some(p.to_string());
+                }
+                if let Some(p) = spec["placeholder"].as_str() {
+                    options.placeholder = Some(p.to_string());
+                }
+                let input = Rc::new(RefCell::new(Input::with_options(options)));
+                if spec["focused"].as_bool().unwrap_or(false) {
+                    input.borrow_mut().set_focused(true);
+                }
+                register(registry, input)
+            }
+            "select-list" => {
+                let empty: Vec<Value> = Vec::new();
+                let items: Vec<SelectItem> = spec["items"]
+                    .as_array()
+                    .unwrap_or(&empty)
+                    .iter()
+                    .map(|it| SelectItem {
+                        value: it["value"].as_str().unwrap_or("").to_string(),
+                        label: it["label"].as_str().unwrap_or("").to_string(),
+                        description: it["description"].as_str().map(String::from),
+                    })
+                    .collect();
+                register(
+                    registry,
+                    Rc::new(RefCell::new(SelectList::new(
+                        items,
+                        num("maxVisible", 5) as usize,
+                        SelectListTheme::default(),
+                    ))),
+                )
+            }
+            "settings-list" => {
+                let empty: Vec<Value> = Vec::new();
+                let mut items: Vec<SettingItem> = Vec::new();
+                for it in spec["items"].as_array().unwrap_or(&empty) {
+                    let mut si = SettingItem::new(
+                        it["id"].as_str().unwrap_or(""),
+                        it["label"].as_str().unwrap_or(""),
+                        it["currentValue"].as_str().unwrap_or(""),
+                    );
+                    if let Some(d) = it["description"].as_str() {
+                        si = si.with_description(d);
+                    }
+                    if let Some(values) = it["values"].as_array() {
+                        si = si.with_values(
+                            values
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect(),
+                        );
+                    }
+                    items.push(si);
+                }
+                let mut sl_options = SettingsListOptions::default();
+                sl_options.enable_search = Some(spec["enableSearch"].as_bool().unwrap_or(false));
+                register(
+                    registry,
+                    Rc::new(RefCell::new(SettingsList::with_options(
+                        items,
+                        num("maxVisible", 5) as usize,
+                        SettingsListTheme::default(),
+                        Box::new(|_, _| {}),
+                        Box::new(|| {}),
+                        sl_options,
+                    ))),
+                )
+            }
+            other => return Err(format!("unknown tui-main/tui-alt component type: {other}")),
+        };
+        Ok(comp)
+    }
+
+    fn parse_size_value_json(v: &Value) -> Result<SizeValue, String> {
+        if let Some(n) = v.as_f64() {
+            return Ok(SizeValue::Number(n));
+        }
+        if let Some(s) = v.as_str() {
+            if let Some(num_part) = s.strip_suffix('%') {
+                if num_part.parse::<f64>().is_ok() {
+                    return Ok(SizeValue::Percent(s.to_string()));
+                }
+            }
+        }
+        Err(format!("invalid SizeValue: {v}"))
+    }
+
+    fn parse_overlay_options(v: Option<&Value>) -> Result<OverlayOptions, String> {
+        let mut o = OverlayOptions::default();
+        let Some(v) = v else { return Ok(o) };
+        if let Some(x) = v.get("width") {
+            o.width = Some(parse_size_value_json(x)?);
+        }
+        if let Some(x) = v.get("minWidth").and_then(|x| x.as_i64()) {
+            o.min_width = Some(x);
+        }
+        if let Some(x) = v.get("maxHeight") {
+            o.max_height = Some(parse_size_value_json(x)?);
+        }
+        if let Some(a) = v.get("anchor").and_then(|x| x.as_str()) {
+            o.anchor = Some(match a {
+                "center" => OverlayAnchor::Center,
+                "top-left" => OverlayAnchor::TopLeft,
+                "top-right" => OverlayAnchor::TopRight,
+                "bottom-left" => OverlayAnchor::BottomLeft,
+                "bottom-right" => OverlayAnchor::BottomRight,
+                "top-center" => OverlayAnchor::TopCenter,
+                "bottom-center" => OverlayAnchor::BottomCenter,
+                "left-center" => OverlayAnchor::LeftCenter,
+                "right-center" => OverlayAnchor::RightCenter,
+                other => return Err(format!("unknown overlay anchor: {other}")),
+            });
+        }
+        if let Some(x) = v.get("offsetX").and_then(|x| x.as_i64()) {
+            o.offset_x = Some(x);
+        }
+        if let Some(x) = v.get("offsetY").and_then(|x| x.as_i64()) {
+            o.offset_y = Some(x);
+        }
+        if let Some(x) = v.get("row") {
+            o.row = Some(parse_size_value_json(x)?);
+        }
+        if let Some(x) = v.get("col") {
+            o.col = Some(parse_size_value_json(x)?);
+        }
+        if let Some(m) = v.get("margin") {
+            if let Some(n) = m.as_i64() {
+                o.margin = Some(OverlayMarginOrNumber::Number(n));
+            } else {
+                o.margin = Some(OverlayMarginOrNumber::Margin(OverlayMargin {
+                    top: m["top"].as_i64(),
+                    right: m["right"].as_i64(),
+                    bottom: m["bottom"].as_i64(),
+                    left: m["left"].as_i64(),
+                }));
+            }
+        }
+        if v["visible"].as_str() == Some("always") {
+            o.visible = Some(Rc::new(|_w: usize, _h: usize| true));
+        }
+        if let Some(nc) = v.get("nonCapturing").and_then(|x| x.as_bool()) {
+            o.non_capturing = nc;
+        }
+        Ok(o)
+    }
+
+    // --- screen construction ---
+    let show_hardware_cursor = input["showHardwareCursor"].as_bool();
+    let mut alt_options = TuiAltScreenOptions::default();
+    if let Some(o) = input.get("altOptions") {
+        if let Some(w) = o.get("wheelScrollLines") {
+            alt_options.wheel_scroll_lines = Some(match w {
+                Value::String(s) if s == "auto" => WheelScrollLines::Auto,
+                Value::Number(n) => WheelScrollLines::Lines(n.as_f64().unwrap_or(1.0)),
+                _ => WheelScrollLines::Lines(1.0),
+            });
+        }
+        if let Some(m) = o.get("mouse").and_then(|x| x.as_bool()) {
+            alt_options.mouse = Some(m);
+        }
+        if o["searchMatchStyle"].as_str() == Some("identity") {
+            alt_options.search_match_style = Some(Rc::new(|t: &str| t.to_string()));
+        }
+        if o["searchCurrentMatchStyle"].as_str() == Some("identity") {
+            alt_options.search_current_match_style = Some(Rc::new(|t: &str| t.to_string()));
+        }
+        if let Some(c) = o.get("copyOnSelect").and_then(|x| x.as_bool()) {
+            alt_options.copy_on_select = Some(c);
+        }
+    }
+
+    let alt_rc: Option<Rc<RefCell<TuiAltScreen>>> = if alt {
+        Some(TuiAltScreen::new(
+            term_dyn.clone(),
+            show_hardware_cursor,
+            None,
+            alt_options,
+        ))
+    } else {
+        None
+    };
+    let main_rc: Option<Rc<RefCell<TuiMainScreen>>> = if alt {
+        None
+    } else {
+        Some(TuiMainScreen::new(term_dyn.clone(), show_hardware_cursor, None))
+    };
+    let surface: Rc<RefCell<dyn TuiSurface>> = if let Some(rc) = &alt_rc {
+        rc.clone()
+    } else {
+        main_rc.as_ref().expect("main screen").clone()
+    };
+    if input["clearOnShrink"].as_bool().unwrap_or(false) {
+        surface.borrow_mut().set_clear_on_shrink(true);
+    }
+
+    // --- script interpreter ---
+    let mut registry: Vec<ComponentRef> = Vec::new();
+    let lookup_ref = |registry: &Vec<ComponentRef>, r: &str| -> Result<ComponentRef, String> {
+        let idx: usize = r
+            .strip_prefix('c')
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| format!("unknown component ref: {r}"))?;
+        registry
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| format!("unknown component ref: {r}"))
+    };
+
+    let empty: Vec<Value> = Vec::new();
+    for op in input["script"].as_array().unwrap_or(&empty) {
+        let type_ = op["type"].as_str().ok_or("missing script op type")?;
+        match type_ {
+            "addChild" => {
+                let component =
+                    build_screen_component(&op["component"], &mut registry)?;
+                surface.borrow_mut().add_child(component);
+            }
+            "input" | "terminalReply" => {
+                let data = op["data"].as_str().unwrap_or("").to_string();
+                let handler = term.borrow().input_handler.clone();
+                if let Some(h) = handler {
+                    let mut f = h.borrow_mut();
+                    f(data);
+                }
+            }
+            "setFocus" => {
+                let target = if op["ref"].is_null() {
+                    None
+                } else {
+                    let r = op["ref"].as_str().ok_or("setFocus ref must be a string or null")?;
+                    Some(lookup_ref(&registry, r)?)
+                };
+                surface.borrow_mut().set_focus(target);
+            }
+            "showOverlay" => {
+                let component =
+                    build_screen_component(&op["component"], &mut registry)?;
+                let options = parse_overlay_options(op.get("options"))?;
+                surface.borrow_mut().show_overlay(component, options);
+            }
+            "hideOverlay" => {
+                surface.borrow_mut().hide_overlay();
+            }
+            "requestRender" => {
+                surface.borrow_mut().request_render(op["force"].as_bool().unwrap_or(false));
+            }
+            "renderNow" => {
+                surface.borrow_mut().render_now(op["force"].as_bool().unwrap_or(false));
+            }
+            "resize" => {
+                let cols = op["cols"].as_u64().ok_or("resize requires cols")? as usize;
+                let rows = op["rows"].as_u64().ok_or("resize requires rows")? as usize;
+                let handler = {
+                    let mut t = term.borrow_mut();
+                    if t.cols == cols && t.rows == rows {
+                        None
+                    } else {
+                        t.cols = cols;
+                        t.rows = rows;
+                        t.resize_handler.clone()
+                    }
+                };
+                if let Some(h) = handler {
+                    let mut f = h.borrow_mut();
+                    f();
+                }
+            }
+            "tickMs" => {
+                let ms = op["n"].as_f64().ok_or("tickMs requires n")?;
+                surface.borrow_mut().advance_clock(ms);
+            }
+            "start" => {
+                surface.borrow_mut().start();
+            }
+            "stop" => {
+                let options = TuiStopOptions {
+                    preserve_screen: op["preserveScreen"].as_bool().unwrap_or(false),
+                };
+                surface.borrow_mut().stop(&options);
+            }
+            "setLayoutRoot" => {
+                let Some(alt_rc) = &alt_rc else {
+                    return Err("setLayoutRoot is alt-only".into());
+                };
+                let component = if op["component"].is_null() {
+                    None
+                } else {
+                    Some(build_screen_component(&op["component"], &mut registry)?)
+                };
+                alt_rc.borrow_mut().set_layout_root(component);
+            }
+            "scrollBy" => {
+                let Some(alt_rc) = &alt_rc else {
+                    return Err("scrollBy is alt-only".into());
+                };
+                let lines = op["lines"].as_i64().ok_or("scrollBy requires lines")?;
+                alt_rc.borrow_mut().scroll_by(lines);
+            }
+            "flash" => {
+                let Some(alt_rc) = &alt_rc else {
+                    return Err("flash is alt-only".into());
+                };
+                let message = op["message"].as_str().unwrap_or("").to_string();
+                let duration = op["durationMs"].as_f64();
+                alt_rc.borrow_mut().flash(&message, duration);
+            }
+            other => return Err(format!("invalid tui-main/tui-alt script op: {other}")),
+        }
+        surface.borrow_mut().run_pending_ticks();
+    }
+
+    // --- output ---
+    let (writes, hide_count, show_count) = {
+        let t = term.borrow();
+        (t.writes.clone(), t.hide_count, t.show_count)
+    };
+    let begin = "\x1b[?2026h";
+    let stream: String = writes.concat();
+    let pieces: Vec<&str> = stream.split(begin).collect();
+    let mut frames: Vec<String> = Vec::new();
+    if !pieces[0].is_empty() {
+        frames.push(pieces[0].to_string());
+    }
+    for p in &pieces[1..] {
+        frames.push(format!("{begin}{p}"));
+    }
+    let focused = {
+        let f = surface.borrow().get_focused_component();
+        f.and_then(|f| {
+            registry
+                .iter()
+                .position(|c| Rc::ptr_eq(c, &f))
+                .map(|idx| format!("c{idx}"))
+        })
+    };
+    let full_redraws = surface.borrow().full_redraws();
+
+    let mut out = serde_json::json!({
+        "name": input["name"].as_str().unwrap_or(""),
+        "frames": frames,
+        "writes": writes,
+        "fullRedraws": full_redraws,
+        "hideCursor": hide_count,
+        "showCursor": show_count,
+        "focused": focused,
+    });
+    if let Some(alt_rc) = &alt_rc {
+        out["viewportTop"] = serde_json::json!(alt_rc.borrow().viewport_top());
+        out["followingOutput"] = serde_json::json!(alt_rc.borrow().is_following_output());
+        if input["screenLines"].as_bool().unwrap_or(false) {
+            out["screenLines"] = serde_json::json!(alt_rc.borrow().get_screen_lines());
+        }
+    }
+    Ok(out)
 }
