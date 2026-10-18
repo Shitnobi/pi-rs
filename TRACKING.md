@@ -587,3 +587,63 @@ Remaining, roughly in dependency order:
 - Remaining after T6: T7 batter framework (seeded generators + shrinker,
   see TUI_PORT_PLAN.md); agent-session layer (Phase 3 continuation:
   `file-mutation-queue`, MCP/extensions, `agent-session*`, providers).
+
+### T6 redteam R1/R2 (IN PROGRESS — resume here)
+
+Status as of 2026-10-18 17:10 — everything committed through 9e57130
+(T6 Wave D); tree is clean. Two redteam delegates (markdown/marked,
+latex) were dispatched but BOTH FAILED before writing reports
+(`docs/report-t6-R1.md` / `report-t6-R2.md` do NOT exist). The markdown
+delegate confirmed (verbally, pre-report) **two findings, one fully
+characterized**; the second was never specified. The latex redteam has
+NOT been done at all. Resume checklist:
+
+1. **[CONFIRMED DIVERGENCE — fix next] JS `.` vs Rust `.` in marked
+   rules.** Reproduced on both sides (tui-markdown-lex):
+   `"# aa\u2028bb"` and `"# aa\u2029bb"` → TS lexes a **paragraph**;
+   Rust lexes a **heading**. Root cause: JS regex `.` (non-`u`, non-`s`)
+   excludes `\n \r U+2028 U+2029`; fancy-regex `.` excludes only `\n`.
+   The heading rule `crates/pi-tui/src/marked/rules.rs:217`
+   `^ {0,3}(#{1,6})(?=[ \t\n\r\f\x0b]|$)(.*)(?:\n+|$)` is affected, and
+   so is EVERY other bare `.` outside a character class, at least:
+   - `lheading` (rules.rs:220): `((?:.|\n(?!...))+?)` — same dot issue
+   - `paragraph` + `table` (rules.rs:226-227): ` *([^\n ].*)\n` and
+     `.*(?:\n|$)` inside the table-row lookahead — bare `.` again
+   - `html` (rules.rs:224): audit (`[\w.:-]` is inside a class = literal
+     dot, fine; look for bare `.`)
+   - ALL inline rules (rules.rs InlineRules struct + inline.rs) — audit
+   Fix approach: the file already has the divergence-guard translator
+   `js_pattern_to_ascii` (rules.rs:24) but it (a) only handles
+   `\d/\w/\s/\b`, NOT `.`, and (b) is NOT called by `rx()` — the ASCII
+   class translations are baked into the static dump strings. Correct
+   fix: extend the translator with `.` → `[^\n\r\u{2028}\u{2029}]`
+   (outside classes, unescaped) AND wire it through `rx()` so all
+   statics get it (or regenerate the statics). Preserve: `\.` literal
+   dots and `[.]`/class-internal dots untouched. After fixing, rebuild,
+   re-run the repro (must MATCH), add regression parity cases to
+   `parity/waved/markdown-lex-cases.mjs` AND
+   `markdown-render-cases.mjs` (heading + lheading + table + paragraph
+   shapes containing U+2028/U+2029), full parity must stay green.
+   Repro one-liner (canonical compare, not raw-string — TS prints
+   compact, Rust pretty):
+   ```
+   node -e 'spawnSync node parity/ts-harness.js /tmp/pi-parity/redteam
+     with {tool:"tui-markdown-lex",args:{fn:"lex",source:"# aa\u2028bb"}}
+     vs target/release/pi-cli harness tool tui-markdown-lex --cwd ...
+     with {fn:"lex",source:...}'   (session log 2026-10-18 17:00 has it)
+   ```
+   NOTE: `\r` cases ("# aa\rbb", "# aa\r") already MATCH — marked
+   normalizes/short-circuits `\r` elsewhere; only U+2028/U+2029
+   observed diverging so far (test `\r` inside lheading/table too).
+2. **[UNKNOWN] second confirmed finding** from the failed markdown
+   redteam delegate — unknown content. Re-run the markdown/marked
+   redteam (line-by-line markdown.ts/markdown.rs + marked audit). The
+   previous delegate's instructions are in the session log; reuse them
+   (report → docs/report-t6-R1.md, findings table, SHIP/FIX verdict,
+   verify top findings by running both sides).
+3. **[NOT STARTED] latex redteam** — same instructions vs latex.ts →
+   docs/report-t6-R2.md (symbol tables codepoint audit, structure
+   handling, JS semantics; delegate 53 died before starting).
+4. After fixes: full `node parity/run-parity.mjs` (expect 1077+new),
+   `cargo test --release`, clippy 0 errors, update this section +
+   parity-status counts, commit.
