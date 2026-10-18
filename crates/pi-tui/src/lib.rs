@@ -20,6 +20,7 @@ pub mod layout;
 pub mod marked;
 pub mod layout_node;
 pub mod kill_ring;
+pub mod latex;
 pub mod native_modifiers;
 pub mod native_module_path;
 pub mod native_platform;
