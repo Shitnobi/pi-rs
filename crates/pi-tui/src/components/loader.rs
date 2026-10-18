@@ -14,6 +14,9 @@
 //!   `updateDisplay` (loader.ts:101-103); modeled as an injectable
 //!   `Option<Box<dyn Fn()>>` callback.
 
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
 use crate::component::Component;
 use crate::components::text::Text;
 
@@ -41,6 +44,9 @@ pub struct Loader {
     current_frame: usize,
     /// Models `intervalId: NodeJS.Timeout | null` (null ⇒ inactive).
     interval_active: bool,
+    /// Virtual-clock deadline of the next animation tick (`setInterval`
+    /// next-fire time; `None` while stopped) — see [`pump_loader_intervals_until`].
+    next_tick_at: Option<f64>,
     /// The `TUI` seam: called instead of `this.ui.requestRender()`.
     request_render: Option<Box<dyn Fn()>>,
     render_indicator_verbatim: bool,
@@ -68,6 +74,7 @@ impl Loader {
             interval_ms: DEFAULT_INTERVAL_MS,
             current_frame: 0,
             interval_active: false,
+            next_tick_at: None,
             request_render,
             render_indicator_verbatim: false,
             spinner_color_fn,
@@ -95,6 +102,7 @@ impl Loader {
     /// `stop()` (loader.ts:53-58).
     pub fn stop(&mut self) {
         self.interval_active = false;
+        self.next_tick_at = None;
     }
 
     /// The clock seam replacing the `setInterval` callback (loader.ts:61-64).
@@ -114,6 +122,13 @@ impl Loader {
     /// to call [`Loader::tick`].
     pub fn interval_ms(&self) -> u64 {
         self.interval_ms
+    }
+
+    /// Re-arm the virtual-clock deadline after an external fire
+    /// ([`CancellableLoader`](crate::components::cancellable_loader::CancellableLoader)
+    /// delegation).
+    pub(crate) fn rearm_next_tick_at(&mut self, at: f64) {
+        self.next_tick_at = Some(at);
     }
 
     /// `setMessage(message)` (loader.ts:68-71).
@@ -152,6 +167,20 @@ impl Loader {
             return;
         }
         self.interval_active = true;
+        // TS `setInterval` semantics: the next fire is one period from the
+        // arm instant (the virtual-clock event loop fires it at that
+        // deadline, repeatedly, `deadline + period` per fire).
+        self.next_tick_at = Some(crate::clock::now_ms() + self.interval_ms as f64);
+    }
+
+    /// The virtual-clock deadline of the animation interval, if armed
+    /// ([`next_loader_deadline`] / [`pump_loader_intervals_until`]).
+    pub(crate) fn loader_deadline(&self) -> Option<f64> {
+        if self.interval_active && self.frames.len() > 1 {
+            self.next_tick_at
+        } else {
+            None
+        }
     }
 
     /// `getRenderedIndicator()` (loader.ts:68/85-88; `protected` in TS).
@@ -191,6 +220,88 @@ impl Component for Loader {
         self.text.invalidate();
         self.update_display();
     }
+}
+
+// =============================================================================
+// Virtual-clock loader interval registry
+//
+// TS `Loader.restartAnimation` arms a real `setInterval`, so the animation
+// advances whenever the (virtual) event loop runs — independent of any
+// `requestRender`. The Rust clock seam keeps `Loader::tick` explicit for
+// the component-level harness, but the screen harness (tui-main/tui-alt)
+// must fire loader ticks from `advance_clock` exactly like the TS event
+// loop. Live loaders register here (weakly); the clock pump consults the
+// registry for the earliest deadline and fires due ticks.
+// =============================================================================
+
+/// Virtual-clock surface of an animating loader ([`Loader`] and
+/// [`CancellableLoader`](crate::components::cancellable_loader::CancellableLoader)).
+pub trait LoaderClock {
+    /// The next animation deadline, if the interval is armed.
+    fn loader_deadline(&self) -> Option<f64>;
+    /// Fire one animation tick at `deadline` and re-arm at
+    /// `deadline + period` (TS `setInterval` semantics — large clock jumps
+    /// fire each missed beat in order).
+    fn fire_loader_tick_at(&mut self, deadline: f64);
+}
+
+impl LoaderClock for Loader {
+    fn loader_deadline(&self) -> Option<f64> {
+        Loader::loader_deadline(self)
+    }
+    fn fire_loader_tick_at(&mut self, deadline: f64) {
+        self.tick();
+        self.next_tick_at = Some(deadline + self.interval_ms as f64);
+    }
+}
+
+thread_local! {
+    /// Weak registry of live loaders created by the screen harness.
+    static LOADER_CLOCKS: RefCell<Vec<Weak<RefCell<dyn LoaderClock>>>> =
+        RefCell::new(Vec::new());
+}
+
+/// Register a live loader with the virtual-clock pump (screen harness).
+pub fn register_loader<T: LoaderClock + 'static>(loader: &Rc<RefCell<T>>) {
+    let clock: Rc<RefCell<dyn LoaderClock>> = loader.clone();
+    LOADER_CLOCKS.with(|registry| registry.borrow_mut().push(Rc::downgrade(&clock)));
+}
+
+/// Collect the live loaders (dropping dead weak refs from the registry).
+fn live_loaders() -> Vec<Rc<RefCell<dyn LoaderClock>>> {
+    LOADER_CLOCKS.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.retain(|weak| weak.strong_count() > 0);
+        registry.iter().filter_map(|weak| weak.upgrade()).collect()
+    })
+}
+
+/// The earliest armed loader deadline, if any.
+pub fn next_loader_deadline() -> Option<f64> {
+    live_loaders()
+        .iter()
+        .filter_map(|loader| loader.borrow().loader_deadline())
+        .reduce(f64::min)
+}
+
+/// Fire every loader tick due at or before `bound`. Returns whether
+/// anything fired.
+pub fn pump_loader_intervals_until(bound: f64) -> bool {
+    let mut fired = false;
+    for loader in live_loaders() {
+        loop {
+            let deadline = {
+                let borrowed = loader.borrow();
+                match borrowed.loader_deadline() {
+                    Some(deadline) if deadline <= bound => deadline,
+                    _ => break,
+                }
+            };
+            loader.borrow_mut().fire_loader_tick_at(deadline);
+            fired = true;
+        }
+    }
+    fired
 }
 
 #[cfg(test)]

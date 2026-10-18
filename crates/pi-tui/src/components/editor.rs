@@ -797,6 +797,12 @@ impl Component for Editor {
         self.render_editor(width)
     }
 
+    /// TS `"focused" in component` — this component implements `Focusable`
+    /// (editor.ts:305).
+    fn as_focusable(&mut self) -> Option<&mut dyn Focusable> {
+        Some(self)
+    }
+
     /// `handleInput(data)` (editor.ts:696-998) — see `editor_input.rs`.
     fn handle_input(&mut self, data: &str) {
         self.handle_input_data(data);

@@ -146,6 +146,14 @@ impl Component for HStack {
         self.stack.handles_input()
     }
 
+    /// TS `HStack extends Stack extends Container` — the inherited
+    /// `Container` surface: `containsComponent` walks the children, and the
+    /// alt-screen layout mouse dispatch skips the inherited vertical router
+    /// (`handleMouse === Container.prototype.handleMouse`).
+    fn container_children(&self) -> Option<Vec<ComponentRef>> {
+        Some(self.stack.container.children.clone())
+    }
+
     fn invalidate(&mut self) {
         self.stack.invalidate();
     }

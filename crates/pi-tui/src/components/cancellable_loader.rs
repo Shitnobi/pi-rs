@@ -123,6 +123,17 @@ impl Component for CancellableLoader {
     }
 }
 
+impl crate::components::loader::LoaderClock for CancellableLoader {
+    fn loader_deadline(&self) -> Option<f64> {
+        self.loader.loader_deadline()
+    }
+    fn fire_loader_tick_at(&mut self, deadline: f64) {
+        let interval_ms = self.loader.interval_ms();
+        self.loader.tick();
+        self.loader.rearm_next_tick_at(deadline + interval_ms as f64);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

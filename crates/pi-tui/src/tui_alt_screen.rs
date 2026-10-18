@@ -657,11 +657,14 @@ impl TuiAltScreen {
     /// Fire the screen-owned timers due at or before `bound`.
     fn pump_screen_timers_until(&mut self, bound: f64) -> bool {
         // TS: the selection auto-scroll `setInterval` callback
-        // (tui-alt-screen.ts:1290).
-        crate::alt_screen_selection::pump_selection_auto_scroll_until(self, bound);
+        // (tui-alt-screen.ts:1290). The fired flag feeds `advanceClock`'s
+        // defensive break — a selection tick must keep the loop pumping.
+        let fired_selection =
+            crate::alt_screen_selection::pump_selection_auto_scroll_until(self, bound);
         // TS: flash-expiry `setTimeout` callbacks remove the entry and
         // request a render (alt-screen-flash.ts:22-29).
-        self.flashes.tick_until(bound)
+        let fired_flashes = self.flashes.tick_until(bound);
+        fired_selection || fired_flashes
     }
 
     /// `readonly mode = "fullscreen"`.

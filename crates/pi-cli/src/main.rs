@@ -2377,27 +2377,29 @@ fn run_tui_screen_harness(input: &Value, alt: bool) -> Result<Value, String> {
                 } else {
                     None
                 };
-                register(
-                    registry,
-                    Rc::new(RefCell::new(Loader::new(
-                        None,
-                        Box::new(|t: &str| t.to_string()),
-                        Box::new(|t: &str| t.to_string()),
-                        spec["message"].as_str().unwrap_or("Loading..."),
-                        indicator,
-                    ))),
-                )
+                let loader = Rc::new(RefCell::new(Loader::new(
+                    None,
+                    Box::new(|t: &str| t.to_string()),
+                    Box::new(|t: &str| t.to_string()),
+                    spec["message"].as_str().unwrap_or("Loading..."),
+                    indicator,
+                )));
+                // TS arms a real setInterval at construction; the virtual
+                // clock pump must fire it (see LoaderClock).
+                pi_tui::components::loader::register_loader(&loader);
+                register(registry, loader)
             }
-            "cancellable-loader" => register(
-                registry,
-                Rc::new(RefCell::new(CancellableLoader::new(
+            "cancellable-loader" => {
+                let loader = Rc::new(RefCell::new(CancellableLoader::new(
                     None,
                     Box::new(|t: &str| t.to_string()),
                     Box::new(|t: &str| t.to_string()),
                     spec["message"].as_str().unwrap_or("Loading..."),
                     None,
-                ))),
-            ),
+                )));
+                pi_tui::components::loader::register_loader(&loader);
+                register(registry, loader)
+            }
             "mouse-region" => {
                 let child = build_screen_component(&spec["child"], registry)?;
                 register(

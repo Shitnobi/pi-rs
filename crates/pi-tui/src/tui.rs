@@ -517,6 +517,10 @@ pub struct TuiBase {
     pub(crate) stopped: bool,
     /// Color queries waiting for their DA1 reply, oldest first.
     pub(crate) pending_color_queries: Vec<PendingTerminalColorQuery>,
+    /// Set when a cell-size response arrived during input dispatch: the
+    /// surface-hook `invalidate()` is deferred to the next microtask pump
+    /// (the input path already holds the surface borrow).
+    pub(crate) cell_size_invalidate_pending: bool,
     color_scheme_listeners: Vec<(usize, Box<dyn FnMut(TerminalColorScheme)>)>,
     next_color_scheme_listener_id: usize,
     pub(crate) color_scheme_notifications_enabled: bool,
@@ -586,6 +590,7 @@ impl TuiBase {
             full_redraw_count: 0,
             stopped: false,
             pending_color_queries: Vec::new(),
+            cell_size_invalidate_pending: false,
             color_scheme_listeners: Vec::new(),
             next_color_scheme_listener_id: 0,
             color_scheme_notifications_enabled: false,
@@ -672,6 +677,12 @@ impl TuiBase {
         let parked =
             PENDING_RENDER_REQUESTS.with(|set| set.borrow_mut().remove(&self.tui_id));
         if parked {
+            self.request_render_state(false);
+        }
+        // Scroll-view `requestRenderCallback` seam (scroll-view.ts:36, 192):
+        // the TS callback reaches the owning surface's `requestRender`;
+        // the port parks it (see `scroll_view::take_scroll_view_render_request`).
+        if crate::components::scroll_view::take_scroll_view_render_request() {
             self.request_render_state(false);
         }
     }
@@ -1084,15 +1095,15 @@ impl TuiBase {
         }
         crate::terminal_image::set_cell_dimensions(width_px as u32, height_px as u32);
         // Invalidate all components so images re-render with correct
-        // dimensions. Runs through the screen hook surface.
-        if let Some(surface) = self.self_weak.borrow().as_ref().and_then(|w| w.upgrade()) {
-            {
-                let mut s = surface.borrow_mut();
-                s.invalidate();
-                // requestRender() — state only; drained by the caller's pump.
-                s.base_mut().request_render_state(false);
-            }
-        }
+        // dimensions. TS calls `invalidate()` + `requestRender()`
+        // synchronously — both state-only. The surface-hook `invalidate()`
+        // cannot re-enter here (the input dispatch path that reaches this
+        // already holds the surface borrow), so it is deferred to the next
+        // `run_pending_ticks` drain, which every caller runs immediately
+        // after input handling at the same virtual instant.
+        self.cell_size_invalidate_pending = true;
+        // requestRender() — state only; drained by the caller's pump.
+        self.request_render_state(false);
         true
     }
 
@@ -1335,6 +1346,13 @@ macro_rules! impl_tui_surface {
 
             /// Drain queued microtasks (TS `process.nextTick`).
             pub fn run_pending_ticks(&mut self) {
+                // Deferred cell-size invalidation (TS runs it synchronously
+                // in the input handler; every caller pumps immediately after
+                // at the same virtual instant).
+                if self.base.cell_size_invalidate_pending {
+                    self.base.cell_size_invalidate_pending = false;
+                    self.invalidate();
+                }
                 self.base.drain_parked_render_request();
                 while let Some(action) = self.base.drain_one_next_tick() {
                     if action == $crate::tui::NextTickAction::DoRender {
@@ -1361,6 +1379,7 @@ macro_rules! impl_tui_surface {
                     let render = self.base.render_timer_deadline().filter(|d| *d <= now);
                     let early = [
                         $crate::layout::next_scrollbar_hide_deadline().filter(|d| *d <= now),
+                        $crate::components::loader::next_loader_deadline().filter(|d| *d <= now),
                         self.next_screen_timer_deadline().filter(|d| *d <= now),
                         self.base.next_color_query_deadline().filter(|d| *d <= now),
                     ]
@@ -1385,10 +1404,12 @@ macro_rules! impl_tui_surface {
                     }
                     if let Some(bound) = early {
                         let fired = $crate::layout::pump_scrollbar_hide_timers_until(bound);
+                        let fired_loader =
+                            $crate::components::loader::pump_loader_intervals_until(bound);
                         let fired_screen = self.pump_screen_timers_until(bound);
                         let fired_query =
                             self.base.fire_due_color_query_timeouts_until(bound);
-                        if !fired && !fired_screen && !fired_query {
+                        if !fired && !fired_loader && !fired_screen && !fired_query {
                             // A due deadline whose owner fired nothing
                             // (defensive): avoid spinning.
                             break;

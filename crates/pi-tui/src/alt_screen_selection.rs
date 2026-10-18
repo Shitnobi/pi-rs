@@ -605,20 +605,26 @@ pub(crate) fn stop_selection_auto_scroll(screen: &mut TuiAltScreen) {
 /// [`auto_scroll_selection`] while the virtual clock has passed the
 /// deadline, re-arming the 50 ms cadence after each fire (the interval
 /// survives until `stopSelectionAutoScroll` clears it).
-pub(crate) fn pump_selection_auto_scroll_until(screen: &mut TuiAltScreen, bound: f64) {
+pub(crate) fn pump_selection_auto_scroll_until(
+    screen: &mut TuiAltScreen,
+    bound: f64,
+) -> bool {
     // TS `setInterval` semantics: the callback fires once per period —
     // each re-arm is `deadline + period`, not `now + period`, so a large
     // clock jump fires the callback for every elapsed period.
+    let mut fired = false;
     while let Some(deadline) = screen.selection_auto_scroll_timer {
         if bound < deadline {
             break;
         }
+        fired = true;
         auto_scroll_selection(screen);
         if screen.selection_auto_scroll_timer.is_some() {
             screen.selection_auto_scroll_timer =
                 Some(deadline + SELECTION_AUTO_SCROLL_INTERVAL_MS);
         }
     }
+    fired
 }
 
 // =============================================================================

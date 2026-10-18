@@ -726,6 +726,12 @@ impl Component for Input {
 
         vec![line]
     }
+
+    /// TS `"focused" in component` — this component implements `Focusable`
+    /// (input.ts:43).
+    fn as_focusable(&mut self) -> Option<&mut dyn Focusable> {
+        Some(self)
+    }
 }
 
 impl Focusable for Input {

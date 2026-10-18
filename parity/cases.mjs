@@ -62,6 +62,9 @@ const smHeader = (version) => ({
 			sb(`${prefix}-split-${i + 1}`, [s.slice(0, i + 1), s.slice(i + 1)], opts),
 		);
 
+import { mainCases } from "./wavec/main-cases.mjs";
+import { altCases } from "./wavec/alt-cases.mjs";
+
 export const cases = [
 	// ---------------------------------------------------------------- read
 	{ name: "read/missing", tool: "read", args: { path: "nope.txt" } },
@@ -4785,6 +4788,12 @@ export const cases = [
 	te("csi-u-emoji-codepoint", ky("\x1b[128512u")),
 	te("tick-no-op", [{ input: "hi" }, { tickMs: 100 }, { render: 20 }]),
 	te("render-focused-cursor-marker", [{ render: 20 }], { setText: "hi", focused: true }),
+
+	// T5 Wave C: tui-main/tui-alt screen-level differential cases
+	// (ported from upstream tui-render/tui-shrink/tui-cell-size-input and
+	// tui-alt-screen tests — see wavec/*.mjs for provenance).
+	...mainCases,
+	...altCases,
 ];
 
 // tui-components sub-case builders (hoisted; used by the cases above).

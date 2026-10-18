@@ -41,7 +41,7 @@
 //!   the solver, which reads it off the scroll state); it is re-exported
 //!   here to mirror the TS export from scroll-view.ts:4.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::component::{
@@ -49,6 +49,24 @@ use crate::component::{
 };
 use crate::layout::{scroll_layout_node, ScrollViewScrollbar};
 use crate::layout_node::{LayoutNode, Overscroll, ScrollLayoutState};
+
+thread_local! {
+    /// Port seam (no TS counterpart): TS scroll views retain the layout
+    /// pass's `requestRender` callback (scroll-view.ts:192) and invoke it
+    /// on every state mutation, reaching the owning surface's
+    /// `requestRender`. A `&mut dyn FnMut()` cannot be retained past the
+    /// layout call, so the port parks the request here; the surface's
+    /// `run_pending_ticks` drains it into `request_render(false)` at the
+    /// same virtual instant.
+    static SCROLL_VIEW_RENDER_REQUESTED: Cell<bool> = Cell::new(false);
+}
+
+/// Drain the parked scroll-view render request
+/// (`this.requestRenderCallback?.()`, scroll-view.ts:36). Returns whether
+/// a scroll view requested a render since the last drain.
+pub fn take_scroll_view_render_request() -> bool {
+    SCROLL_VIEW_RENDER_REQUESTED.with(|flag| flag.replace(false))
+}
 
 // TS re-export (scroll-view.ts:4): the enum itself lives in `layout.rs`.
 pub use crate::layout::ScrollViewState as ScrollViewStateSurface;
@@ -509,6 +527,9 @@ impl ScrollViewStateData {
     /// (upstream callbacks only schedule an async renderer tick).
     fn request_render(&mut self) {
         self.render_requested = true;
+        // TS invokes the retained `requestRenderCallback` (scroll-view.ts:36,
+        // 192); the port parks the request for the owning surface to drain.
+        SCROLL_VIEW_RENDER_REQUESTED.with(|flag| flag.set(true));
         let callback = self.request_render_callback.clone();
         if let Some(callback) = callback {
             callback();
