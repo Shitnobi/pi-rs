@@ -107,6 +107,7 @@ impl LayoutBox {
 }
 
 /// `LayoutFrame` (layout.ts:32-38).
+#[derive(Clone)]
 pub struct LayoutFrame {
     pub root: LayoutBox,
     pub width: i64,
@@ -150,6 +151,10 @@ pub trait ScrollViewState: ScrollLayoutState {
     fn is_scrollbar_active(&self) -> bool;
     fn scrollbar_track_style(&self, text: &str) -> String;
     fn scrollbar_thumb_style(&self, text: &str) -> String;
+    /// `get isFollowingEnd()` (scroll-view.ts:62-64) — TS reads it off the
+    /// `ScrollView` object the alt screen holds via its primary scroll
+    /// view, so the port surfaces it on the shared-state trait.
+    fn is_following_end(&self) -> bool;
 }
 
 /// Shared handle to a scroll view's state (the TS `ScrollView` object
@@ -1374,7 +1379,6 @@ mod tests {
         fn scrollbar(&self) -> ScrollViewScrollbar {
             self.scrollbar
         }
-
         fn is_scrollbar_visible(&self) -> bool {
             if self.scrollbar == ScrollViewScrollbar::Always {
                 return self.viewport_height > 0;
@@ -1400,6 +1404,10 @@ mod tests {
                 Some(style) => style(text),
                 None => format!("\x1b[37m{text}\x1b[39m"),
             }
+        }
+
+        fn is_following_end(&self) -> bool {
+            self.following_end
         }
     }
 

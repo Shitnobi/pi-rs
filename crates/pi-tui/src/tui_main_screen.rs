@@ -1032,7 +1032,13 @@ impl TuiMainScreen {
 
     /// `render(width)` — inherited from `Container` (tui.ts:363+).
     fn render_children(&mut self, width: usize) -> Vec<String> {
-        Component::render(&mut self.base.container, width)
+        Component::render(&mut *self.base.container.borrow_mut(), width)
+    }
+
+    /// `getMountedRoots()` resync (tui.ts:717-719): the main screen's
+    /// mounted roots are exactly the container children.
+    fn refresh_mounted_roots(&mut self) {
+        self.base.mounted_roots = self.base.container.borrow().children.clone();
     }
 
     /// `handleMouse` — inherited from `Container` (tui.ts:390-418).
@@ -1041,7 +1047,7 @@ impl TuiMainScreen {
         self_ref: &ComponentRef,
         event: &TuiMouseEvent,
     ) -> Option<ComponentMouseResult> {
-        Component::handle_mouse(&mut self.base.container, self_ref, event)
+        Component::handle_mouse(&mut *self.base.container.borrow_mut(), self_ref, event)
     }
 
     /// Main screens never install the implicit viewport input listener

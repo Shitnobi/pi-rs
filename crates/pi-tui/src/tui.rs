@@ -478,7 +478,13 @@ pub(crate) enum InputListenerEntry {
 pub struct TuiBase {
     pub(crate) terminal: Rc<RefCell<dyn Terminal>>,
     /// The `Container` state TS inherits (`children`, `mouseLayout`).
-    pub(crate) container: Container,
+    /// Shared via `Rc<RefCell<...>>`: the alt screen's implicit document
+    /// (tui-alt-screen.ts:262-268) is functionally this same `Container`
+    /// (TS `super.render`/`super.handleMouse` are `Container` methods),
+    /// and it must render/dispatch while `doRender` holds the screen
+    /// borrow — so both the base and the implicit scroll view's child
+    /// hold the same `Rc`.
+    pub(crate) container: Rc<RefCell<Container>>,
     /// Weak self reference (`Rc<RefCell<dyn TuiSurface>>`), installed by
     /// [`TuiBase::install_self`] after the screen's `Rc` is created.
     pub(crate) self_weak: RefCell<Option<Weak<RefCell<dyn TuiSurface>>>>,
@@ -521,6 +527,31 @@ thread_local! {
     static NEXT_TUI_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
 }
 
+// =============================================================================
+// Re-entrancy bridge for `requestRender` closures (tui-alt-screen.ts:267)
+// =============================================================================
+
+thread_local! {
+    /// `requestRender` callbacks that fired while the owning screen's
+    /// `RefCell` was mutably borrowed park here, keyed by `tui_id`. TS
+    /// closures like `() => this.requestRender()` (the flash container,
+    /// the layout solver's lazy-measurement callback) execute while
+    /// `doRender` or a screen method holds the screen — impossible through
+    /// the `RefCell`. The port's closures capture only the `Copy`able
+    /// `tui_id` and call [`park_render_request`]; the screen's driver
+    /// methods ([`TuiSurface::render_now`], [`TuiSurface::run_pending_ticks`])
+    /// drain the parked flag once the borrow ends, re-entering the normal
+    /// `requestRender(false)` path — the same observable effect as the TS
+    /// mid-render `requestRender` (a follow-up render gets scheduled).
+    static PENDING_RENDER_REQUESTS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+}
+
+/// Park a `requestRender` for the screen with this `tui_id` (see
+/// [`TuiBase::drain_parked_render_request`]).
+pub(crate) fn park_render_request(tui_id: usize) {
+    PENDING_RENDER_REQUESTS.with(|set| set.borrow_mut().insert(tui_id));
+}
+
 impl TuiBase {
     /// `constructor(terminal, showHardwareCursor?, logDirectory?)` (tui.ts:543).
     /// `logDirectory` is env-gated debug output — see T5_PLAN divergences.
@@ -532,7 +563,7 @@ impl TuiBase {
         });
         TuiBase {
             terminal,
-            container: Container::new(),
+            container: Rc::new(RefCell::new(Container::new())),
             self_weak: RefCell::new(None),
             tui_id,
             mounted_roots: Vec::new(),
@@ -627,6 +658,22 @@ impl TuiBase {
         self.next_input_listener_id += 1;
         self.input_listeners.push((id, InputListenerEntry::SelfViewport));
         id
+    }
+
+    /// Drain a render request parked by [`crate::park_render_request`]
+    /// while this screen's `RefCell` was borrowed. Called by the screen
+    /// driver methods once the borrow is released.
+    pub(crate) fn drain_parked_render_request(&mut self) {
+        let parked =
+            PENDING_RENDER_REQUESTS.with(|set| set.borrow_mut().remove(&self.tui_id));
+        if parked {
+            self.request_render_state(false);
+        }
+    }
+
+    /// Test-only probe of the `renderRequested` flag (tui.ts:529).
+    pub(crate) fn render_requested_probe(&self) -> bool {
+        self.render_requested
     }
 
     pub(crate) fn remove_input_listener(&mut self, listener_id: usize) {
@@ -1217,16 +1264,14 @@ macro_rules! impl_tui_surface {
             /// `addChild` (inherited from `Container` via `TuiBase`,
             /// tui.ts:363-365) — keeps `mountedRoots` in sync.
             pub fn add_child(&mut self, component: $crate::component::ComponentRef) {
-                self.base.container.add_child(component.clone());
-                self.base.mounted_roots.push(component);
+                self.base.container.borrow_mut().add_child(component);
+                self.refresh_mounted_roots();
             }
 
             /// `removeChild` (tui.ts:367-373) — keeps `mountedRoots` in sync.
             pub fn remove_child(&mut self, component: &$crate::component::ComponentRef) {
-                self.base.container.remove_child(component);
-                self.base
-                    .mounted_roots
-                    .retain(|c| !::std::rc::Rc::ptr_eq(c, component));
+                self.base.container.borrow_mut().remove_child(component);
+                self.refresh_mounted_roots();
             }
 
             /// `getMountedRoots()` (tui.ts:717-719): `mountedRoots` is
@@ -1253,10 +1298,15 @@ macro_rules! impl_tui_surface {
                 }
                 self.base.render_now_begin();
                 self.do_render();
+                // Layout/flash callbacks that parked a `requestRender`
+                // mid-render (TS fires them re-entrantly) re-enter the
+                // scheduler now that the borrow is over.
+                self.base.drain_parked_render_request();
             }
 
             /// Drain queued microtasks (TS `process.nextTick`).
             pub fn run_pending_ticks(&mut self) {
+                self.base.drain_parked_render_request();
                 while let Some(action) = self.base.drain_one_next_tick() {
                     if action == $crate::tui::NextTickAction::DoRender {
                         self.do_render();
@@ -1388,8 +1438,8 @@ macro_rules! impl_tui_surface {
 
             /// The screen owns a `Container` (TS: screens extend
             /// `TuiBase extends Container`).
-            fn as_container(&self) -> Option<&$crate::component::Container> {
-                Some(&self.base.container)
+            fn container_children(&self) -> Option<Vec<$crate::component::ComponentRef>> {
+                Some(self.base.container.borrow().children.clone())
             }
         }
 

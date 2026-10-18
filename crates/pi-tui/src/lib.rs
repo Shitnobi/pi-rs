@@ -5,7 +5,10 @@
 //! original TypeScript implementation; see `docs/TUI_PORT_PLAN.md`.
 
 pub mod colors;
+pub mod alt_screen_render;
 pub mod alt_screen_search;
+pub mod alt_screen_input;
+pub mod alt_screen_selection;
 pub mod clock;
 pub mod component;
 pub mod components;
@@ -26,6 +29,7 @@ pub mod terminal;
 pub mod terminal_colors;
 pub mod terminal_image;
 pub mod tui;
+pub mod tui_alt_screen;
 pub mod tui_main_screen;
 pub mod tui_overlay;
 pub mod wheel_scroll;

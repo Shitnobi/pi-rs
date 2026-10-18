@@ -364,10 +364,14 @@ pub trait Component {
     }
 
     /// TS `root instanceof Container` (tui.ts:695): expose the `Container`
-    /// child list for the overlay focus machinery's `containsComponent`
-    /// walk. Only [`Container`] (and T5 screens, which own one) return
-    /// `Some`. Default `None` = "not a Container".
-    fn as_container(&self) -> Option<&Container> {
+    /// child list (cloned) for the overlay focus machinery's
+    /// `containsComponent` walk. Only [`Container`] (and T5 screens, which
+    /// own one) return `Some`. Default `None` = "not a Container".
+    ///
+    /// Returns a cloned `Vec` because screens own their `Container` behind
+    /// an `Rc<RefCell<...>>` (the alt screen's implicit document shares it),
+    /// so a borrowed slice cannot outlive `&self`.
+    fn container_children(&self) -> Option<Vec<ComponentRef>> {
         None
     }
 }
@@ -541,9 +545,10 @@ impl Container {
 }
 
 impl Component for Container {
-    /// A `Container` is itself (tui.ts:695 `instanceof Container`).
-    fn as_container(&self) -> Option<&Container> {
-        Some(self)
+    /// A `Container` exposes its children
+    /// (tui.ts:695 `instanceof Container`).
+    fn container_children(&self) -> Option<Vec<ComponentRef>> {
+        Some(self.children.clone())
     }
 
     fn render(&mut self, width: usize) -> Vec<String> {

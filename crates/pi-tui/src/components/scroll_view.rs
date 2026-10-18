@@ -547,6 +547,10 @@ impl crate::layout::ScrollViewState for ScrollViewStateData {
     fn scrollbar_thumb_style(&self, text: &str) -> String {
         ScrollViewStateData::scrollbar_thumb_style(self, text)
     }
+
+    fn is_following_end(&self) -> bool {
+        ScrollViewStateData::is_following_end(self)
+    }
 }
 
 // =============================================================================

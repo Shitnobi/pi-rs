@@ -41,14 +41,14 @@ fn components_equal(a: Option<&ComponentRef>, b: Option<&ComponentRef>) -> bool 
 
 /// `containsComponent(root, target)` (tui.ts:695-700): identity, then
 /// recurse into `Container` children (`instanceof Container` →
-/// [`Component::as_container`]).
+/// [`Component::container_children`]).
 fn contains_component(root: &ComponentRef, target: &ComponentRef) -> bool {
     if Rc::ptr_eq(root, target) {
         return true;
     }
     let borrowed = root.borrow();
-    if let Some(container) = borrowed.as_container() {
-        return container.children.iter().any(|child| contains_component(child, target));
+    if let Some(children) = borrowed.container_children() {
+        return children.iter().any(|child| contains_component(child, target));
     }
     false
 }
@@ -1006,7 +1006,10 @@ mod tests {
             TuiMode::Regular
         }
         fn render_children(&mut self, width: usize) -> Vec<String> {
-            self.base.container.render(width)
+            self.base.container.borrow_mut().render(width)
+        }
+        fn refresh_mounted_roots(&mut self) {
+            self.base.mounted_roots = self.base.container.borrow().children.clone();
         }
         fn handle_mouse_base(
             &mut self,
