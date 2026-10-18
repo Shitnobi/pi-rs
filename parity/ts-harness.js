@@ -328,6 +328,81 @@ async function runModule(tool, args, cwd) {
 			globalThis.clearTimeout = origClearTimeout;
 		}
 	}
+	if (tool === "tui-terminal-image") {
+		const { pathToFileURL } = require("url");
+		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const ti = await import(pathToFileURL(TUI_SRC + "/terminal-image.ts").href);
+		// Stateful sub-cases: setup capabilities / cell dimensions first.
+		if (args.setup) {
+			if (args.setup.capabilities) ti.setCapabilities(args.setup.capabilities);
+			if (args.setup.cellDimensions) ti.setCellDimensions(args.setup.cellDimensions);
+		}
+		try {
+			switch (args.fn) {
+				case "encodeKitty":
+					return { result: ti.encodeKitty(args.base64Data, args.options ?? {}) };
+				case "encodeITerm2":
+					return { result: ti.encodeITerm2(args.base64Data, args.options ?? {}) };
+				case "calculateImageCellSize":
+					return {
+						result: ti.calculateImageCellSize(
+							args.imageDimensions,
+							args.maxWidthCells,
+							args.maxHeightCells ?? undefined,
+							args.cellDimensions ?? { widthPx: 9, heightPx: 18 },
+							args.optimizeAspectRatio ?? false,
+						),
+					};
+				case "calculateImageRows":
+					return {
+						result: ti.calculateImageRows(
+							args.imageDimensions,
+							args.targetWidthCells,
+							args.cellDimensions ?? { widthPx: 9, heightPx: 18 },
+						),
+					};
+				case "getPngDimensions":
+					return { result: ti.getPngDimensions(args.base64Data) ?? null };
+				case "getGifDimensions":
+					return { result: ti.getGifDimensions(args.base64Data) ?? null };
+				case "getWebpDimensions":
+					return { result: ti.getWebpDimensions(args.base64Data) ?? null };
+				case "getImageDimensions":
+					return { result: ti.getImageDimensions(args.base64Data, args.mimeType) ?? null };
+				case "isImageLine":
+					return { result: ti.isImageLine(args.line) };
+				case "renderImage": {
+					const result = ti.renderImage(args.base64Data, args.imageDimensions, args.options ?? {});
+					return { result };
+				}
+				case "renderImageAndCrop": {
+					// renderImage + cropKittyImageLine + getKittyImagePlacement
+					// (exercises the metadata registry end-to-end).
+					const result = ti.renderImage(args.base64Data, args.imageDimensions, args.options ?? {});
+					if (!result) return { result: null };
+					const cropped = ti.cropKittyImageLine(result.sequence, args.hiddenRows, args.visibleRows);
+					return {
+						result: {
+							...result,
+							cropped,
+							placement: ti.getKittyImagePlacement(cropped) ?? null,
+						},
+					};
+				}
+				case "hyperlink":
+					return { result: ti.hyperlink(args.text, args.url) };
+				case "imageFallback":
+					return { result: ti.imageFallback(args.mimeType, args.dimensions ?? undefined, args.filename ?? undefined) };
+				default:
+					throw new Error("unknown tui-terminal-image fn: " + args.fn);
+			}
+		} finally {
+			if (args.setup) {
+				ti.resetCapabilitiesCache();
+				ti.setCellDimensions({ widthPx: 9, heightPx: 18 });
+			}
+		}
+	}
 	if (tool === "tui-terminal-colors") {
 		const { pathToFileURL } = require("url");
 		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";

@@ -2,9 +2,9 @@
 //!
 //! T5 covers: capability detection, the capability/override caches, cell
 //! dimensions, image-line detection, image-id allocation, the Kitty delete
-//! sequences and the Kitty image metadata/placement registry with
-//! `cropKittyImageLine`. The encoders and image dimension parsers
-//! (`encodeKitty`, `encodeITerm2`, `renderImage`, …) land in T6.
+//! sequences, the Kitty image metadata/placement registry with
+//! `cropKittyImageLine`, and (T6) the encoders, cell sizing, image
+//! dimension parsers, `renderImage`, `hyperlink` and `imageFallback`.
 //!
 //! ## Divergences from TS (documented in T5_PLAN)
 //!
@@ -402,7 +402,7 @@ pub fn delete_kitty_image(image_id: i64) -> String {
 /// `deleteAllKittyImages` (terminal-image.ts:295-297) — uppercase 'A' also
 /// frees the image data.
 pub fn delete_all_kitty_images() -> &'static str {
-    "\x1b_Ga=d,d=I,q=2\x1b\\"
+    "\x1b_Ga=d,d=A,q=2\x1b\\"
 }
 
 /// `deleteAllKittyPlacements` (terminal-image.ts:300) — keeps the uploaded
@@ -650,7 +650,540 @@ pub fn crop_kitty_image_line(line: &str, hidden_rows: i64, visible_rows: i64) ->
 }
 
 // =============================================================================
+// =============================================================================
+// Encoders (terminal-image.ts:226-348) — T6
+// =============================================================================
+
+/// `ImageDimensions` (terminal-image.ts:24-27).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageDimensions {
+    pub width_px: i64,
+    pub height_px: i64,
+}
+
+/// `ImageCellSize` (terminal-image.ts:318-321).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageCellSize {
+    pub columns: i64,
+    pub rows: i64,
+}
+
+/// `encodeKitty` options (terminal-image.ts:226-235). `None` mirrors
+/// `undefined`; TS truthiness (`if (options.columns)`) means `Some(0)` is
+/// treated as absent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KittyEncodeOptions {
+    pub columns: Option<i64>,
+    pub rows: Option<i64>,
+    /// Kitty image ID. If set, reuses/replaces the existing image.
+    pub image_id: Option<i64>,
+    /// Whether Kitty should apply its default cursor movement (default true).
+    pub move_cursor: Option<bool>,
+}
+
+/// `encodeKitty` (terminal-image.ts:226-274) — chunked transmission for
+/// payloads over 4096 chars.
+pub fn encode_kitty(base64_data: &str, options: &KittyEncodeOptions) -> String {
+    const CHUNK_SIZE: usize = 4096;
+
+    let mut params: Vec<String> = vec!["a=T".into(), "f=100".into(), "q=2".into()];
+    if options.move_cursor == Some(false) {
+        params.push("C=1".into());
+    }
+    // TS truthiness: `if (options.columns)` skips `undefined` and `0`
+    // (negatives are truthy in JS).
+    if let Some(columns) = options.columns {
+        if columns != 0 {
+            params.push(format!("c={columns}"));
+        }
+    }
+    if let Some(rows) = options.rows {
+        if rows != 0 {
+            params.push(format!("r={rows}"));
+        }
+    }
+    if let Some(image_id) = options.image_id {
+        if image_id != 0 {
+            params.push(format!("i={image_id}"));
+        }
+    }
+
+    if base64_data.len() <= CHUNK_SIZE {
+        return format!("\x1b_G{};{}\x1b\\", params.join(","), base64_data);
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut offset = 0usize;
+    let mut is_first = true;
+    while offset < base64_data.len() {
+        let chunk = &base64_data[offset..(offset + CHUNK_SIZE).min(base64_data.len())];
+        let is_last = offset + CHUNK_SIZE >= base64_data.len();
+        if is_first {
+            chunks.push(format!("\x1b_G{},m=1;{}\x1b\\", params.join(","), chunk));
+            is_first = false;
+        } else if is_last {
+            chunks.push(format!("\x1b_Gm=0;{}\x1b\\", chunk));
+        } else {
+            chunks.push(format!("\x1b_Gm=1;{}\x1b\\", chunk));
+        }
+        offset += CHUNK_SIZE;
+    }
+    chunks.join("")
+}
+
+/// `encodeITerm2` options (terminal-image.ts:293-302). `width`/`height` are
+/// number-or-string in TS; the port stores the already-stringified form
+/// (`"2"`, `"auto"`).
+#[derive(Debug, Clone, Default)]
+pub struct Iterm2EncodeOptions {
+    pub width: Option<String>,
+    pub height: Option<String>,
+    pub name: Option<String>,
+    pub preserve_aspect_ratio: Option<bool>,
+    pub inline: Option<bool>,
+}
+
+/// `encodeITerm2` (terminal-image.ts:293-327).
+pub fn encode_iterm2(base64_data: &str, options: &Iterm2EncodeOptions) -> String {
+    let inline = options.inline.unwrap_or(true);
+    let mut params: Vec<String> = vec![
+        format!("inline={}", if inline { 1 } else { 0 }),
+        format!("size={}", base64_byte_length(base64_data)),
+    ];
+    if let Some(width) = &options.width {
+        params.push(format!("width={width}"));
+    }
+    if let Some(height) = &options.height {
+        params.push(format!("height={height}"));
+    }
+    if let Some(name) = &options.name {
+        if !name.is_empty() {
+            params.push(format!("name={}", base64_encode(name.as_bytes())));
+        }
+    }
+    if options.preserve_aspect_ratio == Some(false) {
+        params.push("preserveAspectRatio=0".into());
+    }
+    format!("\x1b]1337;File={}:{}\x07", params.join(";"), base64_data)
+}
+
+// =============================================================================
+// Base64 helpers (Node `Buffer` semantics, lenient decode)
+// =============================================================================
+
+/// Decode one base64 char to its 6-bit value. Node's `Buffer.from(s,
+/// "base64")` accepts both the standard and URL-safe alphabets and ignores
+/// every other character.
+fn base64_char_value(c: u8) -> Option<u32> {
+    match c {
+        b'A'..=b'Z' => Some((c - b'A') as u32),
+        b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+        b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        b'-' => Some(62),
+        b'_' => Some(63),
+        _ => None,
+    }
+}
+
+/// `Buffer.from(s, "base64")` — lenient decode: non-alphabet characters
+/// (including `=` and whitespace) are skipped.
+pub fn base64_decode(input: &str) -> Vec<u8> {
+    let values: Vec<u32> = input.bytes().filter_map(base64_char_value).collect();
+    let mut out = Vec::with_capacity(values.len() / 4 * 3 + 3);
+    for group in values.chunks(4) {
+        match group.len() {
+            4 => {
+                out.push(((group[0] << 2) | (group[1] >> 4)) as u8);
+                out.push((((group[1] & 0x0F) << 4) | (group[2] >> 2)) as u8);
+                out.push((((group[2] & 0x03) << 6) | group[3]) as u8);
+            }
+            3 => {
+                out.push(((group[0] << 2) | (group[1] >> 4)) as u8);
+                out.push((((group[1] & 0x0F) << 4) | (group[2] >> 2)) as u8);
+            }
+            2 => {
+                out.push(((group[0] << 2) | (group[1] >> 4)) as u8);
+            }
+            _ => {} // 1 leftover char decodes to nothing
+        }
+    }
+    out
+}
+
+/// `Buffer.byteLength(s, "base64")` — the decoded byte count.
+pub fn base64_byte_length(input: &str) -> usize {
+    base64_decode(input).len()
+}
+
+/// `Buffer.from(s).toString("base64")` — strict standard encoding with
+/// padding.
+pub fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for group in data.chunks(3) {
+        let b = [group[0], group.get(1).copied().unwrap_or(0), group.get(2).copied().unwrap_or(0)];
+        out.push(ALPHABET[(b[0] >> 2) as usize] as char);
+        out.push(ALPHABET[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        if group.len() > 1 {
+            out.push(ALPHABET[(((b[1] & 0x0F) << 2) | (b[2] >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if group.len() > 2 {
+            out.push(ALPHABET[(b[2] & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+// =============================================================================
+// Image cell sizing (terminal-image.ts:472-527)
+// =============================================================================
+
+/// `chooseLessDistortedCellCount` (terminal-image.ts:472-479).
+fn choose_less_distorted_cell_count(upper_count: i64, ideal_count: f64) -> i64 {
+    if upper_count <= 1 {
+        return upper_count;
+    }
+    let lower_count = upper_count - 1;
+    let upper_distortion = (upper_count as f64 / ideal_count).max(ideal_count / upper_count as f64);
+    let lower_distortion = (lower_count as f64 / ideal_count).max(ideal_count / lower_count as f64);
+    if lower_distortion < upper_distortion {
+        lower_count
+    } else {
+        upper_count
+    }
+}
+
+/// `calculateImageCellSize` (terminal-image.ts:481-514). Kitty callers pass
+/// `optimize_aspect_ratio = true` to trade a cell for less distortion;
+/// iTerm2 keeps the plain ceiling sizes.
+pub fn calculate_image_cell_size(
+    image_dimensions: ImageDimensions,
+    max_width_cells: i64,
+    max_height_cells: Option<i64>,
+    cell_dimensions: CellDimensions,
+    optimize_aspect_ratio: bool,
+) -> ImageCellSize {
+    let max_width = 1i64.max(max_width_cells);
+    let max_height = max_height_cells.map(|h| 1i64.max(h));
+    let image_width = 1i64.max(image_dimensions.width_px) as f64;
+    let image_height = 1i64.max(image_dimensions.height_px) as f64;
+    let cell_w = cell_dimensions.width_px as f64;
+    let cell_h = cell_dimensions.height_px as f64;
+
+    let width_scale = (max_width as f64 * cell_w) / image_width;
+    let height_scale = match max_height {
+        None => width_scale,
+        Some(max_height) => (max_height as f64 * cell_h) / image_height,
+    };
+    let scale = width_scale.min(height_scale);
+
+    let scaled_width_px = image_width * scale;
+    let scaled_height_px = image_height * scale;
+    let mut columns = 1i64.max(max_width.min((scaled_width_px / cell_w).ceil() as i64));
+    let height_rows = scaled_height_px / cell_h;
+    let mut rows = 1i64.max(height_rows.ceil() as i64);
+    if let Some(max_height) = max_height {
+        rows = rows.min(max_height);
+    }
+
+    if !optimize_aspect_ratio {
+        return ImageCellSize { columns, rows };
+    }
+
+    if width_scale <= height_scale {
+        let ideal_rows = (columns as f64 * cell_w * image_height) / (image_width * cell_h);
+        rows = choose_less_distorted_cell_count(rows, ideal_rows);
+    } else {
+        let ideal_columns = (rows as f64 * cell_h * image_width) / (image_height * cell_w);
+        columns = choose_less_distorted_cell_count(columns, ideal_columns);
+    }
+
+    ImageCellSize { columns, rows }
+}
+
+/// `calculateImageRows` (terminal-image.ts:521-527).
+pub fn calculate_image_rows(
+    image_dimensions: ImageDimensions,
+    target_width_cells: i64,
+    cell_dimensions: CellDimensions,
+) -> i64 {
+    calculate_image_cell_size(image_dimensions, target_width_cells, None, cell_dimensions, false).rows
+}
+
+// =============================================================================
+// Image dimension parsers (terminal-image.ts:529-668)
+// =============================================================================
+
+/// `getPngDimensions` (terminal-image.ts:529-548) — PNG IHDR width/height
+/// at byte offsets 16/20 (big-endian).
+pub fn get_png_dimensions(base64_data: &str) -> Option<ImageDimensions> {
+    let buffer = base64_decode(base64_data);
+    if buffer.len() < 24 {
+        return None;
+    }
+    if buffer[0] != 0x89 || buffer[1] != 0x50 || buffer[2] != 0x4E || buffer[3] != 0x47 {
+        return None;
+    }
+    let width = u32::from_be_bytes([buffer[16], buffer[17], buffer[18], buffer[19]]);
+    let height = u32::from_be_bytes([buffer[20], buffer[21], buffer[22], buffer[23]]);
+    Some(ImageDimensions { width_px: width as i64, height_px: height as i64 })
+}
+
+/// `getJpegDimensions` (terminal-image.ts:550-568) — the TS stub always
+/// returns null (marker scanning is not implemented upstream).
+pub fn get_jpeg_dimensions(_base64_data: &str) -> Option<ImageDimensions> {
+    None
+}
+
+/// `getGifDimensions` (terminal-image.ts:593-613) — logical screen size at
+/// offsets 6/8 (little-endian).
+pub fn get_gif_dimensions(base64_data: &str) -> Option<ImageDimensions> {
+    let buffer = base64_decode(base64_data);
+    if buffer.len() < 10 {
+        return None;
+    }
+    let sig = &buffer[0..6];
+    if sig != b"GIF87a" && sig != b"GIF89a" {
+        return None;
+    }
+    let width = u16::from_le_bytes([buffer[6], buffer[7]]);
+    let height = u16::from_le_bytes([buffer[8], buffer[9]]);
+    Some(ImageDimensions { width_px: width as i64, height_px: height as i64 })
+}
+
+/// `getWebpDimensions` (terminal-image.ts:615-652) — VP8 / VP8L / VP8X
+/// dimension fields.
+pub fn get_webp_dimensions(base64_data: &str) -> Option<ImageDimensions> {
+    let buffer = base64_decode(base64_data);
+    if buffer.len() < 30 {
+        return None;
+    }
+    if &buffer[0..4] != b"RIFF" || &buffer[8..12] != b"WEBP" {
+        return None;
+    }
+    let chunk = &buffer[12..16];
+    if chunk == b"VP8 " {
+        let width = u16::from_le_bytes([buffer[26], buffer[27]]) & 0x3FFF;
+        let height = u16::from_le_bytes([buffer[28], buffer[29]]) & 0x3FFF;
+        Some(ImageDimensions { width_px: width as i64, height_px: height as i64 })
+    } else if chunk == b"VP8L" {
+        if buffer.len() < 25 {
+            return None;
+        }
+        let bits = u32::from_le_bytes([buffer[21], buffer[22], buffer[23], buffer[24]]);
+        let width = (bits & 0x3FFF) + 1;
+        let height = ((bits >> 14) & 0x3FFF) + 1;
+        Some(ImageDimensions { width_px: width as i64, height_px: height as i64 })
+    } else if chunk == b"VP8X" {
+        let width = (buffer[24] as u32 | (buffer[25] as u32) << 8 | (buffer[26] as u32) << 16) + 1;
+        let height = (buffer[27] as u32 | (buffer[28] as u32) << 8 | (buffer[29] as u32) << 16) + 1;
+        Some(ImageDimensions { width_px: width as i64, height_px: height as i64 })
+    } else {
+        None
+    }
+}
+
+/// `getImageDimensions` (terminal-image.ts:654-668) — dispatch by MIME type.
+pub fn get_image_dimensions(base64_data: &str, mime_type: &str) -> Option<ImageDimensions> {
+    match mime_type {
+        "image/png" => get_png_dimensions(base64_data),
+        "image/jpeg" => get_jpeg_dimensions(base64_data),
+        "image/gif" => get_gif_dimensions(base64_data),
+        "image/webp" => get_webp_dimensions(base64_data),
+        _ => None,
+    }
+}
+
+// =============================================================================
+// renderImage (terminal-image.ts:670-730)
+// =============================================================================
+
+/// `ImageRenderOptions` (terminal-image.ts:29-37).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImageRenderOptions {
+    pub max_width_cells: Option<i64>,
+    pub max_height_cells: Option<i64>,
+    pub preserve_aspect_ratio: Option<bool>,
+    /// Kitty image ID. If provided, reuses/replaces the existing image.
+    pub image_id: Option<i64>,
+    /// Whether Kitty should apply its default cursor movement (default true).
+    pub move_cursor: Option<bool>,
+}
+
+/// `renderImage`'s result (terminal-image.ts:670-679).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedImage {
+    pub sequence: String,
+    pub columns: i64,
+    pub rows: i64,
+    pub image_id: Option<i64>,
+}
+
+/// `renderImage` (terminal-image.ts:670-730) — `None` when the terminal has
+/// no image protocol.
+pub fn render_image(
+    base64_data: &str,
+    image_dimensions: ImageDimensions,
+    options: &ImageRenderOptions,
+) -> Option<RenderedImage> {
+    let caps = get_capabilities();
+    let protocol = caps.images?;
+
+    let max_width = options.max_width_cells.unwrap_or(80);
+    // Reduce Kitty's cell-aligned distortion without shrinking iTerm2
+    // reservations.
+    let size = calculate_image_cell_size(
+        image_dimensions,
+        max_width,
+        options.max_height_cells,
+        get_cell_dimensions(),
+        protocol == ImageProtocol::Kitty,
+    );
+
+    match protocol {
+        ImageProtocol::Kitty => {
+            // TS: `options.imageId !== undefined` (Some(0) still registers).
+            if let Some(image_id) = options.image_id {
+                register_kitty_image_metadata(KittyImageMetadata {
+                    image_id,
+                    columns: size.columns,
+                    rows: size.rows,
+                    width_px: image_dimensions.width_px,
+                    height_px: image_dimensions.height_px,
+                });
+            }
+            let sequence = encode_kitty(
+                base64_data,
+                &KittyEncodeOptions {
+                    columns: Some(size.columns),
+                    rows: Some(size.rows),
+                    image_id: options.image_id,
+                    move_cursor: options.move_cursor,
+                },
+            );
+            Some(RenderedImage {
+                sequence,
+                columns: size.columns,
+                rows: size.rows,
+                image_id: options.image_id,
+            })
+        }
+        ImageProtocol::Iterm2 => {
+            let sequence = encode_iterm2(
+                base64_data,
+                &Iterm2EncodeOptions {
+                    width: Some(size.columns.to_string()),
+                    height: Some("auto".to_string()),
+                    name: None,
+                    preserve_aspect_ratio: Some(options.preserve_aspect_ratio.unwrap_or(true)),
+                    inline: None,
+                },
+            );
+            Some(RenderedImage { sequence, columns: size.columns, rows: size.rows, image_id: None })
+        }
+    }
+}
+
+// =============================================================================
+// hyperlink / imageFallback (terminal-image.ts:732-762)
+// =============================================================================
+
+/// `hyperlink` (terminal-image.ts:732-746) — OSC 8.
+pub fn hyperlink(text: &str, url: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
+/// `os.homedir()` (documented divergence: env-only, no passwd fallback —
+/// tests always run with `HOME` set).
+fn home_dir() -> Option<String> {
+    if cfg!(windows) {
+        std::env::var("USERPROFILE").ok().filter(|s| !s.is_empty())
+    } else {
+        std::env::var("HOME").ok().filter(|s| !s.is_empty())
+    }
+}
+
+/// `shortenImagePath` (terminal-image.ts:737-748) — `~/...` for
+/// home-prefixed absolute paths.
+fn shorten_image_path(filename: &str) -> String {
+    let home = home_dir().unwrap_or_default();
+    if !home.is_empty()
+        && (filename == home
+            || filename.starts_with(&format!("{home}/"))
+            || filename.starts_with(&format!("{home}\\")))
+    {
+        return format!("~{}", &filename[home.len()..]);
+    }
+    filename.to_string()
+}
+
+/// `url.pathToFileURL(path).href` for absolute paths (WHATWG file URL):
+/// percent-encodes the file path percent-encode set (C0 controls, DEL,
+/// space, `"#<>?\`{}` and non-ASCII bytes).
+fn file_url_from_path(filename: &str) -> String {
+    #[cfg(windows)]
+    {
+        // `file:///C:/path/with/forward/slashes`.
+        let normalized = filename.replace('\\', "/");
+        let mut url = String::from("file:///");
+        for b in normalized.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/' | b':') {
+                url.push(b as char);
+            } else {
+                url.push_str(&format!("%{b:02X}"));
+            }
+        }
+        return url;
+    }
+    #[cfg(not(windows))]
+    {
+        let mut url = String::from("file://");
+        for b in filename.bytes() {
+            let encode = b < 0x21
+                || b > 0x7E
+                || matches!(b, b'"' | b'#' | b'<' | b'>' | b'?' | b'`' | b'{' | b'}');
+            if encode {
+                url.push_str(&format!("%{b:02X}"));
+            } else {
+                url.push(b as char);
+            }
+        }
+        url
+    }
+}
+
+/// `imageFallback` (terminal-image.ts:750-762) — text fallback when the
+/// terminal cannot render inline images.
+pub fn image_fallback(
+    mime_type: &str,
+    dimensions: Option<ImageDimensions>,
+    filename: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(filename) = filename {
+        let display = shorten_image_path(filename);
+        if get_capabilities().hyperlinks && std::path::Path::new(filename).is_absolute() {
+            parts.push(hyperlink(&display, &file_url_from_path(filename)));
+        } else {
+            parts.push(display);
+        }
+    }
+    parts.push(format!("[{mime_type}]"));
+    if let Some(dimensions) = dimensions {
+        parts.push(format!("{}x{}", dimensions.width_px, dimensions.height_px));
+    }
+    format!("[Image: {}]", parts.join(" "))
+}
+
+// =============================================================================
 // Test support
+// =============================================================================
 // =============================================================================
 
 /// Reset all module state (registries, caches, random source). The TS tests
@@ -830,7 +1363,7 @@ mod tests {
     #[test]
     fn delete_sequences() {
         assert_eq!(delete_kitty_image(42), "\x1b_Ga=d,d=I,i=42,q=2\x1b\\");
-        assert_eq!(delete_all_kitty_images(), "\x1b_Ga=d,d=I,q=2\x1b\\");
+        assert_eq!(delete_all_kitty_images(), "\x1b_Ga=d,d=A,q=2\x1b\\");
         assert_eq!(delete_all_kitty_placements(), "\x1b_Ga=d,d=a,q=2\x1b\\");
     }
 
@@ -935,6 +1468,395 @@ mod tests {
             crop_kitty_image_line(only_geometry, 1, 2),
             "\x1b_Gi=3,y=20,h=40,r=2;DATA\x1b\\"
         );
+        reset_for_test();
+    }
+
+    // =========================================================================
+    // T6: encoders, cell sizing, dimension parsers, renderImage, fallbacks
+    // =========================================================================
+
+    fn kitty_caps() {
+        set_capabilities(TerminalCapabilities {
+            images: Some(ImageProtocol::Kitty),
+            true_color: true,
+            hyperlinks: true,
+        });
+    }
+
+    fn iterm2_caps() {
+        set_capabilities(TerminalCapabilities {
+            images: Some(ImageProtocol::Iterm2),
+            true_color: true,
+            hyperlinks: true,
+        });
+    }
+
+    fn no_image_caps() {
+        set_capabilities(TerminalCapabilities {
+            images: None,
+            true_color: false,
+            hyperlinks: false,
+        });
+    }
+
+    fn dims(width_px: i64, height_px: i64) -> ImageDimensions {
+        ImageDimensions { width_px, height_px }
+    }
+
+    #[test]
+    fn encode_kitty_small_payload() {
+        // "can request no terminal-side cursor movement"
+        let sequence = encode_kitty(
+            "AAAA",
+            &KittyEncodeOptions {
+                columns: Some(2),
+                rows: Some(2),
+                move_cursor: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(sequence, "\x1b_Ga=T,f=100,q=2,C=1,c=2,r=2;AAAA\x1b\\");
+        // Default: terminal-side cursor movement on (no C=1).
+        let sequence = encode_kitty("AAAA", &KittyEncodeOptions::default());
+        assert_eq!(sequence, "\x1b_Ga=T,f=100,q=2;AAAA\x1b\\");
+        // TS truthiness: Some(0) columns/rows/imageId are skipped.
+        let sequence = encode_kitty(
+            "AAAA",
+            &KittyEncodeOptions {
+                columns: Some(0),
+                rows: Some(0),
+                image_id: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(sequence, "\x1b_Ga=T,f=100,q=2;AAAA\x1b\\");
+    }
+
+    #[test]
+    fn encode_kitty_chunked_payload() {
+        let payload = "A".repeat(4096 * 2 + 100);
+        let sequence =
+            encode_kitty(&payload, &KittyEncodeOptions { columns: Some(5), ..Default::default() });
+        // First chunk: full params + m=1.
+        assert!(sequence.starts_with("\x1b_Ga=T,f=100,q=2,c=5,m=1;"));
+        // Middle chunk: m=1 without params. The first chunk is
+        // "_G" + params + ";" (24 chars) + 4096 + "\" (2) = 4122.
+        assert!(sequence[4123..].starts_with("\x1b_Gm=1;"));
+        // Last chunk: m=0.
+        assert!(sequence.contains("\x1b_Gm=0;"));
+        // Exactly-4096 payload stays single-chunk.
+        let single = encode_kitty(&"A".repeat(4096), &KittyEncodeOptions::default());
+        assert_eq!(single, format!("\x1b_Ga=T,f=100,q=2;{}\x1b\\", "A".repeat(4096)));
+    }
+
+    #[test]
+    fn encode_iterm2_metadata() {
+        // "includes the decoded payload size in OSC 1337 metadata"
+        let sequence = encode_iterm2(
+            "AAAA",
+            &Iterm2EncodeOptions {
+                width: Some("2".into()),
+                height: Some("auto".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(sequence, "\x1b]1337;File=inline=1;size=3;width=2;height=auto:AAAA\x07");
+        // name + preserveAspectRatio=0 + inline=0.
+        let sequence = encode_iterm2(
+            "AAAA",
+            &Iterm2EncodeOptions {
+                name: Some("pic.png".into()),
+                preserve_aspect_ratio: Some(false),
+                inline: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            sequence,
+            format!(
+                "\x1b]1337;File=inline=0;size=3;name={};preserveAspectRatio=0:AAAA\x07",
+                base64_encode(b"pic.png")
+            )
+        );
+    }
+
+    #[test]
+    fn base64_node_semantics() {
+        assert_eq!(base64_decode("AAAA"), vec![0, 0, 0]);
+        assert_eq!(base64_byte_length("AAAA"), 3);
+        // Lenient: padding and whitespace skipped.
+        assert_eq!(base64_byte_length("AAAA====="), 3);
+        assert_eq!(base64_byte_length("AA AA\n"), 3);
+        // URL-safe alphabet accepted.
+        assert_eq!(base64_decode("-_8="), base64_decode("+/8"));
+        // 2 leftover chars → 1 byte; 1 leftover char → 0 bytes.
+        assert_eq!(base64_byte_length("AA"), 1);
+        assert_eq!(base64_byte_length("A"), 0);
+        assert_eq!(base64_encode(b"pic.png"), "cGljLnBuZw==");
+        assert_eq!(base64_decode("cGljLnBuZw=="), b"pic.png".to_vec());
+    }
+
+    #[test]
+    fn render_image_kitty_default_cursor_movement() {
+        let _lock = global_test_lock();
+        reset_for_test();
+        kitty_caps();
+        set_cell_dimensions(10, 10);
+        let result = render_image(
+            "AAAA",
+            dims(20, 20),
+            &ImageRenderOptions { max_width_cells: Some(2), ..Default::default() },
+        )
+        .expect("kitty render");
+        assert!(!result.sequence.contains(",C=1,"));
+        assert_eq!(result.rows, 2);
+        // "can opt renderImage into no terminal-side cursor movement"
+        let result = render_image(
+            "AAAA",
+            dims(20, 20),
+            &ImageRenderOptions {
+                max_width_cells: Some(2),
+                move_cursor: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("kitty render");
+        assert!(result.sequence.contains(",C=1,"));
+        assert_eq!(result.rows, 2);
+        reset_for_test();
+    }
+
+    #[test]
+    fn render_image_kitty_thin_image_single_row() {
+        let _lock = global_test_lock();
+        reset_for_test();
+        kitty_caps();
+        set_cell_dimensions(9, 18);
+        let result = render_image(
+            "AAAA",
+            dims(1200, 12),
+            &ImageRenderOptions { max_width_cells: Some(60), ..Default::default() },
+        )
+        .expect("kitty render");
+        assert_eq!(result.rows, 1);
+        assert!(result.sequence.contains(",c=60,r=1;"));
+        reset_for_test();
+    }
+
+    #[test]
+    fn render_image_kitty_ceiling_placement() {
+        let _lock = global_test_lock();
+        reset_for_test();
+        kitty_caps();
+        set_cell_dimensions(15, 28);
+        let result = render_image(
+            "AAAA",
+            dims(615, 86),
+            &ImageRenderOptions { max_width_cells: Some(60), ..Default::default() },
+        )
+        .expect("kitty render");
+        assert_eq!(result.rows, 5);
+        assert!(result.sequence.contains(",c=60,r=5;"));
+        reset_for_test();
+    }
+
+    #[test]
+    fn render_image_kitty_metadata_and_crop() {
+        let _lock = global_test_lock();
+        reset_for_test();
+        kitty_caps();
+        set_cell_dimensions(14, 28);
+        let result = render_image(
+            "AAAA",
+            dims(400, 900),
+            // max_height_cells: the TS test reaches renderImage through the
+            // Image component, which caps height to a square pixel box:
+            // floor(maxWidthCells * cellW / cellH) = floor(30 * 14 / 28) = 15.
+            &ImageRenderOptions {
+                max_width_cells: Some(30),
+                max_height_cells: Some(15),
+                image_id: Some(8938),
+                // The Image component passes moveCursor: false; the C=1 it
+                // adds survives into the placement-only command.
+                move_cursor: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("kitty render");
+        assert!(result.sequence.contains(",c=13,r=15,i=8938;"));
+        assert_eq!(
+            get_kitty_image_metadata(&result.sequence),
+            Some(KittyImageMetadata {
+                image_id: 8938,
+                columns: 13,
+                rows: 15,
+                width_px: 400,
+                height_px: 900,
+            })
+        );
+        let placement = get_kitty_image_placement(&crop_kitty_image_line(&result.sequence, 1, 2))
+            .expect("cropped placement");
+        assert_eq!(placement.sequence, "\x1b_Ga=p,q=2,C=1,c=13,i=8938,y=60,h=120,r=2\x1b\\");
+        reset_for_test();
+    }
+
+    #[test]
+    fn render_image_kitty_thin_widths_by_proportion() {
+        let _lock = global_test_lock();
+        reset_for_test();
+        kitty_caps();
+        set_cell_dimensions(1, 1);
+        for (width_px, columns) in [(1, 1), (140, 1), (149, 2)] {
+            let result = render_image(
+                "AAAA",
+                dims(width_px, 1000),
+                &ImageRenderOptions {
+                    max_width_cells: Some(30),
+                    max_height_cells: Some(10),
+                    ..Default::default()
+                },
+            )
+            .expect("kitty render");
+            assert_eq!(result.columns, columns);
+            assert_eq!(result.rows, 10);
+            assert!(result.sequence.contains(&format!(",c={columns},r=10;")));
+        }
+        reset_for_test();
+    }
+
+    #[test]
+    fn render_image_iterm2_ceiling_width() {
+        let _lock = global_test_lock();
+        reset_for_test();
+        iterm2_caps();
+        set_cell_dimensions(14, 28);
+        let result = render_image(
+            "AAAA",
+            dims(400, 900),
+            &ImageRenderOptions {
+                max_width_cells: Some(30),
+                max_height_cells: Some(15),
+                ..Default::default()
+            },
+        )
+        .expect("iterm2 render");
+        assert_eq!(result.columns, 14);
+        assert_eq!(result.rows, 15);
+        assert_eq!(result.sequence, "\x1b]1337;File=inline=1;size=3;width=14;height=auto:AAAA\x07");
+        reset_for_test();
+    }
+
+    #[test]
+    fn render_image_without_protocol() {
+        let _lock = global_test_lock();
+        reset_for_test();
+        no_image_caps();
+        assert!(render_image("AAAA", dims(20, 20), &ImageRenderOptions::default()).is_none());
+        reset_for_test();
+    }
+
+    #[test]
+    fn image_dimension_parsers() {
+        // PNG: signature + IHDR width/height at offsets 16/20.
+        let mut png = vec![0u8; 24];
+        png[0..4].copy_from_slice(&[0x89, 0x50, 0x4E, 0x47]);
+        png[16..20].copy_from_slice(&615u32.to_be_bytes());
+        png[20..24].copy_from_slice(&86u32.to_be_bytes());
+        let png_b64 = base64_encode(&png);
+        assert_eq!(get_png_dimensions(&png_b64), Some(dims(615, 86)));
+        assert_eq!(get_image_dimensions(&png_b64, "image/png"), Some(dims(615, 86)));
+        // Too short / wrong signature.
+        assert_eq!(get_png_dimensions("AAAA"), None);
+        let mut bad = png.clone();
+        bad[0] = 0x00;
+        assert_eq!(get_png_dimensions(&base64_encode(&bad)), None);
+
+        // JPEG stub always returns null.
+        assert_eq!(get_jpeg_dimensions(&png_b64), None);
+        assert_eq!(get_image_dimensions(&png_b64, "image/jpeg"), None);
+
+        // GIF: signature + LE u16 at 6/8.
+        let mut gif = vec![0u8; 10];
+        gif[0..6].copy_from_slice(b"GIF89a");
+        gif[6..8].copy_from_slice(&640u16.to_le_bytes());
+        gif[8..10].copy_from_slice(&480u16.to_le_bytes());
+        let gif_b64 = base64_encode(&gif);
+        assert_eq!(get_gif_dimensions(&gif_b64), Some(dims(640, 480)));
+        assert_eq!(get_image_dimensions(&gif_b64, "image/gif"), Some(dims(640, 480)));
+
+        // WebP VP8L: bits at 21 encode (width-1) and (height-1).
+        let mut webp = vec![0u8; 30];
+        webp[0..4].copy_from_slice(b"RIFF");
+        webp[8..12].copy_from_slice(b"WEBP");
+        webp[12..16].copy_from_slice(b"VP8L");
+        let bits = (((480u32) - 1) << 14) | ((640u32) - 1);
+        webp[21..25].copy_from_slice(&bits.to_le_bytes());
+        let webp_b64 = base64_encode(&webp);
+        assert_eq!(get_webp_dimensions(&webp_b64), Some(dims(640, 480)));
+        assert_eq!(get_image_dimensions(&webp_b64, "image/webp"), Some(dims(640, 480)));
+
+        // WebP VP8X: 24-bit canvas size - 1 at 24/27.
+        webp[12..16].copy_from_slice(b"VP8X");
+        webp[24..27].copy_from_slice(&[99, 0, 0]); // width 100
+        webp[27..30].copy_from_slice(&[49, 0, 0]); // height 50
+        let webp_b64 = base64_encode(&webp);
+        assert_eq!(get_webp_dimensions(&webp_b64), Some(dims(100, 50)));
+
+        // Unknown MIME type.
+        assert_eq!(get_image_dimensions(&png_b64, "image/bmp"), None);
+    }
+
+    #[test]
+    fn calculate_cell_size_math() {
+        let cells = CellDimensions { width_px: 9, height_px: 18 };
+        // No height cap: scale by width.
+        let size = calculate_image_cell_size(dims(90, 180), 10, None, cells, false);
+        assert_eq!(size, ImageCellSize { columns: 10, rows: 10 });
+        // Height cap limits rows and width together (uniform scale).
+        let size = calculate_image_cell_size(dims(90, 180), 10, Some(5), cells, false);
+        assert_eq!(size, ImageCellSize { columns: 5, rows: 5 });
+        // calculateImageRows delegates without aspect optimization.
+        assert_eq!(calculate_image_rows(dims(90, 180), 10, cells), 10);
+    }
+
+    #[test]
+    fn hyperlink_osc8() {
+        assert_eq!(
+            hyperlink("text", "https://example.com"),
+            "\x1b]8;;https://example.com\x1b\\text\x1b]8;;\x1b\\"
+        );
+        assert_eq!(hyperlink("", "file:///x"), "\x1b]8;;file:///x\x1b\\\x1b]8;;\x1b\\");
+    }
+
+    #[test]
+    fn image_fallback_variants() {
+        let _lock = global_test_lock();
+        reset_for_test();
+        no_image_caps();
+        // No filename / no dimensions.
+        assert_eq!(image_fallback("image/png", None, None), "[Image: [image/png]]");
+        // Dimensions only.
+        assert_eq!(image_fallback("image/png", Some(dims(100, 50)), None), "[Image: [image/png] 100x50]");
+        // Relative basename: never hyperlinked.
+        assert_eq!(
+            image_fallback("image/png", Some(dims(100, 50)), Some("pic.png")),
+            "[Image: pic.png [image/png] 100x50]"
+        );
+        // Absolute path without hyperlink support: shortened but plain.
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let path = format!("{home}/docs/pic.png");
+            assert_eq!(image_fallback("image/png", None, Some(&path)), "[Image: ~/docs/pic.png [image/png]]");
+        }
+        // Hyperlinks enabled: absolute path wrapped in OSC 8 file link.
+        set_capabilities(TerminalCapabilities { images: None, true_color: true, hyperlinks: true });
+        if !home.is_empty() {
+            let path = format!("{home}/docs/pic.png");
+            let expected = format!(
+                "[Image: \x1b]8;;file://{home}/docs/pic.png\x1b\\~/docs/pic.png\x1b]8;;\x1b\\ [image/png]]"
+            );
+            assert_eq!(image_fallback("image/png", None, Some(&path)), expected);
+        }
         reset_for_test();
     }
 }

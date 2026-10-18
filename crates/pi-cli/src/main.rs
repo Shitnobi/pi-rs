@@ -106,6 +106,7 @@ fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
         "tui-program-status" => return run_tui_program_status_harness(&input),
         "tui-colors" => return run_tui_colors_harness(&input),
         "tui-terminal-colors" => return run_tui_terminal_colors_harness(&input),
+        "tui-terminal-image" => return run_tui_terminal_image_harness(&input),
         "tui-keys" => return run_tui_keys_harness(&input),
         "tui-stdin-buffer" => return run_tui_stdin_buffer_harness(&input),
         "tui-components" => return run_tui_components_harness(&input),
@@ -782,6 +783,237 @@ fn run_math_harness(input: &Value) -> Result<Value, String> {
     }
     Ok(serde_json::json!({ "results": results }))
 }
+fn run_tui_terminal_image_harness(input: &Value) -> Result<Value, String> {
+    use pi_tui::terminal_image::{
+        self, calculate_image_cell_size, calculate_image_rows, encode_iterm2, encode_kitty,
+        get_gif_dimensions, get_image_dimensions, get_png_dimensions, get_webp_dimensions,
+        hyperlink, image_fallback, render_image, CellDimensions, ImageProtocol,
+        Iterm2EncodeOptions, KittyEncodeOptions, TerminalCapabilities,
+    };
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    let text = |key: &str| -> Result<&str, String> {
+        input[key].as_str().ok_or_else(|| format!("missing {key}"))
+    };
+
+    // `args.setup`: capabilities / cell dimensions applied before the call.
+    let mut setup_applied = false;
+    if let Some(setup) = input.get("setup") {
+        setup_applied = true;
+        if let Some(caps) = setup.get("capabilities") {
+            let images = match caps["images"].as_str() {
+                Some("kitty") => Some(ImageProtocol::Kitty),
+                Some("iterm2") => Some(ImageProtocol::Iterm2),
+                _ => None,
+            };
+            terminal_image::set_capabilities(TerminalCapabilities {
+                images,
+                true_color: caps["trueColor"].as_bool().unwrap_or(false),
+                hyperlinks: caps["hyperlinks"].as_bool().unwrap_or(false),
+            });
+        }
+        if let Some(dims) = setup.get("cellDimensions") {
+            terminal_image::set_cell_dimensions(
+                dims["widthPx"].as_u64().unwrap_or(9) as u32,
+                dims["heightPx"].as_u64().unwrap_or(18) as u32,
+            );
+        }
+    }
+
+    let result = (|| -> Result<Value, String> {
+        match fn_name {
+            "encodeKitty" => {
+                let options = input.get("options");
+                let opts = KittyEncodeOptions {
+                    columns: options.and_then(|o| o.get("columns")).and_then(|v| v.as_i64()),
+                    rows: options.and_then(|o| o.get("rows")).and_then(|v| v.as_i64()),
+                    image_id: options.and_then(|o| o.get("imageId")).and_then(|v| v.as_i64()),
+                    move_cursor: options
+                        .and_then(|o| o.get("moveCursor"))
+                        .and_then(|v| v.as_bool()),
+                };
+                Ok(serde_json::json!({ "result": encode_kitty(text("base64Data")?, &opts) }))
+            }
+            "encodeITerm2" => {
+                let options = input.get("options");
+                // TS width/height are number-or-string; stringify JSON values.
+                let dim = |key: &str| -> Option<String> {
+                    options
+                        .and_then(|o| o.get(key))
+                        .filter(|v| !v.is_null())
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                };
+                let opts = Iterm2EncodeOptions {
+                    width: dim("width"),
+                    height: dim("height"),
+                    name: options
+                        .and_then(|o| o.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    preserve_aspect_ratio: options
+                        .and_then(|o| o.get("preserveAspectRatio"))
+                        .and_then(|v| v.as_bool()),
+                    inline: options
+                        .and_then(|o| o.get("inline"))
+                        .and_then(|v| v.as_bool()),
+                };
+                Ok(serde_json::json!({ "result": encode_iterm2(text("base64Data")?, &opts) }))
+            }
+            "calculateImageCellSize" => {
+                let image_dimensions = json_dims(&input["imageDimensions"])?;
+                let max_width = input["maxWidthCells"].as_i64().ok_or("missing maxWidthCells")?;
+                let max_height = input["maxHeightCells"].as_i64();
+                let cell_dimensions = input
+                    .get("cellDimensions")
+                    .map(json_dims)
+                    .transpose()?
+                    .map(|d| CellDimensions { width_px: d.width_px as u32, height_px: d.height_px as u32 })
+                    .unwrap_or(CellDimensions { width_px: 9, height_px: 18 });
+                let optimize = input["optimizeAspectRatio"].as_bool().unwrap_or(false);
+                let size = calculate_image_cell_size(
+                    image_dimensions,
+                    max_width,
+                    max_height,
+                    cell_dimensions,
+                    optimize,
+                );
+                Ok(serde_json::json!({ "result": { "columns": size.columns, "rows": size.rows } }))
+            }
+            "calculateImageRows" => {
+                let image_dimensions = json_dims(&input["imageDimensions"])?;
+                let target_width = input["targetWidthCells"].as_i64().ok_or("missing targetWidthCells")?;
+                let cell_dimensions = input
+                    .get("cellDimensions")
+                    .map(json_dims)
+                    .transpose()?
+                    .map(|d| CellDimensions { width_px: d.width_px as u32, height_px: d.height_px as u32 })
+                    .unwrap_or(CellDimensions { width_px: 9, height_px: 18 });
+                Ok(serde_json::json!({ "result": calculate_image_rows(image_dimensions, target_width, cell_dimensions) }))
+            }
+            "getPngDimensions" => Ok(serde_json::json!({
+                "result": json_opt_dims(get_png_dimensions(text("base64Data")?))
+            })),
+            "getGifDimensions" => Ok(serde_json::json!({
+                "result": json_opt_dims(get_gif_dimensions(text("base64Data")?))
+            })),
+            "getWebpDimensions" => Ok(serde_json::json!({
+                "result": json_opt_dims(get_webp_dimensions(text("base64Data")?))
+            })),
+            "getImageDimensions" => Ok(serde_json::json!({
+                "result": json_opt_dims(get_image_dimensions(text("base64Data")?, text("mimeType")?))
+            })),
+            "isImageLine" => Ok(serde_json::json!({ "result": terminal_image::is_image_line(text("line")?) })),
+            "renderImage" => {
+                let image_dimensions = json_dims(&input["imageDimensions"])?;
+                let options = input.get("options");
+                let opts = json_render_options(options);
+                let result = render_image(text("base64Data")?, image_dimensions, &opts);
+                Ok(serde_json::json!({ "result": json_opt_rendered(result) }))
+            }
+            "renderImageAndCrop" => {
+                let image_dimensions = json_dims(&input["imageDimensions"])?;
+                let options = input.get("options");
+                let opts = json_render_options(options);
+                let hidden_rows = input["hiddenRows"].as_i64().unwrap_or(0);
+                let visible_rows = input["visibleRows"].as_i64().unwrap_or(0);
+                let result = match render_image(text("base64Data")?, image_dimensions, &opts) {
+                    Some(result) => result,
+                    None => return Ok(serde_json::json!({ "result": null })),
+                };
+                let cropped =
+                    terminal_image::crop_kitty_image_line(&result.sequence, hidden_rows, visible_rows);
+                let placement = terminal_image::get_kitty_image_placement(&cropped);
+                let mut json = json_rendered_value(&result);
+                json["cropped"] = serde_json::json!(cropped);
+                json["placement"] = match placement {
+                    Some(placement) => serde_json::json!({
+                        "imageId": placement.image_id,
+                        "transmissionGeneration": placement.transmission_generation,
+                        "transmissionBytes": placement.transmission_bytes,
+                        "estimatedDecodedBytes": placement.estimated_decoded_bytes,
+                        "rows": placement.rows,
+                        "sequence": placement.sequence,
+                        "replacementLine": placement.replacement_line,
+                    }),
+                    None => serde_json::json!(null),
+                };
+                Ok(serde_json::json!({ "result": json }))
+            }
+            "hyperlink" => Ok(serde_json::json!({ "result": hyperlink(text("text")?, text("url")?) })),
+            "imageFallback" => {
+                let dimensions = input
+                    .get("dimensions")
+                    .filter(|v| !v.is_null())
+                    .map(json_dims)
+                    .transpose()?;
+                let filename = input["filename"].as_str().filter(|s| !s.is_empty());
+                Ok(serde_json::json!({
+                    "result": image_fallback(text("mimeType")?, dimensions, filename)
+                }))
+            }
+            _ => Err(format!("unknown tui-terminal-image fn: {fn_name}")),
+        }
+    })();
+
+    if setup_applied {
+        terminal_image::reset_capabilities_cache();
+        terminal_image::set_cell_dimensions(9, 18);
+    }
+    result
+}
+
+/// Parse `ImageDimensions` from `{ widthPx, heightPx }` JSON.
+fn json_dims(value: &Value) -> Result<pi_tui::terminal_image::ImageDimensions, String> {
+    Ok(pi_tui::terminal_image::ImageDimensions {
+        width_px: value["widthPx"].as_i64().ok_or("missing widthPx")?,
+        height_px: value["heightPx"].as_i64().ok_or("missing heightPx")?,
+    })
+}
+
+/// Serialize `Option<ImageDimensions>` — `null` when absent.
+fn json_opt_dims(dims: Option<pi_tui::terminal_image::ImageDimensions>) -> Value {
+    match dims {
+        Some(d) => serde_json::json!({ "widthPx": d.width_px, "heightPx": d.height_px }),
+        None => serde_json::json!(null),
+    }
+}
+
+/// Parse `ImageRenderOptions` from harness JSON.
+fn json_render_options(options: Option<&Value>) -> pi_tui::terminal_image::ImageRenderOptions {
+    let get = |key: &str| options.and_then(|o| o.get(key)).filter(|v| !v.is_null());
+    pi_tui::terminal_image::ImageRenderOptions {
+        max_width_cells: get("maxWidthCells").and_then(|v| v.as_i64()),
+        max_height_cells: get("maxHeightCells").and_then(|v| v.as_i64()),
+        preserve_aspect_ratio: get("preserveAspectRatio").and_then(|v| v.as_bool()),
+        image_id: get("imageId").and_then(|v| v.as_i64()),
+        move_cursor: get("moveCursor").and_then(|v| v.as_bool()),
+    }
+}
+
+/// Serialize `render_image`'s result — `imageId` is dropped when `None`
+/// (TS `undefined` keys vanish under JSON.stringify).
+fn json_rendered_value(result: &pi_tui::terminal_image::RenderedImage) -> Value {
+    let mut json = serde_json::json!({
+        "sequence": result.sequence,
+        "columns": result.columns,
+        "rows": result.rows,
+    });
+    if let Some(image_id) = result.image_id {
+        json["imageId"] = serde_json::json!(image_id);
+    }
+    json
+}
+
+/// Serialize `Option<RenderedImage>` — `null` when the protocol is absent.
+fn json_opt_rendered(result: Option<pi_tui::terminal_image::RenderedImage>) -> Value {
+    match result {
+        Some(result) => json_rendered_value(&result),
+        None => serde_json::json!(null),
+    }
+}
+
 fn run_tui_terminal_colors_harness(input: &Value) -> Result<Value, String> {
     use pi_tui::terminal_colors::{
         parse_osc_color_response, parse_terminal_color_scheme_report, OscColorTarget,
