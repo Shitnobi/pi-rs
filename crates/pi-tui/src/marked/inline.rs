@@ -784,9 +784,29 @@ impl Lexer {
             if let Some(o) = self.inline_text(&text_src) {
                 e = cut_raw(&e, &o.raw);
                 // o.raw.slice(-1) !== "_" && (r = o.raw.slice(-1))
+                // JS takes the last UTF-16 UNIT: for a token ending in an
+                // astral char that is the LONE LOW SURROGATE — unassigned
+                // (Cn), so it matches none of [\s\p{P}\p{S}] (punctSpace),
+                // [\p{L}\p{N}] (unicodeAlphaNumeric) and never equals the
+                // "*" / "_" delimiter char. Represent it with the latex
+                // low-surrogate sentinel (U+F1400..U+F17FF, category Co —
+                // also matches none of those classes) so em_strong's
+                // prevChar tests behave identically (fuzz/reg-markdown-001:
+                // TS lexes "🇺_+_" as plain text, not em).
                 let last = o.raw.chars().last();
                 if last != Some('_') {
-                    prev_char = last.map(|ch| ch.to_string()).unwrap_or_default();
+                    prev_char = match last {
+                        None => String::new(),
+                        Some(ch) => {
+                            let cp = ch as u32;
+                            if cp >= 0x10000 {
+                                let low = (0xDC00 + (cp - 0x10000) % 0x400) as u16;
+                                crate::latex::surrogate_sentinel(low).to_string()
+                            } else {
+                                ch.to_string()
+                            }
+                        }
+                    };
                 }
                 prev_captured = true;
                 // a?.type === "text" ? merge : push (no type check on o —

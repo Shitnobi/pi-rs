@@ -489,6 +489,27 @@ pub fn get_active_osc8_close(prefix: &str) -> String {
         .unwrap_or_default()
 }
 
+/// JS `ansiCode.match(/\x1b\[([\d;]*)m/)` — returns the parameter body of
+/// the FIRST embedded well-formed SGR sequence, or `None`. Unanchored
+/// search: matches can start at any `\x1b[` inside the (possibly
+/// oversized) code token.
+fn sgr_params(ansi_code: &str) -> Option<&str> {
+    let bytes = ansi_code.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = ansi_code[start..].find("\x1b[") {
+        let p = start + rel + 2;
+        let mut e = p;
+        while e < bytes.len() && (bytes[e].is_ascii_digit() || bytes[e] == b';') {
+            e += 1;
+        }
+        if bytes.get(e) == Some(&b'm') {
+            return Some(&ansi_code[p..e]);
+        }
+        start = start + rel + 1;
+    }
+    None
+}
+
 // --- ANSI SGR tracker -------------------------------------------------------------
 
 /// Port of `AnsiCodeTracker` — tracks active SGR codes (and the OSC 8
@@ -527,14 +548,18 @@ impl AnsiCodeTracker {
             return;
         }
 
-        // /\x1b\[([\d;]*)m/ — the parameter body must be digits/semicolons.
-        let Some(body) = ansi_code.strip_prefix("\x1b[").and_then(|b| b.strip_suffix('m')) else {
+        // JS `ansiCode.match(/\x1b\[([\d;]*)m/)` — an UNANCHORED regex
+        // SEARCH. `ansi_code_length`'s CSI scan swallows everything up to
+        // the first m/G/K/H/J, so a single "code" token can span visible
+        // text and later escape sequences (e.g. "\x1b[?2026h…\x1b[1;38;2;10;20;30m"
+        // — fuzz/reg-unicode-004..013). The JS regex still finds the
+        // embedded well-formed SGR; an anchored prefix/suffix strip would
+        // reject the whole token and drop the state update. Greedy [\d;]*
+        // followed by 'm' = maximal digit/; run terminated by 'm'; the
+        // first such position wins.
+        let Some(params) = sgr_params(ansi_code) else {
             return;
         };
-        if !body.bytes().all(|b| b.is_ascii_digit() || b == b';') {
-            return;
-        }
-        let params = body;
 
         if params.is_empty() || params == "0" {
             // Full reset
@@ -777,15 +802,31 @@ pub fn get_grapheme_cell_range(line: &str, column: usize) -> Option<GraphemeCell
 
 /// `/^\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)$/` — the URL of an OSC 8
 /// open sequence, or `None` for non-opens / empty URLs.
-fn osc8_open_url(code: &str) -> Option<String> {
-    let body = code.strip_prefix("\x1b]8;")?;
-    let terminator = if code.ends_with('\x07') { "\x07" } else { "\x1b\\" };
-    let body = body.strip_suffix(terminator)?;
+/// JS `/^\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)$/.exec(ansi.code)` in
+/// `getOsc8LinkAtColumn` — three-valued like the JS usage:
+/// - `None` = NO match (non-OSC-8 code, or malformed) — the caller leaves
+///   `activeUrl` UNCHANGED;
+/// - `Some(None)` = matched with an EMPTY url (the close sequence
+///   `\x1b]8;;\x1b\\`) — `hyperlink[1] || undefined` CLEARS the active link
+///   (fuzz/reg-unicode-012);
+/// - `Some(Some(url))` = matched with a url.
+fn osc8_regex_exec(code: &str) -> Option<Option<String>> {
+    let stripped = code.strip_prefix("\x1b]8;")?;
+    // (?:\x07|\x1b\\)$ — the terminator is whatever ends the code.
+    let body = match stripped.strip_suffix("\x1b\\") {
+        Some(b) => b,
+        None => stripped.strip_suffix('\x07')?,
+    };
+    // [^;]* ; ([^\x07\x1b]*) — params cannot contain ';', so the split is
+    // at the FIRST ';' (any earlier cut is followed by a non-';' char).
     let (_params, url) = body.split_once(';')?;
+    if url.contains('\x07') || url.contains('\x1b') {
+        return None;
+    }
     if url.is_empty() {
-        None
+        Some(None)
     } else {
-        Some(url.to_string())
+        Some(Some(url.to_string()))
     }
 }
 
@@ -796,8 +837,8 @@ pub fn get_osc8_link_at_column(line: &str, column: usize) -> Option<String> {
     let mut i = 0usize;
     while i < line.len() {
         if let Some(code) = extract_ansi_code(line, i) {
-            if let Some(url) = osc8_open_url(code) {
-                active_url = Some(url);
+            if let Some(matched) = osc8_regex_exec(code) {
+                active_url = matched;
             }
             i += code.len();
             continue;

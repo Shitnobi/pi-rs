@@ -180,14 +180,15 @@ Remaining, roughly in dependency order:
 | G8 | async | `NestedToolCallRunner` (drives the agent tool pipeline) and `file-mutation-queue.ts` (global registration queue + per-realpath mutation queues) need an async runtime and the agent session layer; deferred with the agent-loop tranche. `NestedCallRecorder` — the persisted half — is ported | 3+ |
 ## Parity suite status
 
-- 1204/1204 cases pass (stable across repeated runs; includes the built-in
+- 1218/1218 cases pass (stable across repeated runs; includes the built-in
   tools, core-runtime modules, and the TUI groups: `tui-utils`,
   `tui-colors`, `math`, `tui-word-navigation`, `tui-keys`,
   `tui-stdin-buffer`, `tui-components`, `tui-editor`, `tui-main`,
   `tui-alt`, `tui-terminal-colors`, `tui-terminal-image`,
   `tui-markdown-lex`, `tui-latex`, `tui-markdown-render`; 79 astral/
   surrogate regression cases added by the T6 redteam — see
-  docs/report-t6-R1.md and docs/report-t6-R2.md)
+  docs/report-t6-R1.md and docs/report-t6-R2.md — plus 14 fuzz
+  regressions auto-written by the T7 batter — see the T7 section)
 - 1307 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
   plus fuzz corpora: ansi 2010 cases, decoder 800 cases, pi-photon
   byte-parity, segmenter corpus 1208 cases)
@@ -198,6 +199,17 @@ Remaining, roughly in dependency order:
 
 ## Changelog
 
+- T7 complete: differential fuzz batter (parity/fuzz/ — seeded JS
+  generators, batched both-harness execution with crash fallback, ddmin
+  shrinker, auto-written permanent regressions aggregated into the main
+  parity suite). First runs found 5 divergence classes (14 regressions):
+  marked prevChar UTF-16-unit semantics, the block-loop substring-clamp
+  panic, AnsiCodeTracker unanchored-SGR extraction on oversized CSI
+  tokens, OSC-8 close not clearing the active link, and a GB11
+  double-ZWJ lookback bug in the custom segmenter — all fixed. Batter
+  clean at scale (unicode 21k, keys 96k sub-cases, stdin 40k sub-cases,
+  latex 16k, markdown 16k, all 0 divergences); parity 1218/1218;
+  1307 tests; clippy 0 errors.
 - Phase 1 complete: all built-in tools ported, parity suite at 64 cases,
   flaky cases (fd `--max-results` subsets, rg multi-file ordering, bash
   pipe interleave) made deterministic/normalized.
@@ -687,3 +699,105 @@ fixed, full validation green.
 4. **Full validation green (this commit):** parity **1204/1204** (was
    1125), `cargo test --workspace` 1307 passed / 0 failed, clippy
    (pi-tui, pi-cli, --release) 0 errors.
+
+## T7 — Differential fuzz batter (COMPLETE; last updated 2026-10-18)
+
+Seeded differential fuzzing framework per docs/TUI_PORT_PLAN.md: JS-side
+generators produce argument payloads; both harnesses replay them in batch;
+divergences are ddmin-minimized and auto-written as permanent parity
+regressions.
+
+### Framework (all under parity/fuzz/)
+
+- **lib.mjs** — mulberry32 seeded PRNG (case generation is JS-only; Rust
+  just replays the emitted args — no cross-language PRNG needed),
+  unicode corpus samplers (POOLS, weighted 50% toward risky pools:
+  combining marks, ZWJ, sentinels, Cn, Hangul jamo, line/para
+  separators), ANSI-dense line sampler, byte/UTF-16-unit string
+  samplers, canonical JSON compare, batched `runBatch` (crash-hardened:
+  on a harness crash it replays one-by-one and reports the crashing case
+  as a divergence), `checkCase`, ddmin delta-debugging shrinker, and
+  `writeRegression` (auto-writes parity/regressions/reg-<target>-NNN.mjs).
+- **run-batter.mjs** — orchestrator. Targets: `unicode` (tui-utils, 13
+  fns, default 3000), `keys` (tui-keys, 1200 payloads × 40 sub-cases),
+  `stdin` (tui-stdin-buffer, 800 payloads × 25 sub-cases with
+  string/bytes/u16-unit chunks incl. lone surrogates), `latex`
+  (tui-latex, 2000), `markdown` (tui-markdown-lex, 2000). CLI:
+  `--target all|csv`, `--count`, `--seed`, `--budget` (default 900s),
+  `--no-shrink`, `--list`. Exit 1 on divergence. Seed derivation:
+  `rng(seed * 7919 + name.length * 104729 + name.charCodeAt(0))`.
+- **Batch harness modes** — `pi-cli harness tool-batch <tool> --cwd`
+  (stdin JSON array of arg objects → array of results, errors in-band)
+  and `node parity/ts-harness.js <cwd> --batch` (stdin array of
+  {tool, args}); both amortize process startup over thousands of cases.
+- **Regression aggregation** — parity/regressions/index.mjs scans
+  reg-*.mjs and flattens into the main parity suite via cases.mjs, so
+  every fuzz find becomes a permanent parity case.
+
+### Divergences found and fixed (14 permanent regressions)
+
+1. **marked prevChar UTF-16-unit semantics** (fuzz/reg-markdown-001,
+   "🇺_+_") — marked v18's emStrong gate uses `o.raw.slice(-1)`, the last
+   UTF-16 UNIT: for a token ending in an astral char that is the lone
+   LOW surrogate (unassigned Cn — matches none of punctSpace /
+   unicodeAlphaNumeric and never equals the `*`/`_` delimiter). Rust had
+   used the full char (So → \p{S} → passed the punctuation gate → wrong
+   em token). Fix: marked/inline.rs maps an astral last char to
+   `crate::latex::surrogate_sentinel(low)` (U+F1400..U+F17FF, Co — also
+   matches none of those classes).
+2. **Lexer substring-clamp panic** (fuzz/reg-markdown-002 ">*\n<",
+   reg-markdown-003 ">-\n^") — marked's blockquote tokenizer reconstructs
+   its raw from line sections and can EXCEED the source (raw ">*\n\n<"
+   from src ">*\n<" — 7 UTF-16 units from 5); the block loop advances
+   via JS `e.substring(raw.length)`, which CLAMPS out-of-range indices
+   to "" instead of throwing, while the Rust byte-slice
+   `&src[raw_len..]` panicked ("start byte index 96 is out of bounds
+   for string of length 95"). Fix: helpers.rs `js_substring_skip(src,
+   units)` skips the raw's UTF-16-unit count clamped at the end;
+   replaced at all 16 block-advance sites in lexer.rs (also switched
+   the advance amount from raw BYTES to UTF-16 units, the faithful JS
+   semantics; a unit count landing mid-astral-char rounds up to the
+   next char boundary — &str cannot hold the lone surrogate JS would
+   produce, unreachable in practice).
+3. **AnsiCodeTracker oversized-token SGR extraction** (fuzz/reg-unicode-
+   004..011, 013 — wrapTextWithAnsi / getActiveBackgroundAnsi /
+   extractSegments) — `ansiCodeLength`'s CSI scan swallows everything
+   up to the first m/G/K/H/J, so one "code" token can span visible text
+   and later escape sequences (e.g. "\x1b[?2026h…\x1b[1;38;2;10;20;30m").
+   TS extracts the params via the UNANCHORED regex
+   `ansiCode.match(/\x1b\[([\d;]*)m/)` and still finds the embedded
+   well-formed SGR; the Rust port used anchored strip_prefix/suffix,
+   which rejected the whole token and silently dropped the state update
+   (missing line prefixes / active background). Fix: utils.rs
+   `sgr_params()` — first-match search for "\x1b[" + maximal digit/;
+   run + "m".
+4. **OSC-8 close does not clear the active link** (fuzz/reg-unicode-012,
+   getOsc8LinkAtColumn) — TS's regex `/^\x1b\]8;[^;]*;([^\x07\x1b]*)
+   (?:\x07|\x1b\\)$/` MATCHES the close sequence with an empty group,
+   and `hyperlink[1] || undefined` then CLEARS activeUrl; the Rust
+   `osc8_open_url` returned None for the close and left the stale URL
+   active. Fix: utils.rs `osc8_regex_exec()` — three-valued (no-match /
+   clear / set) faithful port of the regex incl. its backtracking
+   semantics (params may not contain ';', URL may not contain BEL/ESC).
+5. **GB11 ZWJ-chain lookback** (fuzz/reg-unicode-014, getGraphemeCellRange
+   — "⌛ ZWJ ZWJ ⌚ ᆨ U+20000 U+20000 ° TAB") — the custom UAX #29 segmenter kept
+   "⌛ ZWJ ZWJ ⌚" as ONE cluster; ICU/V8 splits ["⌛ ZWJ ZWJ", "⌚"]:
+   GB11's lookbehind is ExtPict Extend* ZWJ, and a ZWJ is neither
+   Extend nor ExtPict, so a SECOND consecutive ZWJ does not qualify.
+   The state machine set `zwj_ok = extpict_run` on a ZWJ without
+   resetting `extpict_run`, letting the second ZWJ inherit the first
+   one's qualification. Fix: unicode/mod.rs resets `extpict_run` after
+   consuming a ZWJ. The 1208-case live-ICU segmenter corpus still
+   passes unchanged.
+
+### Validation (this tranche)
+
+- Batter, final binary: unicode seeds 1–5 + all-targets seeds 1–2 →
+  21,000 cases, 0 divergences; keys 96,000 sub-cases, 0 divergences;
+  stdin 40,000 sub-cases, 0 divergences; latex seeds 1–8 → 16,000
+  cases, 0 divergences; markdown seeds 1–8 → 16,000 cases, 0
+  divergences. (all-targets runs hit the 900s budget before
+  latex/markdown; those targets were run separately at 8 seeds.)
+- Full parity: **1218/1218** (1204 prior + 14 fuzz regressions).
+- `cargo test --workspace`: 1307 passed / 0 failed.
+- `cargo clippy --workspace --all-targets`: 0 errors.

@@ -1522,21 +1522,41 @@ let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (d) => (input += d));
 process.stdin.on("end", async () => {
-	const { tool, args } = JSON.parse(input);
 	const cwd = process.argv[2];
-	try {
-		const moduleResult = await runModule(tool, args, cwd);
-		if (moduleResult !== undefined) {
-			process.stdout.write(JSON.stringify(moduleResult));
-			return;
+	// --batch: stdin is a JSON array of {tool, args}; stdout is an array of
+	// per-case results (same shapes as single mode; errors in-band). Used by
+	// the parity/fuzz batter framework to amortize process startup.
+	if (process.argv.includes("--batch")) {
+		const payloads = JSON.parse(input);
+		if (!Array.isArray(payloads)) throw new Error("--batch expects a JSON array");
+		const out = [];
+		for (const { tool, args } of payloads) {
+			try {
+				out.push(await runOne(tool, args, cwd));
+			} catch (e) {
+				out.push({ error: e && e.message !== undefined ? e.message : String(e) });
+			}
 		}
-		const t = FACTORIES[tool](cwd);
-		const prepared = t.prepareArguments ? t.prepareArguments(args) : args;
-		const result = await t.execute("parity-call", prepared);
-		process.stdout.write(JSON.stringify(result));
+		process.stdout.write(JSON.stringify(out));
+		return;
+	}
+	const { tool, args } = JSON.parse(input);
+	try {
+		process.stdout.write(JSON.stringify(await runOne(tool, args, cwd)));
 	} catch (e) {
 		process.stdout.write(
 			JSON.stringify({ error: e && e.message !== undefined ? e.message : String(e) }),
 		);
 	}
 });
+
+/** Run a single {tool, args} payload (module entry first, then AgentTool). */
+async function runOne(tool, args, cwd) {
+	const moduleResult = await runModule(tool, args, cwd);
+	if (moduleResult !== undefined) {
+		return moduleResult;
+	}
+	const t = FACTORIES[tool](cwd);
+	const prepared = t.prepareArguments ? t.prepareArguments(args) : args;
+	return await t.execute("parity-call", prepared);
+}

@@ -5,7 +5,7 @@
 //! no hooks, extensions = LATEX_MARKDOWN_EXTENSIONS only (block: latexBlock,
 //! whose `start` fn is the only startBlock entry).
 
-use super::helpers::next_char_boundary;
+use super::helpers::{js_substring_skip, next_char_boundary};
 use super::{Lexer, LinkDef, TokenList};
 
 impl Lexer {
@@ -34,8 +34,8 @@ impl Lexer {
 
             // extensions.block: the latexBlock tokenizer runs FIRST.
             if let Some(tok) = self.ext_latex_block(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 target.borrow_mut().push(tok);
                 continue;
             }
@@ -43,8 +43,8 @@ impl Lexer {
             // space: a single-char (newline) match merges into the previous
             // token's raw instead of pushing a space token.
             if let Some(tok) = self.space(src) {
-                let raw_len = tok.raw.len();
-                let single = raw_len == 1;
+                let raw_units = tok.raw.encode_utf16().count();
+                let single = raw_units == 1;
                 let mut tg = target.borrow_mut();
                 if single && !tg.is_empty() {
                     // JS `o.raw += "\n"` — the raw is exactly "\n".
@@ -53,15 +53,15 @@ impl Lexer {
                     tg.push(tok);
                 }
                 drop(tg);
-                src = &src[raw_len..];
+                src = js_substring_skip(src, raw_units);
                 continue;
             }
 
             // code: paragraph/text continuation appends raw+text and
             // rewrites the LAST inline-queue entry's src.
             if let Some(tok) = self.code(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 let mut tg = target.borrow_mut();
                 let last_is_pt = tg
                     .last()
@@ -90,38 +90,38 @@ impl Lexer {
             }
 
             if let Some(tok) = self.fences(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 target.borrow_mut().push(tok);
                 continue;
             }
             if let Some(tok) = self.heading(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 target.borrow_mut().push(tok);
                 continue;
             }
             if let Some(tok) = self.hr(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 target.borrow_mut().push(tok);
                 continue;
             }
             if let Some(tok) = self.blockquote(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 target.borrow_mut().push(tok);
                 continue;
             }
             if let Some(tok) = self.list(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 target.borrow_mut().push(tok);
                 continue;
             }
             if let Some(tok) = self.html(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 target.borrow_mut().push(tok);
                 continue;
             }
@@ -129,8 +129,8 @@ impl Lexer {
             // def: continuation first; otherwise register in the links
             // registry (first definition wins) and push.
             if let Some(tok) = self.def(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 let mut tg = target.borrow_mut();
                 let last_is_pt = tg
                     .last()
@@ -165,14 +165,14 @@ impl Lexer {
             }
 
             if let Some(tok) = self.table(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 target.borrow_mut().push(tok);
                 continue;
             }
             if let Some(tok) = self.lheading(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 target.borrow_mut().push(tok);
                 continue;
             }
@@ -190,7 +190,7 @@ impl Lexer {
 
             if self.state.top {
                 if let Some(tok) = self.paragraph(i) {
-                    let raw_len = tok.raw.len();
+                    let raw_units = tok.raw.encode_utf16().count();
                     let mut tg = target.borrow_mut();
                     let last_is_paragraph =
                         tg.last().map(|o| o.r#type == "paragraph").unwrap_or(false);
@@ -218,7 +218,7 @@ impl Lexer {
                     }
                     // JS `n = i.length !== e.length` (before e advances).
                     in_cont = i.len() != src.len();
-                    src = &src[raw_len..];
+                    src = js_substring_skip(src, raw_units);
                     continue;
                 }
             }
@@ -226,8 +226,8 @@ impl Lexer {
             // text: merge into a previous text token (popping this token's
             // queue entry and rewriting the previous one).
             if let Some(tok) = self.text(src) {
-                let raw_len = tok.raw.len();
-                src = &src[raw_len..];
+                let raw_units = tok.raw.encode_utf16().count();
+                src = js_substring_skip(src, raw_units);
                 let mut tg = target.borrow_mut();
                 let last_is_text = tg.last().map(|o| o.r#type == "text").unwrap_or(false);
                 if last_is_text {

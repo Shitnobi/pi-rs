@@ -69,6 +69,7 @@ import { terminalImageCases } from "./waved/terminal-image-cases.mjs";
 import { markdownLexCases } from "./waved/markdown-lex-cases.mjs";
 import { latexCases } from "./waved/latex-cases.mjs";
 import { markdownRenderCases } from "./waved/markdown-render-cases.mjs";
+import { regressionCases } from "./regressions/index.mjs";
 
 export const cases = [
 	// ---------------------------------------------------------------- read
@@ -4804,6 +4805,7 @@ export const cases = [
 	...markdownLexCases,
 	...latexCases,
 	...markdownRenderCases,
+	...regressionCases,
 ];
 
 // tui-components sub-case builders (hoisted; used by the cases above).

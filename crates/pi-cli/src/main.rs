@@ -87,6 +87,12 @@ fn run_harness(args: &[String]) -> Result<Value, String> {
 
     match mode.as_str() {
         "tool" => run_tool(&name, &cwd),
+        // Fuzz-batter batch mode: stdin is a JSON ARRAY of argument objects
+        // for the SAME tool; stdout is an array of per-case results, each
+        // exactly the shape the single-case `tool` mode emits (errors are
+        // in-band {"error": ...}). Lets the batter framework amortize
+        // process startup over thousands of cases.
+        "tool-batch" => run_tool_batch(&name, &cwd),
         "pure" => run_pure(&name, &cwd),
         _ => Err(format!("unknown harness mode: {}", mode)),
     }
@@ -94,6 +100,28 @@ fn run_harness(args: &[String]) -> Result<Value, String> {
 
 fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
     let input = read_stdin_json()?;
+    run_tool_input(name, cwd, input)
+}
+
+/// Batch entry used by parity/fuzz (see run-batter.mjs). Input: JSON array
+/// of argument objects; output: array of per-case results.
+fn run_tool_batch(name: &str, cwd: &str) -> Result<Value, String> {
+    let input = read_stdin_json()?;
+    let items = input
+        .as_array()
+        .ok_or("tool-batch input must be a JSON array of argument objects")?;
+    let mut results = Vec::with_capacity(items.len());
+    for item in items {
+        let value = match run_tool_input(name, cwd, item.clone()) {
+            Ok(value) => value,
+            Err(message) => serde_json::json!({ "error": message }),
+        };
+        results.push(value);
+    }
+    Ok(Value::Array(results))
+}
+
+fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> {
     // Module-level harness entries (not AgentTools): the bash executor and
     // the output accumulator, driven directly.
     match name {

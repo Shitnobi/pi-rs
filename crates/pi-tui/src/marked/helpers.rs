@@ -29,6 +29,29 @@ pub(crate) fn next_char_boundary(text: &str, pos: usize) -> usize {
     i
 }
 
+/// JS `e = e.substring(raw.length)` — the block-loop advance by the token
+/// raw's UTF-16 unit count. marked does NOT guarantee the reconstructed
+/// raw is a prefix of the source: the blockquote tokenizer reassembles its
+/// raw from line sections and can EXCEED the source (e.g. raw ">*\n\n<"
+/// from src ">*\n<" — fuzz/reg-markdown-002 / reg-markdown-003). JS
+/// `String.prototype.substring` clamps out-of-range indices and returns ""
+/// instead of throwing; the previous byte-slice `&src[raw_len..]` panicked.
+/// Skip exactly `units` UTF-16 code units from the start of `src`, clamped
+/// at the end (a raw longer than the source consumes everything). A unit
+/// count landing mid-astral-char (JS can split surrogate pairs, yielding a
+/// lone surrogate) rounds up to the next char boundary — &str cannot hold
+/// lone surrogates, and the parity corpus never reaches that case.
+pub(crate) fn js_substring_skip(src: &str, units: usize) -> &str {
+    let mut skipped = 0usize;
+    for (off, ch) in src.char_indices() {
+        if skipped >= units {
+            return &src[off..];
+        }
+        skipped += ch.len_utf16();
+    }
+    ""
+}
+
 /// JS `text.replace(/.../g, f)` — replaces every match; after an empty match
 /// the scan advances one char (JS semantics).
 pub(crate) fn js_replace<F: FnMut(&StrCaptures<'_>) -> String>(

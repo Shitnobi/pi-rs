@@ -315,6 +315,13 @@ pub fn grapheme_segments(s: &str) -> Vec<&str> {
             }
             Gcb::Zwj => {
                 zwj_ok = extpict_run;
+                // A ZWJ is neither Extend nor ExtPict: the GB11 lookback
+                // (ExtPict Extend* ZWJ) is broken for a FOLLOWING ZWJ, so
+                // "⌛ ZWJ ZWJ ⌚" must split as ["⌛ ZWJ ZWJ", "⌚"] like ICU
+                // (fuzz/reg-unicode-014). Without this reset the second ZWJ
+                // inherited the first one's qualification and joined the
+                // pictographic that follows.
+                extpict_run = false;
             }
             _ => {
                 extpict_run = false;
