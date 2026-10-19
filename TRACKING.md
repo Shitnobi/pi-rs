@@ -933,7 +933,11 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       auth/composer (auth_storage, provider_composer, remote_catalog) → facades
       (model_runtime, model_registry) — each wave parity-green via new module-level
       harness entries, then batter targets + regressions.
-- [ ] MCP pure-logic tranche: `pi-core/src/mcp_servers.rs`, `mcp_tools.rs`,
-      `tool_search.rs`.
+- [x] MCP pure-logic tranche: `pi-core/src/mcp_servers.rs`, `mcp_tools.rs`,
+      `tool_search.rs`. All pi-core tests green, clippy clean, parity green
+      (21 `mcp-*` + 5 `tool-search` cases + V8-vs-libm log divergence vectors
+      in `math/basic`). Implementation notes: `docs/plans/impl-notes-mcp-pure.md`
+      (fdlibm `js_math_log` port, protocol-violation V8 error parity, WHATWG
+      URL subset deviations, fake-saver harness design).
 - [ ] CLI Stage A: `pi-cli/src/config.rs`, `migrations.rs`, `cli/args.rs`.
 - [ ] Agent-session tranches (tokio, per plan §5.5).

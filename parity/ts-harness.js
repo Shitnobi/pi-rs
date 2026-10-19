@@ -15,6 +15,10 @@
  * - "bash-executor": executeBashWithOperations with local shell operations
  * - "output-accumulator": OutputAccumulator append/finish/snapshot/...
  * - "messages": core/messages.js pure functions
+ * - "mcp-servers": core/mcp-servers.js pure functions
+ * - "mcp-tools": extensions/mcp/tools.js pure conversion functions (the
+ *   output saver is a deterministic fake on both sides)
+ * - "tool-search": extensions/tool-search/tool.ts tokenizer/document/ranker
  */
 const path = require("path");
 const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
@@ -1521,6 +1525,106 @@ async function runModule(tool, args, cwd) {
 				return msgs.createCustomMessage(args.customType, args.content, args.display, args.details, args.timestamp);
 			default:
 				throw new Error("unknown messages fn: " + args.fn);
+		}
+	}
+	if (tool === "mcp-servers") {
+		const mcps = require(path.join(distDir, "core", "mcp-servers.js"));
+		switch (args.fn) {
+			case "createToolNameMatcher": {
+				const matcher = mcps.createToolNameMatcher(args.entries);
+				return { matches: (args.names || []).map((name) => matcher(name)) };
+			}
+			case "isMcpToolName":
+				return { results: args.names.map((name) => mcps.isMcpToolName(name)) };
+			case "mcpNamespace":
+				return { namespaces: args.servers.map((server) => mcps.mcpNamespace(server)) };
+			case "validateMcpServerConfig": {
+				const result = mcps.validateMcpServerConfig(args.name, args.raw);
+				return { result: typeof result === "string" ? { error: result } : result };
+			}
+			case "getMcpToolExposure": {
+				const config = mcps.validateMcpServerConfig(args.name, args.raw);
+				if (typeof config === "string") throw new Error(config);
+				return { exposures: args.toolNames.map((name) => mcps.getMcpToolExposure(config, name)) };
+			}
+			case "isLoopbackRedirectUri":
+				return { results: args.values.map((value) => mcps.isLoopbackRedirectUri(value)) };
+			case "parseUrl": {
+				// WHATWG `new URL()`, the spec the Rust hand-rolled parser
+				// mirrors for the inputs this module sees.
+				const results = args.inputs.map((input) => {
+					try {
+						const url = new URL(input);
+						return {
+							protocol: url.protocol,
+							hostname: url.hostname,
+							port: url.port,
+							pathname: url.pathname,
+							search: url.search,
+							hash: url.hash,
+						};
+					} catch {
+						return null;
+					}
+				});
+				return { results };
+			}
+			default:
+				throw new Error("unknown mcp-servers fn: " + args.fn);
+		}
+	}
+	if (tool === "mcp-tools") {
+		const mt = require(path.join(distDir, "extensions", "mcp", "tools.js"));
+		// Deterministic fake output saver, mirrored by the Rust harness.
+		const fakeSaver = async (_data, extension) => "/tmp/pi-mcp-out" + extension;
+		switch (args.fn) {
+			case "createMcpToolName":
+				return {
+					results: args.calls.map(({ server, tool, taken }) =>
+						mt.createMcpToolName(server, tool, (name) => (taken || []).includes(name)),
+					),
+				};
+			case "createMcpResultSchema":
+				return { schema: mt.createMcpResultSchema(args.structuredContentSchema) };
+			case "toToolExposure":
+				return { results: args.exposures.map((exposure) => mt.toToolExposure(exposure)) };
+			case "toModelContent": {
+				const content = await mt.toModelContent(args.server, args.blocks, {
+					saveOutput: fakeSaver,
+					readableResources: args.readableResources,
+				});
+				return { content };
+			}
+			case "convertMcpResult": {
+				const result = await mt.convertMcpResult(args.server, args.tool, args.result, {
+					saveOutput: fakeSaver,
+					readableResources: args.readableResources,
+				});
+				return result;
+			}
+			case "limitMcpContent": {
+				const { content, fullOutputPath } = await mt.limitMcpContent(args.content, fakeSaver);
+				return { content, ...(fullOutputPath ? { fullOutputPath } : {}) };
+			}
+			default:
+				throw new Error("unknown mcp-tools fn: " + args.fn);
+		}
+	}
+	if (tool === "tool-search") {
+		const tsm = require(path.join(distDir, "extensions", "tool-search", "tool.js"));
+		switch (args.fn) {
+			case "tokenize":
+				return { tokens: args.texts.map((text) => tsm.tokenize(text)) };
+			case "createToolSearchDocument": {
+				const document = tsm.createToolSearchDocument(args.tool, args.namespace);
+				return { name: document.name, text: document.text };
+			}
+			case "rank": {
+				const ranker = new tsm.Bm25Ranker({ k1: args.k1, b: args.b });
+				return { matches: ranker.rank(args.query, args.documents, args.limit) };
+			}
+			default:
+				throw new Error("unknown tool-search fn: " + args.fn);
 		}
 	}
 	return undefined;

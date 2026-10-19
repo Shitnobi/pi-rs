@@ -187,6 +187,9 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "tui-main" => return run_tui_screen_harness(&input, false),
         "tui-alt" => return run_tui_screen_harness(&input, true),
         "math" => return run_math_harness(&input),
+        "mcp-servers" => return run_mcp_servers_harness(&input),
+        "mcp-tools" => return run_mcp_tools_harness(&input),
+        "tool-search" => return run_tool_search_harness(&input),
         _ => {}
     }
     let result: Result<pi_tools::ToolOutput, String> = match name {
@@ -822,6 +825,275 @@ fn run_tui_colors_harness(input: &Value) -> Result<Value, String> {
     }
 }
 
+/// Module harness for `pi_core::mcp_servers` (TS: `core/mcp-servers.ts`).
+fn run_mcp_servers_harness(input: &Value) -> Result<Value, String> {
+    use pi_core::mcp_servers as ms;
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    let str_list = |key: &str| -> Result<Vec<String>, String> {
+        input[key]
+            .as_array()
+            .ok_or_else(|| format!("missing {}", key))?
+            .iter()
+            .map(|v| v.as_str().map(str::to_string).ok_or_else(|| format!("non-string in {}", key)))
+            .collect()
+    };
+    match fn_name {
+        "createToolNameMatcher" => {
+            let entries = str_list("entries")?;
+            let matcher = ms::create_tool_name_matcher(&entries);
+            let names = str_list("names")?;
+            Ok(serde_json::json!({
+                "matches": names.iter().map(|n| matcher.matches(n)).collect::<Vec<bool>>(),
+            }))
+        }
+        "isMcpToolName" => {
+            let names = str_list("names")?;
+            Ok(serde_json::json!({
+                "results": names.iter().map(|n| ms::is_mcp_tool_name(n)).collect::<Vec<bool>>(),
+            }))
+        }
+        "mcpNamespace" => {
+            let servers = str_list("servers")?;
+            Ok(serde_json::json!({
+                "namespaces": servers.iter().map(|s| ms::mcp_namespace(s)).collect::<Vec<String>>(),
+            }))
+        }
+        "validateMcpServerConfig" => {
+            let name = input["name"].as_str().ok_or("missing name")?;
+            let raw = input.get("raw").cloned().unwrap_or(Value::Null);
+            match ms::validate_mcp_server_config(name, &raw) {
+                Ok(config) => Ok(serde_json::json!({
+                    "result": serde_json::to_value(&config).map_err(|e| e.to_string())?,
+                })),
+                Err(error) => Ok(serde_json::json!({ "result": { "error": error } })),
+            }
+        }
+        "getMcpToolExposure" => {
+            let name = input["name"].as_str().ok_or("missing name")?;
+            let raw = input.get("raw").cloned().unwrap_or(Value::Null);
+            let config = ms::validate_mcp_server_config(name, &raw)?;
+            let tool_names = str_list("toolNames")?;
+            let exposures = tool_names
+                .iter()
+                .map(|n| serde_json::to_value(ms::get_mcp_tool_exposure(&config, n)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "exposures": exposures }))
+        }
+        "isLoopbackRedirectUri" => {
+            let values = str_list("values")?;
+            Ok(serde_json::json!({
+                "results": values.iter().map(|v| ms::is_loopback_redirect_uri(v)).collect::<Vec<bool>>(),
+            }))
+        }
+        "parseUrl" => {
+            let inputs = str_list("inputs")?;
+            let results = inputs
+                .iter()
+                .map(|input| match ms::parse_url(input) {
+                    Some(url) => serde_json::json!({
+                        "protocol": url.protocol,
+                        "hostname": url.hostname,
+                        "port": url.port,
+                        "pathname": url.pathname,
+                        "search": url.search,
+                        "hash": url.hash,
+                    }),
+                    None => Value::Null,
+                })
+                .collect::<Vec<_>>();
+            Ok(serde_json::json!({ "results": results }))
+        }
+        _ => Err(format!("unknown mcp-servers fn: {fn_name}")),
+    }
+}
+
+/// Module harness for `pi_core::mcp_tools` (TS: `extensions/mcp/tools.ts`).
+/// The output saver is a deterministic fake on both sides
+/// (`async (_, ext) => "/tmp/pi-mcp-out" + ext`), so truncated-output and
+/// binary-resource cases compare without temp-file normalization.
+fn run_mcp_tools_harness(input: &Value) -> Result<Value, String> {
+    use pi_core::mcp_tools as mt;
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    let fake_saver = |_data: mt::OutputData, extension: &str| -> Result<String, String> {
+        Ok(format!("/tmp/pi-mcp-out{}", extension))
+    };
+    match fn_name {
+        "createMcpToolName" => {
+            let calls = input["calls"].as_array().ok_or("missing calls")?;
+            let mut results = Vec::with_capacity(calls.len());
+            for call in calls {
+                let server = call["server"].as_str().ok_or("missing server")?;
+                let tool = call["tool"].as_str().ok_or("missing tool")?;
+                let taken: Vec<String> = call["taken"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                results.push(mt::create_mcp_tool_name(server, tool, |name| taken.iter().any(|t| t == name)));
+            }
+            Ok(serde_json::json!({ "results": results }))
+        }
+        "createMcpResultSchema" => {
+            let schema = mt::create_mcp_result_schema(input.get("structuredContentSchema"));
+            Ok(serde_json::json!({ "schema": schema }))
+        }
+        "toToolExposure" => {
+            let exposures: Vec<String> = input["exposures"]
+                .as_array()
+                .ok_or("missing exposures")?
+                .iter()
+                .map(|v| v.as_str().map(str::to_string).ok_or("non-string exposure"))
+                .collect::<Result<_, _>>()?;
+            let results = exposures
+                .iter()
+                .map(|e| {
+                    let exposure = pi_core::mcp_servers::McpExposure::parse(e)
+                        .ok_or_else(|| format!("unknown exposure: {}", e))?;
+                    serde_json::to_value(mt::to_tool_exposure(exposure)).map_err(|err| err.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(serde_json::json!({ "results": results }))
+        }
+        "toModelContent" => {
+            let server = input["server"].as_str().ok_or("missing server")?;
+            let blocks = parse_content_blocks(input)?;
+            let options = mt::ConvertMcpResultOptions {
+                save_output: &fake_saver,
+                readable_resources: input["readableResources"].as_bool().unwrap_or(false),
+            };
+            let content = mt::to_model_content(server, &blocks, &options);
+            let content = content
+                .iter()
+                .map(|c| serde_json::to_value(c))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({ "content": content }))
+        }
+        "convertMcpResult" => {
+            let server = input["server"].as_str().ok_or("missing server")?;
+            let tool = input["tool"].as_str().ok_or("missing tool")?;
+            let result = parse_call_tool_result(input)?;
+            let options = mt::ConvertMcpResultOptions {
+                save_output: &fake_saver,
+                readable_resources: input["readableResources"].as_bool().unwrap_or(false),
+            };
+            let converted = mt::convert_mcp_result(server, tool, &result, &options)?;
+            Ok(serde_json::to_value(&converted).map_err(|e| e.to_string())?)
+        }
+        "limitMcpContent" => {
+            let content = parse_llm_content(input)?;
+            let limited = mt::limit_mcp_content(&content, &fake_saver);
+            let content = limited
+                .content
+                .iter()
+                .map(|c| serde_json::to_value(c))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            let mut out = serde_json::json!({ "content": content });
+            if let Some(path) = limited.full_output_path {
+                out["fullOutputPath"] = Value::String(path);
+            }
+            Ok(out)
+        }
+        _ => Err(format!("unknown mcp-tools fn: {fn_name}")),
+    }
+}
+
+fn parse_content_blocks(input: &Value) -> Result<Vec<pi_core::mcp_tools::ContentBlock>, String> {
+    let blocks = input["blocks"].as_array().ok_or("missing blocks")?;
+    blocks
+        .iter()
+        .map(|b| {
+            b.as_object()
+                .cloned()
+                .map(pi_core::mcp_tools::ContentBlock::from)
+                .ok_or_else(|| "non-object block".to_string())
+        })
+        .collect()
+}
+
+fn parse_call_tool_result(input: &Value) -> Result<pi_core::mcp_tools::CallToolResult, String> {
+    input["result"]
+        .as_object()
+        .cloned()
+        .map(pi_core::mcp_tools::CallToolResult::from)
+        .ok_or_else(|| "missing result object".to_string())
+}
+
+fn parse_llm_content(input: &Value) -> Result<Vec<pi_core::mcp_tools::LlmContent>, String> {
+    let content = input["content"].as_array().ok_or("missing content")?;
+    content
+        .iter()
+        .map(|c| serde_json::from_value::<pi_core::messages::TextOrImage>(c.clone()).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Module harness for `pi_core::tool_search`
+/// (TS: `extensions/tool-search/tool.ts`).
+fn run_tool_search_harness(input: &Value) -> Result<Value, String> {
+    use pi_core::tool_search as tsm;
+    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
+    match fn_name {
+        "tokenize" => {
+            let texts: Vec<String> = input["texts"]
+                .as_array()
+                .ok_or("missing texts")?
+                .iter()
+                .map(|v| v.as_str().map(str::to_string).ok_or("non-string text"))
+                .collect::<Result<_, _>>()?;
+            Ok(serde_json::json!({
+                "tokens": texts.iter().map(|t| tsm::tokenize(t)).collect::<Vec<_>>(),
+            }))
+        }
+        "createToolSearchDocument" => {
+            let tool = input["tool"].as_object().ok_or("missing tool")?;
+            let tool = tsm::ToolInfo {
+                name: tool.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                description: tool
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                parameters: tool.get("parameters").cloned().unwrap_or(Value::Null),
+            };
+            let namespace = input.get("namespace").map(|ns| tsm::ToolNamespace {
+                name: ns.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                description: ns.get("description").and_then(|v| v.as_str()).map(str::to_string),
+                instructions: ns.get("instructions").and_then(|v| v.as_str()).map(str::to_string),
+            });
+            let document = tsm::create_tool_search_document(&tool, namespace.as_ref());
+            Ok(serde_json::json!({ "name": document.name, "text": document.text }))
+        }
+        "rank" => {
+            let query = input["query"].as_str().ok_or("missing query")?;
+            let documents: Vec<tsm::ToolSearchDocument> = input["documents"]
+                .as_array()
+                .ok_or("missing documents")?
+                .iter()
+                .map(|d| {
+                    tsm::ToolSearchDocument {
+                        name: d.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        text: d.get("text").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    }
+                })
+                .collect();
+            let limit = input["limit"].as_u64().ok_or("missing limit")? as usize;
+            let ranker = match (input.get("k1"), input.get("b")) {
+                (Some(k1), Some(b)) => tsm::Bm25Ranker::with_params(k1.as_f64().unwrap(), b.as_f64().unwrap()),
+                _ => tsm::Bm25Ranker::new(),
+            };
+            let matches = ranker.rank(query, &documents, limit);
+            Ok(serde_json::json!({
+                "matches": matches
+                    .iter()
+                    .map(|m| serde_json::json!({ "name": m.name, "score": m.score }))
+                    .collect::<Vec<_>>(),
+            }))
+        }
+        _ => Err(format!("unknown tool-search fn: {fn_name}")),
+    }
+}
+
 /// `math` entry: batch bit-level evaluation of `Math.*` functions for
 /// differential float testing. Input: { ops: [{ fn, args: [..] }] }.
 /// Output: { results: ["<16 hex chars of f64 bits>", ...] }.
@@ -848,7 +1120,9 @@ fn run_math_harness(input: &Value) -> Result<Value, String> {
             ("sqrt", [x]) => x.sqrt(),
             ("exp", [x]) => x.exp(),
             ("pow", [x, y]) => x.powf(*y),
-            ("log", [x]) => x.ln(),
+            // V8's Math.log is its fdlibm port, which differs from the
+            // system libm's ln for ~0.7% of inputs by 1 ulp.
+            ("log", [x]) => pi_core::js_math::js_math_log(*x),
             ("atan", [x]) => x.atan(),
             _ => return Err(format!("unknown math fn: {}", fn_name)),
         };

@@ -3290,6 +3290,19 @@ export const cases = [
 				{ fn: "sqrt", args: [2] },
 				{ fn: "pow", args: [0.5, 1 / 2.4] },
 				{ fn: "pow", args: [0.5, 2.4] },
+				// Math.log: V8's fdlibm port differs from the system libm's
+				// ln for ~0.7% of inputs by exactly 1 ulp — these values are
+				// known divergence vectors (js_math::js_math_log).
+				{ fn: "log", args: [1.6] },
+				{ fn: "log", args: [1 + (3 - 1 + 0.5) / (1 + 0.5)] },
+				{ fn: "log", args: [3] },
+				{ fn: "log", args: [10] },
+				{ fn: "log", args: [0.5] },
+				{ fn: "log", args: [5e-324] },
+				{ fn: "log", args: [2.2250738585072014e-308] },
+				{ fn: "log", args: [Math.pow(2, -1023) * 1.5] },
+				{ fn: "log", args: [1.0000000000000002] },
+				{ fn: "log", args: [0.9999999999999999] },
 			],
 		},
 	},
@@ -4806,6 +4819,369 @@ export const cases = [
 	...latexCases,
 	...markdownRenderCases,
 	...regressionCases,
+
+	// ------------------------------------------------- mcp-servers (module)
+	// core/mcp-servers.ts: tool name matching, config validation, exposure
+	// resolution, loopback redirect URIs, and the WHATWG URL subset.
+	{
+		name: "mcp-servers/tool-name-matcher",
+		tool: "mcp-servers",
+		args: {
+			fn: "createToolNameMatcher",
+			entries: ["read_file", "b*", "*a", "x*y*z", "a*b", "mcp__srv__*"],
+			names: [
+				"read_file",
+				"read_files",
+				"bcd",
+				"abc",
+				"ba",
+				"xb",
+				"xbycz",
+				"xcyz",
+				"ab",
+				"axb",
+				"a\nb",
+				"mcp__srv__tool",
+				"",
+			],
+		},
+	},
+	{
+		name: "mcp-servers/namespace-and-name-checks",
+		tool: "mcp-servers",
+		args: {
+			fn: "mcpNamespace",
+			servers: ["github", "my-server", "server.with.dots", "SERVER", "a b"],
+		},
+	},
+	{
+		name: "mcp-servers/validate-stdio",
+		tool: "mcp-servers",
+		args: {
+			fn: "validateMcpServerConfig",
+			name: "std",
+			raw: {
+				command: "node",
+				args: ["server.js"],
+				env: { A: "1" },
+				exposure: "deferred",
+				toolExposure: { "read_*": "direct", write_tool: "hidden" },
+			},
+		},
+	},
+	{
+		name: "mcp-servers/validate-http",
+		tool: "mcp-servers",
+		args: {
+			fn: "validateMcpServerConfig",
+			name: "web",
+			raw: {
+				url: "https://example.com/mcp",
+				exposure: "mcp",
+				oauth: { clientId: "cid", scopes: "read write", redirectUri: "http://localhost:8931/callback" },
+			},
+		},
+	},
+	{
+		name: "mcp-servers/validate-errors",
+		tool: "mcp-servers",
+		args: {
+			fn: "validateMcpServerConfig",
+			name: "bad",
+			raw: { command: "node", exposure: "mcp" },
+		},
+	},
+	{
+		name: "mcp-servers/validate-missing-transport",
+		tool: "mcp-servers",
+		args: {
+			fn: "validateMcpServerConfig",
+			name: "bad",
+			raw: { type: "stdio" },
+		},
+	},
+	{
+		name: "mcp-servers/validate-bad-tool-exposure",
+		tool: "mcp-servers",
+		args: {
+			fn: "validateMcpServerConfig",
+			name: "bad",
+			raw: { command: "node", toolExposure: { "read_*": "direct", "(": "hidden" } },
+		},
+	},
+	{
+		name: "mcp-servers/tool-exposure",
+		tool: "mcp-servers",
+		args: {
+			fn: "getMcpToolExposure",
+			name: "srv",
+			raw: {
+				command: "node",
+				exposure: "codemode",
+				toolExposure: { "read_*": "direct", write_tool: "hidden", "*_file": "deferred", bad: "direct" },
+			},
+			toolNames: ["read_file", "write_tool", "some_file", "other", "readme"],
+		},
+	},
+	{
+		name: "mcp-servers/loopback-redirect-uri",
+		tool: "mcp-servers",
+		args: {
+			fn: "isLoopbackRedirectUri",
+			values: [
+				"http://localhost:8931/callback",
+				"http://127.0.0.1:80/cb",
+				"http://[::1]:3000/cb",
+				"https://localhost:8931/cb",
+				"http://example.com/cb",
+				"ui://localhost/cb",
+				"http://localhost:8931",
+				"not a url",
+				"",
+			],
+		},
+	},
+	{
+		name: "mcp-servers/parse-url",
+		tool: "mcp-servers",
+		args: {
+			fn: "parseUrl",
+			inputs: [
+				"http://x:8080/p?q=1#f",
+				"https://EXAMPLE.com/a/b",
+				"ui://a/b.txt",
+				"http://[::1]:3000/x",
+				"http:example.com",
+				"http:///path",
+				"HTTP://x",
+				"http://user:pw@host:99/p",
+				"http://x:99999/p",
+				"http://x:nope/p",
+				"noscheme",
+				"  http://x  ",
+				"http://x\t/y",
+			],
+		},
+	},
+
+	// ---------------------------------------------------- mcp-tools (module)
+	// extensions/mcp/tools.ts: tool names, result schemas, content conversion.
+	{
+		name: "mcp-tools/tool-names",
+		tool: "mcp-tools",
+		args: {
+			fn: "createMcpToolName",
+			calls: [
+				{ server: "srv", tool: "read_file" },
+				{ server: "my-server", tool: "read file" },
+				{ server: "srv", tool: "a-b" },
+				{ server: "srv", tool: "a_b" },
+				{ server: "srv", tool: "ünïcödé" },
+				{ server: "srv", tool: "𝄞-sharp" },
+				{ server: "srv", tool: "x".repeat(80) },
+				{ server: "s", tool: "t", taken: ["mcp__s__t"] },
+				{ server: "srv", tool: "y".repeat(80), taken: [] },
+			],
+		},
+	},
+	{
+		name: "mcp-tools/result-schema",
+		tool: "mcp-tools",
+		args: {
+			fn: "createMcpResultSchema",
+			structuredContentSchema: {
+				type: "object",
+				properties: { a: { $ref: "#/$defs/X" }, b: { enum: ["#/$defs/X"] } },
+				$defs: { X: { type: "string" } },
+				anyOf: [{ $ref: "#" }],
+			},
+		},
+	},
+	{
+		name: "mcp-tools/result-schema-undefined",
+		tool: "mcp-tools",
+		args: { fn: "createMcpResultSchema" },
+	},
+	{
+		name: "mcp-tools/to-tool-exposure",
+		tool: "mcp-tools",
+		args: { fn: "toToolExposure", exposures: ["codemode", "deferred", "direct", "hidden"] },
+	},
+	{
+		name: "mcp-tools/to-model-content",
+		tool: "mcp-tools",
+		args: {
+			fn: "toModelContent",
+			server: "srv",
+			readableResources: true,
+			blocks: [
+				{ type: "text", text: "hello" },
+				{ type: "image", data: "AAAA", mimeType: "image/png" },
+				{ type: "audio", data: "AAAA", mimeType: "audio/wav" },
+				{
+					type: "resource_link",
+					uri: "ui://x/y.png",
+					name: "res",
+					title: "T",
+					description: "d",
+					mimeType: "image/png",
+					size: 2048,
+				},
+				{ type: "resource_link", uri: "u", name: "n", description: "" },
+				{ type: "resource", resource: { uri: "ui://t.txt", mimeType: "text/plain", blob: "aGVsbG8=" } },
+				{ type: "resource", resource: { uri: "ui://b.bin", mimeType: "application/octet-stream", blob: "AAAA" } },
+				{ type: "resource", resource: { uri: "ui://j.json", mimeType: "application/json", blob: "eyJ4IjoxfQ==" } },
+			],
+		},
+	},
+	{
+		name: "mcp-tools/to-model-content-not-readable",
+		tool: "mcp-tools",
+		args: {
+			fn: "toModelContent",
+			server: "srv",
+			readableResources: false,
+			blocks: [{ type: "resource_link", uri: "u", name: "n", title: undefined }],
+		},
+	},
+	{
+		name: "mcp-tools/convert-result",
+		tool: "mcp-tools",
+		args: {
+			fn: "convertMcpResult",
+			server: "s",
+			tool: "t",
+			result: {
+				content: [{ type: "text", text: "hi" }],
+				structuredContent: { x: 1 },
+				_meta: { progress: 0.5 },
+			},
+		},
+	},
+	{
+		name: "mcp-tools/convert-result-error-no-text",
+		tool: "mcp-tools",
+		args: {
+			fn: "convertMcpResult",
+			server: "s",
+			tool: "t",
+			result: { isError: true, structuredContent: { code: 5 } },
+		},
+	},
+	{
+		name: "mcp-tools/convert-result-error-with-text",
+		tool: "mcp-tools",
+		args: {
+			fn: "convertMcpResult",
+			server: "s",
+			tool: "t",
+			result: { isError: true, content: [{ type: "text", text: "boom" }] },
+		},
+	},
+	{
+		name: "mcp-tools/limit-content",
+		tool: "mcp-tools",
+		args: {
+			fn: "limitMcpContent",
+			content: [
+				{ type: "text", text: "short" },
+				{ type: "image", data: "AAAA", mimeType: "image/png" },
+			],
+		},
+	},
+	{
+		name: "mcp-tools/limit-content-truncated",
+		tool: "mcp-tools",
+		args: {
+			fn: "limitMcpContent",
+			content: [
+				{ type: "text", text: "x".repeat(25000) },
+				{ type: "image", data: "AAAA", mimeType: "image/png" },
+			],
+		},
+	},
+
+	// -------------------------------------------------- tool-search (module)
+	// extensions/tool-search/tool.ts: tokenizer, documents, BM25 ranker.
+	{
+		name: "tool-search/tokenize",
+		tool: "tool-search",
+		args: {
+			fn: "tokenize",
+			texts: [
+				"FooBar_baz HTTPServer2 x-y",
+				"a1b2 camelCase snake_case kebab-case dots.periods",
+				"get_issues searches classes analyses the AND with",
+				"buses uses classes",
+				"process address",
+				"is ties",
+				"",
+				"...",
+				"héllo wörld",
+			],
+		},
+	},
+	{
+		name: "tool-search/document",
+		tool: "tool-search",
+		args: {
+			fn: "createToolSearchDocument",
+			tool: {
+				name: "list_issues",
+				description: "Lists GitHub issues",
+				parameters: {
+					type: "object",
+					description: "params",
+					properties: {
+						state: { type: "string", description: "open or closed" },
+						labels: { type: "array", items: { type: "string", description: "label names" } },
+					},
+					anyOf: [{ type: "string", description: "alt" }],
+				},
+			},
+			namespace: { name: "github", description: "GitHub tools", instructions: "Use for repo work" },
+		},
+	},
+	{
+		name: "tool-search/document-minimal",
+		tool: "tool-search",
+		args: {
+			fn: "createToolSearchDocument",
+			tool: { name: "t", description: "", parameters: "not an object" },
+		},
+	},
+	{
+		name: "tool-search/rank",
+		tool: "tool-search",
+		args: {
+			fn: "rank",
+			query: "file read",
+			documents: [
+				{ name: "read_file", text: "read file contents filesystem" },
+				{ name: "write_file", text: "write file save disk" },
+				{ name: "search_web", text: "search the web internet" },
+			],
+			limit: 8,
+		},
+	},
+	{
+		name: "tool-search/rank-params-and-ties",
+		tool: "tool-search",
+		args: {
+			fn: "rank",
+			query: "file",
+			documents: [
+				{ name: "read_file", text: "read file contents filesystem" },
+				{ name: "write_file", text: "write file save disk" },
+				{ name: "search_web", text: "search the web internet" },
+				{ name: "a", text: "file" },
+				{ name: "b", text: "file" },
+			],
+			limit: 3,
+			k1: 2.0,
+			b: 0.0,
+		},
+	},
 ];
 
 // tui-components sub-case builders (hoisted; used by the cases above).
