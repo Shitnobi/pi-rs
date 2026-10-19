@@ -243,6 +243,11 @@ pub trait LoaderClock {
     /// `deadline + period` (TS `setInterval` semantics — large clock jumps
     /// fire each missed beat in order).
     fn fire_loader_tick_at(&mut self, deadline: f64);
+    /// Fire one tick WITHOUT advancing the re-arm deadline (synchronous
+    /// harness tick — no virtual-clock time passes, mirroring the TS
+    /// components harness invoking the stored `setInterval` callback
+    /// directly).
+    fn fire_sync_tick(&mut self);
 }
 
 impl LoaderClock for Loader {
@@ -252,6 +257,9 @@ impl LoaderClock for Loader {
     fn fire_loader_tick_at(&mut self, deadline: f64) {
         self.tick();
         self.next_tick_at = Some(deadline + self.interval_ms as f64);
+    }
+    fn fire_sync_tick(&mut self) {
+        self.tick();
     }
 }
 
@@ -302,6 +310,19 @@ pub fn pump_loader_intervals_until(bound: f64) -> bool {
         }
     }
     fired
+}
+
+/// Fire one synchronous animation tick on every live ARMED loader
+/// (components-harness `ticks` script step). Models the TS components
+/// harness invoking the stored `setInterval` callbacks directly: a real
+/// event loop fires ALL armed intervals regardless of component nesting,
+/// so nested loaders (e.g. inside a `Box`) animate too.
+pub fn tick_all_live_loaders() {
+    for loader in live_loaders() {
+        if loader.borrow().loader_deadline().is_some() {
+            loader.borrow_mut().fire_sync_tick();
+        }
+    }
 }
 
 #[cfg(test)]

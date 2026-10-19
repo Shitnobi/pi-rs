@@ -100,7 +100,40 @@ fn run_harness(args: &[String]) -> Result<Value, String> {
 
 fn run_tool(name: &str, cwd: &str) -> Result<Value, String> {
     let input = read_stdin_json()?;
-    run_tool_input(name, cwd, input)
+    run_tool_input_catching_panics(name, cwd, input)
+}
+
+/// `run_tool_input` wrapped in `catch_unwind`: a Rust panic inside a
+/// harness case becomes an in-band `{error: <panic message>}` result,
+/// matching the TS harness where per-case exceptions are caught and
+/// reported in-band (e.g. the "Rendered line N exceeds terminal width"
+/// crash that TS throws and Rust panics with). Stack overflows are
+/// process aborts, NOT panics, and still crash the harness — the batter
+/// reconciles that class separately.
+fn run_tool_input_catching_panics(name: &str, cwd: &str, input: Value) -> Result<Value, String> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_tool_input(name, cwd, input)
+    }));
+    match result {
+        Ok(r) => r,
+        Err(payload) => {
+            let mut msg = if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else {
+                "unknown panic".to_string()
+            };
+            // Redact the environment-specific crash-log path so the
+            // message compares equal with the TS harness output (which
+            // redacts the same suffix in ts-harness.js errMsg()).
+            if let Some(pos) = msg.find("Debug log written to: ") {
+                msg.truncate(pos + "Debug log written to: ".len());
+                msg.push_str("<redacted>");
+            }
+            Err(msg)
+        }
+    }
 }
 
 /// Batch entry used by parity/fuzz (see run-batter.mjs). Input: JSON array
@@ -112,7 +145,7 @@ fn run_tool_batch(name: &str, cwd: &str) -> Result<Value, String> {
         .ok_or("tool-batch input must be a JSON array of argument objects")?;
     let mut results = Vec::with_capacity(items.len());
     for item in items {
-        let value = match run_tool_input(name, cwd, item.clone()) {
+        let value = match run_tool_input_catching_panics(name, cwd, item.clone()) {
             Ok(value) => value,
             Err(message) => serde_json::json!({ "error": message }),
         };
@@ -1729,13 +1762,13 @@ fn run_tui_components_harness(input: &Value) -> Result<Value, String> {
 
     use pi_tui::component::{
         dispatch_mouse_event, ComponentRef, Focusable, TuiMouseButton, TuiMouseEvent,
-        TuiMouseEventResult, TuiMouseEventType,
+        TuiMouseEventType,
     };
     use pi_tui::components::box_component::TuiBox;
     use pi_tui::components::cancellable_loader::CancellableLoader;
     use pi_tui::components::h_stack::HStack;
     use pi_tui::components::input::{Input, InputOptions};
-    use pi_tui::components::loader::{Loader, LoaderIndicatorOptions};
+    use pi_tui::components::loader::{register_loader, Loader, LoaderIndicatorOptions};
     use pi_tui::components::mouse_region::MouseRegion;
     use pi_tui::components::scroll_view::{
         ScrollView, ScrollViewFollow, ScrollViewOptions, ScrollViewScrollToOptions,
@@ -1896,7 +1929,9 @@ fn run_tui_components_harness(input: &Value) -> Result<Value, String> {
                         Some("always") => {
                             options.visible = Some(Rc::new(|_vp: &LayoutViewport| true));
                         }
-                        Some("never") => {
+                        // TS maps ANY other present value to never-visible
+                        // (`entry.visible === "always" ? () => true : () => false`).
+                        _ if entry.get("visible").is_some() => {
                             options.visible = Some(Rc::new(|_vp: &LayoutViewport| false));
                         }
                         _ => {}
@@ -1936,13 +1971,18 @@ fn run_tui_components_harness(input: &Value) -> Result<Value, String> {
                     } else {
                         None
                     };
-                Ok(Built::Loader(Rc::new(RefCell::new(Loader::new(
+                let loader = Rc::new(RefCell::new(Loader::new(
                     None,
                     style_preset(),
                     style_preset(),
                     spec["message"].as_str().unwrap_or("Loading..."),
                     indicator,
-                )))))
+                )));
+                // Register with the virtual-clock registry so `ticks` steps
+                // fire nested loaders too (TS: a real event loop fires ALL
+                // armed setInterval callbacks, not just the root component).
+                register_loader(&loader);
+                Ok(Built::Loader(loader))
             }
             "cancellable-loader" => {
                 let loader = Rc::new(RefCell::new(CancellableLoader::new(
@@ -1952,6 +1992,7 @@ fn run_tui_components_harness(input: &Value) -> Result<Value, String> {
                     spec["message"].as_str().unwrap_or("Loading..."),
                     None,
                 )));
+                register_loader(&loader);
                 if spec["onAbort"].as_str() == Some("record") {
                     let log2 = Rc::clone(log);
                     loader.borrow_mut().on_abort = Some(Box::new(move || {
@@ -1962,11 +2003,17 @@ fn run_tui_components_harness(input: &Value) -> Result<Value, String> {
             }
             "mouse-region" => {
                 let child = build(&spec["child"], log)?.comp();
-                let log2 = Rc::clone(log);
-                let handler = Box::new(move |ev: &TuiMouseEvent| -> Option<TuiMouseEventResult> {
-                    log2.borrow_mut().push(mouse_event_json(ev));
-                    None
-                });
+                let handler: Box<
+                    dyn Fn(&TuiMouseEvent) -> Option<pi_tui::component::TuiMouseEventResult>,
+                > = if spec["onMouse"].as_str() == Some("record") {
+                    let log2 = Rc::clone(log);
+                    Box::new(move |ev: &TuiMouseEvent| {
+                        log2.borrow_mut().push(mouse_event_json(ev));
+                        None
+                    })
+                } else {
+                    Box::new(|_ev: &TuiMouseEvent| None)
+                };
                 Ok(Built::Plain(Rc::new(RefCell::new(MouseRegion::new(
                     child, handler,
                 )))))
@@ -2155,11 +2202,11 @@ fn run_tui_components_harness(input: &Value) -> Result<Value, String> {
                     }
                 }
                 for _ in 0..step["ticks"].as_u64().unwrap_or(0) {
-                    match &built {
-                        Built::Loader(loader) => loader.borrow_mut().tick(),
-                        Built::CancelLoader(loader) => loader.borrow_mut().tick(),
-                        _ => {}
-                    }
+                    // Fire EVERY live armed loader (registered above), not
+                    // just a top-level one — TS's patched setInterval store
+                    // holds one callback per armed loader and the harness
+                    // tick invokes all of them.
+                    pi_tui::components::loader::tick_all_live_loaders();
                 }
                 if let Some(filter) = step["setFilter"].as_str() {
                     if let Built::Select(list) = &built {
@@ -2692,7 +2739,8 @@ fn run_tui_screen_harness(input: &Value, alt: bool) -> Result<Value, String> {
                             options.visible =
                                 Some(Rc::new(|_vp: &pi_tui::layout_node::LayoutViewport| true));
                         }
-                        Some("never") => {
+                        // TS maps ANY other present value to never-visible.
+                        _ if entry.get("visible").is_some() => {
                             options.visible =
                                 Some(Rc::new(|_vp: &pi_tui::layout_node::LayoutViewport| false));
                         }
@@ -3072,7 +3120,11 @@ fn run_tui_screen_harness(input: &Value, alt: bool) -> Result<Value, String> {
                 }
             }
             "tickMs" => {
-                let ms = op["n"].as_f64().ok_or("tickMs requires n")?;
+                // TS harness: `clock += op.n` with a missing n yields NaN
+                // and every deadline comparison stays false (no timers
+                // ever fire again) — model that exactly rather than
+                // erroring (fuzz/reg-main-043).
+                let ms = op["n"].as_f64().unwrap_or(f64::NAN);
                 surface.borrow_mut().advance_clock(ms);
             }
             "start" => {

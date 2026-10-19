@@ -259,10 +259,31 @@ export function runBatch(tool, argsList, { batchSize = 200 } = {}) {
 						}),
 					);
 				} catch (e2) {
-					oneRs = [{ error: `rs harness crashed: ${String(e2.message).slice(0, 300)}` }];
+					oneRs = [
+						{
+							error:
+								"rs harness crashed: " +
+								String(e2.message).slice(0, 300) +
+								(e2.stderr ? " :: " + String(e2.stderr).slice(0, 300) : ""),
+						},
+					];
 				}
+				// wordWrapLine upstream bug: a single grapheme wider than
+				// the wrap width recurses with identical arguments in BOTH
+				// implementations (TS original and Rust port). TS surfaces
+				// it as an in-band RangeError ("Maximum call stack size
+				// exceeded"); Rust aborts the harness process with a stack
+				// overflow. Same root cause, untestable class — reconcile
+				// instead of flagging a divergence.
+				const stackSkip =
+					oneTs[0] &&
+					oneTs[0].error === "Maximum call stack size exceeded" &&
+					oneRs[0] &&
+					typeof oneRs[0].error === "string" &&
+					/stack overflow/i.test(oneRs[0].error);
 				out.push({
-					ok: canonical(oneTs[0]) === canonical(oneRs[0]),
+					ok: stackSkip || canonical(oneTs[0]) === canonical(oneRs[0]),
+					skipped: stackSkip,
 					ts: oneTs[0],
 					rs: oneRs[0],
 					args,
@@ -334,8 +355,15 @@ export function stringToChunks(s) {
  */
 export function writeRegression(target, caseSpec) {
 	mkdirSync(regressionsDir, { recursive: true });
-	const existing = readdirSync(regressionsDir).filter((f) => /^reg-.*\.mjs$/.test(f));
-	const seq = String(existing.length + 1).padStart(3, "0");
+	const existing = readdirSync(regressionsDir).filter((f) => new RegExp(`^reg-${target}-\\d+\\.mjs$`).test(f));
+	// Max existing sequence + 1 (NOT file count): earlier deletions must
+	// never make the counter collide with a surviving file and overwrite it
+	// (this bug previously collapsed 10 editor regressions into one file).
+	const maxSeq = existing.reduce((m, f) => {
+		const n = parseInt(f.match(/(\d+)\.mjs$/)[1], 10);
+		return Math.max(m, n);
+	}, 0);
+	const seq = String(maxSeq + 1).padStart(3, "0");
 	const name = `reg-${target}-${seq}`;
 	const file = join(regressionsDir, `${name}.mjs`);
 	const json = (v) => JSON.stringify(v);

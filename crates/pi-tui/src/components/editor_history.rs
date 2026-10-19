@@ -16,7 +16,11 @@ impl Editor {
     pub fn add_to_history(&mut self, text: &str) {
         // const trimmed = text.trim();
         // if (!trimmed) return;
-        let trimmed = text.trim();
+        // JS `String.prototype.trim` includes U+FEFF (ZWNBSP) in its
+        // whitespace set — Rust `str::trim` does not — so a BOM-only
+        // entry is REJECTED by TS (`if (!trimmed) return`) but kept by a
+        // plain `str::trim` (fuzz/reg-editor-036).
+        let trimmed = crate::utils::js_trim(text);
         if trimmed.is_empty() {
             return;
         }

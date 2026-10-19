@@ -700,7 +700,7 @@ fixed, full validation green.
    1125), `cargo test --workspace` 1307 passed / 0 failed, clippy
    (pi-tui, pi-cli, --release) 0 errors.
 
-## T7 — Differential fuzz batter (COMPLETE; last updated 2026-10-18)
+## T7 — Differential fuzz batter (COMPLETE; last updated 2026-10-19)
 
 Seeded differential fuzzing framework per docs/TUI_PORT_PLAN.md: JS-side
 generators produce argument payloads; both harnesses replay them in batch;
@@ -726,7 +726,22 @@ regressions.
   `--target all|csv`, `--count`, `--seed`, `--budget` (default 900s),
   `--no-shrink`, `--list`. Exit 1 on divergence. Seed derivation:
   `rng(seed * 7919 + name.length * 104729 + name.charCodeAt(0))`.
-- **Batch harness modes** — `pi-cli harness tool-batch <tool> --cwd`
+- **Batter expansion (2026-10-19)** — four TUI-layer targets:
+  `components` (tui-components native batch, 1200 payloads × ~20
+  sub-cases: spec-tree generators over text/box/stack/scroll-view/
+  editor/loader/select-list/mouse-region + scripts of inputs/ticks/
+  renders/scroll/mouse at random widths), `editor` (tui-editor, 1500:
+  full editor lifecycle — options, history, setText, insertTextAtCursor,
+  pastes gated to render widths ≥ 24, key scripts and renders; narrow
+  mode 2–23 exercises the width-exceeds paths), `main` (tui-main, 800)
+  and `alt` (tui-alt, 800): screen scripts (addChild/showOverlay/
+  setFocus/input/terminalReply/resize/renderNow/tickMs/start/stop +
+  alt-only setLayoutRoot/scrollBy/flash) over the component generators,
+  with per-target structured minimizer (`minimizeDeep`: del-elem /
+  del-key / num→0|1 / code-point-safe string halving; PROTECTED_KEYS /
+  FROZEN_KEYS keep harness-identity fields and reject lone-surrogate
+  candidates; screen shrink guards keep setFocus refs registered and
+  script-op required fields present).- **Batch harness modes** — `pi-cli harness tool-batch <tool> --cwd`
   (stdin JSON array of arg objects → array of results, errors in-band)
   and `node parity/ts-harness.js <cwd> --batch` (stdin array of
   {tool, args}); both amortize process startup over thousands of cases.
@@ -790,6 +805,96 @@ regressions.
    consuming a ZWJ. The 1208-case live-ICU segmenter corpus still
    passes unchanged.
 
+### Batter-expansion divergences and fixes (2026-10-19)
+
+44 permanent regressions from the components/editor/main/alt targets
+(reg-components-015..034, reg-editor-036, reg-main-036..058,
+reg-alt-001..002), plus harness/framework hardening:
+
+1. **Nested loader ticks** (reg-components series) — the components
+   harness 'ticks' step fired only the top-level built loader; a
+   loader nested inside a box never advanced (ts "⠙" vs rs "⠋").
+   Fix: `register_loader()` in the harness + new
+   `loader::tick_all_live_loaders()` (fires one synchronous tick on
+   every live ARMED loader, modeling the TS event loop firing all
+   armed `setInterval` callbacks); TS harness setInterval patch moved
+   from single-slot to a Map of all armed callbacks.
+2. **Stack-entry visible contract** (components + screen builders) —
+   TS maps `entry.visible === "always" ? () => true : () => false`:
+   ANY other present value means never-visible. Rust matched only
+   `"never"`. Fix: `_ if entry.get("visible").is_some() => false`.
+3. **mouse-region recording gate** — the Rust components harness
+   attached the recording handler to EVERY mouse-region; TS only
+   records when `onMouse === "record"`. Fix: conditional handler.
+4. **BOM history entries** (reg-editor-036) — JS `String.trim`
+   treats U+FEFF as whitespace, Rust `str::trim` does not, so a
+   BOM-only entry was rejected by TS `add_to_history` but kept by
+   Rust. Fix: `editor_history::add_to_history` uses
+   `utils::js_trim`.
+5. **ScrollView input presence** (reg-main-046..053) — TS `ScrollView`
+   defines no `handleInput` method, so the
+   `if (this.focusedComponent?.handleInput)` gate in
+   `handleTerminalInput` DROPS keyboard input to a focused
+   scroll-view (no `requestImmediateRender` either — the render
+   timer stays pending, nothing is written). Rust's
+   `ScrollView::handles_input()` wrongly returned `true` (a stale
+   comment claimed the Container foundation modeled presence as
+   true; it models `false`), so Rust dispatched the input and
+   rendered an empty synchronized-output frame. Fix:
+   `handles_input() == false`, aligning the gate and both
+   mouse-forward focus-target sites.
+6. **Alt-screen stop fake-cursor resolution** (reg-alt-001) — TS
+   `afterTerminalStop` renders the final document through
+   `resolveFakeCursors` (fake-cursor markers → reverse video
+   `\x1b[7m/\x1b[27m`); the Rust port skipped the call and wrote
+   the raw `\x1b_pi:fc\x07` markers. Fix: `resolve_fake_cursors`
+   applied in `alt_screen_input::after_terminal_stop`.
+7. **ScrollView container traversal** (reg-alt-002) — TS
+   `ScrollView extends Container`, so `containsComponent`'s
+   `instanceof Container` recursion walks the inherited child list
+   (the constructor's `this.children.push(child)`); the Rust
+   `ScrollView` exposed no `container_children`, so
+   `isComponentMounted` returned false for anything inside a
+   scroll-view and `setFocusInternal`'s blocked-overlay-restore
+   resolution fired early (focus jumped to the overlay). Fix:
+   `ScrollView::container_children` returns the inherited list
+   (also aligns the alt-screen mouse-dispatch skip, whose TS check
+   is `handleMouse === Container.prototype.handleMouse` — true for
+   the inherited ScrollView method).
+
+Framework/harness hardening driven by the same runs:
+
+- **wordWrapLine upstream recursion** — a single grapheme wider than
+  the wrap width recurses `wordWrapLine(grapheme, maxWidth)` with
+  IDENTICAL arguments (editor.ts:188-205): infinite recursion in
+  BOTH implementations. TS surfaces it as an in-band RangeError;
+  Rust aborts the process. Untestable class (faithful port,
+  not fixed): `runBatch` reconciles TS "Maximum call stack size
+  exceeded" + Rust stack-overflow abort as `skipped` (ok, no
+  regression recorded); the editor generator gates pastes to
+  render widths ≥ 24 (emoji ZWJ clusters remain skip-class).
+- **writeRegression numbering** — was `existing.length + 1`, which
+  collides with surviving files after deletions (10 editor
+  regressions were collapsed into one file by this bug). Now
+  max existing sequence + 1.
+- **Panic → in-band error** — `run_tool_input_catching_panics`
+  (catch_unwind around every harness case, single and batch modes):
+  a Rust panic becomes an in-band `{"error": <message>}` exactly like
+  a TS exception, e.g. the "Rendered line N exceeds terminal width"
+  crash both sides now report in-band with the debug-log path
+  redacted on both sides (`errMsg()` in ts-harness.js / truncate in
+  main.rs). run-parity.mjs now prefers parsed stdout over the
+  exit-status/stderr fallback.
+- **Harness contract alignment for missing op fields** — the
+  minimizer deleting required fields used to expose CONTRACT gaps:
+  input/terminalReply `data` (TS crash vs Rust ""-default — TS now
+  defaults `?? ""`), tickMs `n` (Rust errored; TS's `clock +=
+  undefined` = NaN semantics now modeled via `advance_clock(NAN)`),
+  resize `cols`/`rows` and scrollBy `lines` (both harnesses now
+  throw the same in-band "X requires Y" errors). The minimizer also
+  gained a screenOpsValid guard so shrunk cases keep required fields
+  and stay generator-reachable.
+
 ### Validation (this tranche)
 
 - Batter, final binary: unicode seeds 1–5 + all-targets seeds 1–2 →
@@ -798,6 +903,12 @@ regressions.
   cases, 0 divergences; markdown seeds 1–8 → 16,000 cases, 0
   divergences. (all-targets runs hit the 900s budget before
   latex/markdown; those targets were run separately at 8 seeds.)
-- Full parity: **1218/1218** (1204 prior + 14 fuzz regressions).
-- `cargo test --workspace`: 1307 passed / 0 failed.
+- Batter expansion, final binary: components/editor/main/alt seeds
+  1–3 → **81,300 cases, 0 divergences** (components 24,000/seed,
+  editor 1,500/seed, main 800/seed, alt 800/seed; the wordWrapLine
+  stack-overflow class reconciled as skipped).
+- Full parity: **1262/1262** (1204 prior + 58 fuzz regressions: 14
+  earlier [markdown 3, unicode 11] + 44 from the expansion [components
+  18, editor 1, main 23, alt 2]).
+- `cargo test --workspace`: 1228 passed / 0 failed.
 - `cargo clippy --workspace --all-targets`: 0 errors.

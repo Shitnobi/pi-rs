@@ -661,24 +661,27 @@ async function runModule(tool, args, cwd) {
 					throw new Error("unknown tui-components type: " + spec.type);
 			}
 		};
-		// Deterministic loader timers: patch setInterval/clearInterval so the
-		// loader's animation callback is stored (never scheduled); a script
-		// "tick" invokes it synchronously — mirroring the Rust harness's
-		// Loader::tick().
-		let intervalFn = null;
+		// Deterministic loader timers: patch setInterval/clearInterval so
+		// each loader's animation callback is stored (never scheduled); a
+		// script "tick" invokes ALL stored callbacks synchronously —
+		// mirroring a real event loop (and the Rust harness's
+		// loader-registry tick), including nested loaders.
+		let intervalFns = new Map();
+		let nextIntervalId = 1;
 		const origSetInterval = globalThis.setInterval;
 		const origClearInterval = globalThis.clearInterval;
 		globalThis.setInterval = (fn) => {
-			intervalFn = fn;
-			return 2;
+			const id = nextIntervalId++;
+			intervalFns.set(id, fn);
+			return id;
 		};
 		globalThis.clearInterval = (id) => {
-			if (id === 2) intervalFn = null;
+			intervalFns.delete(id);
 		};
 		try {
 			const results = [];
 			for (const c of args.cases || []) {
-				intervalFn = null;
+				intervalFns.clear();
 				const log = [];
 				const component = build(c.component, log);
 				const frames = [];
@@ -693,17 +696,18 @@ async function runModule(tool, args, cwd) {
 						if (component.handleInput) component.handleInput(s);
 					}
 					for (let i = 0; i < (step.ticks || 0); i++) {
-						if (intervalFn) intervalFn();
+						for (const fn of [...intervalFns.values()]) fn();
 					}
 					if (step.setFilter !== undefined && component.setFilter)
 						component.setFilter(step.setFilter);
 					for (const op of step.scroll || []) {
-						if (op.updateLayout) component.updateLayout(op.updateLayout[0], op.updateLayout[1], () => {});
-						if (op.scrollTo !== undefined)
+						if (op.updateLayout && component.updateLayout)
+							component.updateLayout(op.updateLayout[0], op.updateLayout[1], () => {});
+						if (op.scrollTo !== undefined && component.scrollTo)
 							component.scrollTo(op.scrollTo, op.disableFollow ? { disableFollow: true } : {});
-						if (op.scrollBy !== undefined) component.scrollBy(op.scrollBy);
-						if (op.scrollToStart) component.scrollToStart();
-						if (op.scrollToEnd) component.scrollToEnd();
+						if (op.scrollBy !== undefined && component.scrollBy) component.scrollBy(op.scrollBy);
+						if (op.scrollToStart && component.scrollToStart) component.scrollToStart();
+						if (op.scrollToEnd && component.scrollToEnd) component.scrollToEnd();
 					}
 					if (step.mouse) {
 						const m = step.mouse;
@@ -1189,7 +1193,8 @@ async function runModule(tool, args, cwd) {
 						break;
 					case "input":
 					case "terminalReply":
-						term.sendInput(op.data);
+						// Rust harness defaults missing data to "" — align.
+						term.sendInput(op.data ?? "");
 						break;
 					case "setFocus":
 						screen.setFocus(op.ref === null ? null : refOf({ ref: op.ref }));
@@ -1207,6 +1212,8 @@ async function runModule(tool, args, cwd) {
 						screen.renderNow(op.force ?? false);
 						break;
 					case "resize":
+						if (op.cols === undefined) throw new Error("resize requires cols");
+						if (op.rows === undefined) throw new Error("resize requires rows");
 						term.resize(op.cols, op.rows);
 						break;
 					case "tickMs":
@@ -1224,6 +1231,7 @@ async function runModule(tool, args, cwd) {
 						break;
 					case "scrollBy":
 						if (tool !== "tui-alt") throw new Error("scrollBy is alt-only");
+						if (op.lines === undefined) throw new Error("scrollBy requires lines");
 						screen.scrollBy(op.lines);
 						break;
 					case "flash":
@@ -1534,7 +1542,7 @@ process.stdin.on("end", async () => {
 			try {
 				out.push(await runOne(tool, args, cwd));
 			} catch (e) {
-				out.push({ error: e && e.message !== undefined ? e.message : String(e) });
+				out.push({ error: errMsg(e) });
 			}
 		}
 		process.stdout.write(JSON.stringify(out));
@@ -1544,11 +1552,20 @@ process.stdin.on("end", async () => {
 	try {
 		process.stdout.write(JSON.stringify(await runOne(tool, args, cwd)));
 	} catch (e) {
-		process.stdout.write(
-			JSON.stringify({ error: e && e.message !== undefined ? e.message : String(e) }),
-		);
+		process.stdout.write(JSON.stringify({ error: errMsg(e) }));
 	}
 });
+
+/**
+ * Error message for in-band results. Both implementations report
+ * "Debug log written to: <path>" with an environment-specific path
+ * (logDirectory/tmpdir + timestamped filename) on the rendered-line-width
+ * crash; redact it so the two sides compare equal.
+ */
+function errMsg(e) {
+	const msg = e && e.message !== undefined ? e.message : String(e);
+	return msg.replace(/Debug log written to: .*/g, "Debug log written to: <redacted>");
+}
 
 /** Run a single {tool, args} payload (module entry first, then AgentTool). */
 async function runOne(tool, args, cwd) {

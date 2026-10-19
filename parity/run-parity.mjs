@@ -180,12 +180,14 @@ function runRs(caseInfo, dir) {
 		maxBuffer: 256 * 1024 * 1024,
 	});
 	if (r.error) return { __harnessError: String(r.error) };
-	if (r.status !== 0) {
-		return { __harnessError: (r.stderr || r.stdout || "").split("\n").slice(-6).join("\n") };
-	}
+	// In-band errors (`{"error": ...}`) are printed to stdout but exit(1)
+	// — prefer the parsed result over the panic-hook stderr spew.
 	try {
 		return JSON.parse(r.stdout);
 	} catch (e) {
+		if (r.status !== 0) {
+			return { __harnessError: (r.stderr || r.stdout || "").split("\n").slice(-6).join("\n") };
+		}
 		return { __harnessError: "unparseable output: " + r.stdout.slice(0, 300) };
 	}
 }

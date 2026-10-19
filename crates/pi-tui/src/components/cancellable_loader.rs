@@ -132,6 +132,9 @@ impl crate::components::loader::LoaderClock for CancellableLoader {
         self.loader.tick();
         self.loader.rearm_next_tick_at(deadline + interval_ms as f64);
     }
+    fn fire_sync_tick(&mut self) {
+        self.loader.tick();
+    }
 }
 
 #[cfg(test)]

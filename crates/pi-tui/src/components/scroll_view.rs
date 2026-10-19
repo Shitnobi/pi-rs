@@ -805,6 +805,17 @@ impl ScrollView {
 }
 
 impl Component for ScrollView {
+    /// TS `ScrollView extends Container`, so `containsComponent` recursion
+    /// (`instanceof Container` → child list) traverses into the scroll
+    /// view — the inherited child list holds the single child pushed by
+    /// the constructor (`this.children.push(component)`). The layout
+    /// machinery reads the layout-node view instead; this trait hook is
+    /// only for the focus/mounted walks (fuzz/reg-alt-002).
+    fn container_children(&self) -> Option<Vec<ComponentRef>> {
+        let state = self.state.borrow();
+        Some(state.container.children.clone())
+    }
+
     /// `render(width)` (scroll-view.ts:203-207): the child rendered at the
     /// content width; with a reserved scrollbar column every line gains a
     /// trailing space. The scrollTop offset is applied by the layout
@@ -823,11 +834,14 @@ impl Component for ScrollView {
         }
     }
 
-    /// TS `ScrollView` inherits `Container`'s (absent) `handleInput`
-    /// presence; the Rust `Container` foundation models that presence as
-    /// `true` (see `component.rs`), inherited unchanged like `VStack`.
+    /// TS `ScrollView` defines no `handleInput` method (only editor, input,
+    /// select-list, settings-list and cancellable-loader do), so the
+    /// `if (this.focusedComponent?.handleInput)` presence gate in
+    /// `handleTerminalInput` (tui.ts:1128) DROPS keyboard input to a
+    /// focused scroll-view — no `requestImmediateRender` either
+    /// (fuzz/reg-main-046).
     fn handles_input(&self) -> bool {
-        true
+        false
     }
 
     /// `invalidate()` — inherited from `Container` (tui.ts:376-380):

@@ -403,7 +403,9 @@ pub(crate) fn after_terminal_stop(screen: &mut TuiAltScreen, options: &TuiStopOp
         // prefixes → drop CURSOR_MARKER → `applyLineResets` → overflow
         // truncation (tui-alt-screen.ts:415-419).
         let rendered = TuiSurface::render_children(screen, width);
-        let document_lines: Vec<String> = rendered
+        let document_lines: Vec<String> = screen
+            .base
+            .resolve_fake_cursors(rendered)
             .into_iter()
             .map(|line| strip_osc133_zone_prefix(&line).to_string())
             .map(|line| line.replace(CURSOR_MARKER, ""))
