@@ -206,4 +206,19 @@ export const markdownRenderCases = [
 	mr("nel-lheading-trim", "a\u0085b\n==="),
 	mr("bom-inline-text", "a\ufeff*b*c"),
 	mr("ls-hr-shape", "*\u2028*\u2028*\n"),
+
+	// ---------------------------------------- astral / surrogate latex shapes
+	mr("astral-text", "\u{1F600} *b* c"),
+	mr("astral-heading", "# \u{1F600}"),
+	mr("astral-emphasis", "**\u{1F600}** and \u{1F600}"),
+	mr("astral-keycap", "1\uFE0F\u20E3 ok"),
+	mr("astral-latex-block", "$$x^\u{1F600}$$"),
+	mr("astral-latex-block-sqrt", "$$\\sqrt\u{1F600}$$"),
+	mr("astral-latex-block-frac", "$$\\frac\u{1F600}{+}$$"),
+	mr("astral-latex-block-matrix", "$$\\begin{pmatrix} x^\u{1F600} \\\\ b \\end{pmatrix}$$"),
+	mr("astral-latex-inline", "$x^\u{1F600}$"),
+	mr("astral-latex-inline-vec", "$\\vec\u{1F600}$"),
+	mr("astral-latex-display-width", "$$x^\u{1F600}_\u{1F602}$$"),
+	mr("astral-table", "| \u{1F600} | b |\n|---|---|\n| 1 | 2 |"),
 ];
+

@@ -15,7 +15,12 @@ fn main() {
     let result = run(&args);
     match result {
         Ok(value) => {
-            println!("{}", serde_json::to_string_pretty(&value).unwrap());
+            let json = serde_json::to_string_pretty(&value).unwrap();
+            // Lone-surrogate sentinels from the latex port (see
+            // pi-tui/src/latex.rs) decode to `\uXXXX` escapes exactly like
+            // `JSON.stringify` of a lone surrogate; adjacent sentinel pairs
+            // coalesce back to the real astral char.
+            println!("{}", pi_tui::latex::decode_surrogate_sentinels(&json));
         }
         Err(message) => {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "error": message })).unwrap());

@@ -6,11 +6,14 @@
 //! (TS `string | undefined`).
 //!
 //! Porting notes:
-//! - JS string indexing is UTF-16-code-unit based. All strings handled by this
-//!   module (LaTeX source plus the symbol tables) are BMP-only, so we use
-//!   `char`-based arithmetic consistently (`Vec<char>` for the parser source).
-//!   Lone-surrogate splitting of astral input chars (a JS `source[i]` quirk) is
-//!   therefore not replicated; see the report.
+//! - JS string indexing is UTF-16-code-unit based, and the TS lexer reads the
+//!   source by the unit (`this.source[i]`), so an astral-plane character
+//!   (e.g. emoji) in a single-unit position splits into its two surrogate
+//!   halves. Rust `str`/`char` cannot represent a lone surrogate, so this port
+//!   expands astral chars into surrogate-sentinel pairs at every parser entry
+//!   (`js_units`) and decodes them at the boundaries — see the sentinel
+//!   section below. `Vec<char>` parser sources are therefore UTF-16
+//!   code-unit-indexed exactly like TS.
 //! - JS `\s` / `trim()` whitespace differs from Rust's `char::is_whitespace`
 //!   (JS omits U+0085, includes U+FEFF), so `js_is_whitespace` +
 //!   `JS_WS_CLASS` enumerate the exact ECMAScript set.
@@ -21,6 +24,179 @@ use std::sync::OnceLock;
 use fancy_regex::Regex;
 
 use crate::utils::visible_width;
+
+// ---------------------------------------------------------------------------
+// JS UTF-16 lone-surrogate sentinels
+// ---------------------------------------------------------------------------
+//
+// JS strings are UTF-16 code-unit sequences and the TS lexer indexes them by
+// the unit (`this.source[i]`, `.slice()`, non-`u` regexes). A single-unit read
+// of an astral-plane char (U+10000..U+10FFFF, e.g. emoji) captures only its
+// high surrogate, leaving the low surrogate in the stream — the render result
+// then contains lone surrogates (e.g. `x^😀` display → " \ud83d\nx\ude00").
+//
+// Rust `char` cannot hold a lone surrogate, so this port encodes UTF-16 units
+// as follows:
+//
+// - `js_units` expands every astral char of a parser source into a pair of
+//   sentinel chars (high surrogate → U+F1000..U+F13FF, low surrogate →
+//   U+F1400..U+F17FF; plane-15 PUA, far above the port's own
+//   U+F0000..U+F0005 layout markers). Parser `position`s are then unit
+//   indices exactly like TS, and single-unit reads split astral chars
+//   automatically. Applied at EVERY parser entry — TS `renderNested`
+//   re-parses strings by unit too.
+// - `js_code_points` emulates `Array.from`/`[...str]`: adjacent sentinel
+//   pairs coalesce back to the real astral char, lone sentinels pass
+//   through.
+// - `visible_width` (utils) coalesces adjacent pairs before measuring
+//   (matching `Intl.Segmenter` joining) and treats lone sentinels as zero
+//   width (matching `\p{Surrogate}` in the TS zero-width regex).
+// - The parity harness decodes final output JSON via
+//   `decode_surrogate_sentinels`: pairs coalesce to the real char, lone
+//   sentinels escape as `\uXXXX` exactly like `JSON.stringify`.
+//
+// Known limitation (accepted): input containing literal U+F1000..U+F17FF
+// plane-15 PUA chars would be misdecoded as surrogate halves. Real pi usage
+// never produces those code points; TS's own latex markers stop at U+F0005.
+
+/// High surrogates (U+D800..U+DBFF) encode as U+F1000..U+F13FF.
+const SENTINEL_HIGH_BASE: u32 = 0xF1000;
+/// Low surrogates (U+DC00..U+DFFF) encode as U+F1400..U+F17FF.
+const SENTINEL_LOW_BASE: u32 = 0xF1400;
+
+/// Encode one UTF-16 code unit as its sentinel char.
+pub(crate) fn surrogate_sentinel(unit: u16) -> char {
+    let cp = if (0xD800..=0xDBFF).contains(&unit) {
+        SENTINEL_HIGH_BASE + u32::from(unit) - 0xD800
+    } else {
+        SENTINEL_LOW_BASE + u32::from(unit) - 0xDC00
+    };
+    char::from_u32(cp).expect("surrogate sentinel is a valid scalar")
+}
+
+/// Decode a sentinel char back to its UTF-16 code unit.
+pub(crate) fn sentinel_surrogate_unit(c: char) -> Option<u16> {
+    sentinel_surrogate_unit_cp(c as u32)
+}
+
+/// `sentinel_surrogate_unit` on a raw code point.
+pub(crate) fn sentinel_surrogate_unit_cp(cp: u32) -> Option<u16> {
+    if (SENTINEL_HIGH_BASE..SENTINEL_HIGH_BASE + 0x400).contains(&cp) {
+        Some((0xD800 + cp - SENTINEL_HIGH_BASE) as u16)
+    } else if (SENTINEL_LOW_BASE..SENTINEL_LOW_BASE + 0x400).contains(&cp) {
+        Some((0xDC00 + cp - SENTINEL_LOW_BASE) as u16)
+    } else {
+        None
+    }
+}
+
+/// True for either sentinel half (a lone-surrogate stand-in).
+pub(crate) fn is_surrogate_sentinel(c: char) -> bool {
+    sentinel_surrogate_unit(c).is_some()
+}
+
+/// `Intl.Segmenter` surrogate-pair joining: a high sentinel directly followed
+/// by a low sentinel is the real astral code point.
+fn sentinel_pair_char(high: char, low: char) -> Option<char> {
+    let h = sentinel_surrogate_unit(high)?;
+    let l = sentinel_surrogate_unit(low)?;
+    if (0xD800..=0xDBFF).contains(&h) && (0xDC00..=0xDFFF).contains(&l) {
+        char::from_u32(0x10000 + (u32::from(h) - 0xD800) * 0x400 + u32::from(l) - 0xDC00)
+    } else {
+        None
+    }
+}
+
+/// Expand a string into UTF-16 code units, encoding astral chars as sentinel
+/// pairs. The parser's `source` is then unit-indexed like `this.source` in TS.
+/// Sentinel chars already in the input pass through untouched (nested
+/// re-parses receive unit strings, never re-expanded).
+fn js_units(s: &str) -> Vec<char> {
+    let mut units: Vec<char> = Vec::with_capacity(s.chars().count());
+    for c in s.chars() {
+        let cp = c as u32;
+        if cp >= 0x10000 && !is_surrogate_sentinel(c) {
+            let v = cp - 0x10000;
+            units.push(surrogate_sentinel((0xD800 + (v >> 10)) as u16));
+            units.push(surrogate_sentinel((0xDC00 + (v & 0x3FF)) as u16));
+        } else {
+            units.push(c);
+        }
+    }
+    units
+}
+
+/// Coalesce sentinel pairs for code-point-semantics boundaries (u-flag
+/// regexes like `[\p{L}\p{N}]`, final output). Lossless for output: pairs
+/// become the real astral char, lone sentinels pass through.
+fn with_coalesced_pairs(value: &str) -> String {
+    coalesce_surrogate_sentinels(value).unwrap_or_else(|| value.to_string())
+}
+
+/// JS `Array.from(str)` / `[...str]`: code points — adjacent sentinel pairs
+/// coalesce back to the real astral char, lone sentinels pass through.
+fn js_code_points(s: &str) -> Vec<char> {
+    let mut points: Vec<char> = Vec::with_capacity(s.chars().count());
+    let mut iter = s.chars().peekable();
+    while let Some(c) = iter.next() {
+        if let Some(&next) = iter.peek() {
+            if let Some(real) = sentinel_pair_char(c, next) {
+                points.push(real);
+                iter.next();
+                continue;
+            }
+        }
+        points.push(c);
+    }
+    points
+}
+
+/// Coalesce adjacent sentinel pairs into the real astral chars; `None` when
+/// the string contains no sentinels (fast path). Used by the width path to
+/// mirror `Intl.Segmenter` pair joining.
+pub(crate) fn coalesce_surrogate_sentinels(s: &str) -> Option<String> {
+    if !s.chars().any(is_surrogate_sentinel) {
+        return None;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut iter = s.chars().peekable();
+    while let Some(c) = iter.next() {
+        if let Some(&next) = iter.peek() {
+            if let Some(real) = sentinel_pair_char(c, next) {
+                out.push(real);
+                iter.next();
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
+/// Harness-boundary decode for final output: adjacent sentinel pairs coalesce
+/// to the real astral char; lone sentinels escape as `\uXXXX` text exactly
+/// like `JSON.stringify` of a lone surrogate.
+pub fn decode_surrogate_sentinels(s: &str) -> String {
+    if !s.chars().any(is_surrogate_sentinel) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut iter = s.chars().peekable();
+    while let Some(c) = iter.next() {
+        if let Some(&next) = iter.peek() {
+            if let Some(real) = sentinel_pair_char(c, next) {
+                out.push(real);
+                iter.next();
+                continue;
+            }
+        }
+        match sentinel_surrogate_unit(c) {
+            Some(unit) => out.push_str(&format!("\\u{unit:04x}")),
+            None => out.push(c),
+        }
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Tables (TS lines 2–580)
@@ -848,8 +1024,9 @@ fn replace_first_literal(value: &str, pattern: &Regex, replacement: &str) -> Str
 /// TS `replaceCharacters` (latex.ts:602) — returns None when any character is
 /// missing from the table.
 fn replace_characters(value: &str, replacements: fn(char) -> Option<char>) -> Option<String> {
+    // TS `Array.from(value, fn)` — iterates code points (sentinel pairs join).
     let mut result = String::new();
-    for c in value.chars() {
+    for c in js_code_points(value) {
         result.push(replacements(c)?);
     }
     Some(result)
@@ -902,7 +1079,7 @@ fn format_script(value: &str, kind: ScriptKind) -> String {
     // `/^[A-Za-z]+$/` — at least one ASCII letter, all ASCII letters.
     let all_ascii_letters =
         !value.is_empty() && value.chars().all(|c| c.is_ascii_alphabetic());
-    if value.chars().count() == 1 || (kind == ScriptKind::Sub && all_ascii_letters) {
+    if js_code_points(&value).len() == 1 || (kind == ScriptKind::Sub && all_ascii_letters) {
         return format!("{prefix}{value}");
     }
     format!("{prefix}({value})")
@@ -910,15 +1087,19 @@ fn format_script(value: &str, kind: ScriptKind) -> String {
 
 /// TS `formatFraction` (latex.ts:636).
 fn format_fraction(numerator: &str, denominator: &str) -> String {
-    let numerator = js_trim(numerator);
-    let denominator = js_trim(denominator);
+    // `/^[\p{L}\p{N}.]+$/u` and `/^[\p{N}.]+$/u` match code points
+    // (sentinel pairs join).
+    let numerator = with_coalesced_pairs(numerator);
+    let denominator = with_coalesced_pairs(denominator);
+    let numerator = js_trim(&numerator);
+    let denominator = js_trim(&denominator);
     let simple_numerator = simple_text_pattern()
         .is_match(numerator)
         .expect("latex regex match");
     let simple_denominator = simple_number_pattern()
         .is_match(denominator)
         .expect("latex regex match")
-        || denominator.chars().count() == 1;
+        || js_code_points(denominator).len() == 1;
     let num = if simple_numerator {
         numerator.to_string()
     } else {
@@ -934,7 +1115,9 @@ fn format_fraction(numerator: &str, denominator: &str) -> String {
 
 /// TS `formatRoot` (latex.ts:644).
 fn format_root(value: &str, symbol: &str) -> String {
-    let value = js_trim(value);
+    // `/^[\p{L}\p{N}.]+$/u` matches code points (sentinel pairs join).
+    let value = with_coalesced_pairs(value);
+    let value = js_trim(&value);
     if simple_text_pattern()
         .is_match(value)
         .expect("latex regex match")
@@ -962,7 +1145,10 @@ const PROTECTED_SPACE: &str = "\u{f0002}";
 
 /// TS `normalizeOutput` (latex.ts:654).
 fn normalize_output(value: &str) -> String {
-    let value = replace_all_literal(value, named_operator_left_spacing_pattern(), " ");
+    // u-flag `\p{L}\p{N}` lookarounds match code points — feed them the
+    // pair-coalesced string (lossless: see `with_coalesced_pairs`).
+    let value = with_coalesced_pairs(value);
+    let value = replace_all_literal(&value, named_operator_left_spacing_pattern(), " ");
     let value = value.replace(NAMED_OPERATOR_START, "");
     let value = replace_all_literal(&value, named_operator_right_spacing_pattern(), " ");
     let value = value.replace(NAMED_OPERATOR_END, "");
@@ -1261,9 +1447,11 @@ enum InlineLowerStyle {
 }
 
 /// TS `class LatexParser` (latex.ts:838).
-struct LatexParser<'a, 'n> {
-    /// `private readonly source` — char-based (JS UTF-16 units are all BMP here).
-    source: &'a [char],
+struct LatexParser<'n> {
+    /// `private readonly source` — UTF-16 code units (astral chars expanded
+    /// to surrogate-sentinel pairs by `js_units`), so `position` is a unit
+    /// index exactly like TS `this.source`.
+    source: Vec<char>,
     /// `private readonly layoutNodes` — shared across nested parsers.
     layout_nodes: &'n mut Vec<LayoutNode>,
     /// `private readonly display`.
@@ -1278,12 +1466,12 @@ struct LatexParser<'a, 'n> {
     script_depth: usize,
 }
 
-impl<'a, 'n> LatexParser<'a, 'n> {
+impl<'n> LatexParser<'n> {
     fn new(
-        source: &'a [char],
+        source: Vec<char>,
         layout_nodes: &'n mut Vec<LayoutNode>,
         display: bool,
-    ) -> LatexParser<'a, 'n> {
+    ) -> LatexParser<'n> {
         LatexParser {
             source,
             layout_nodes,
@@ -1459,7 +1647,7 @@ impl<'a, 'n> LatexParser<'a, 'n> {
                 Some(value) => {
                     value.contains('/')
                         || (!value.contains(LAYOUT_MARKER_START)
-                            && value.chars().count() > 1
+                            && js_code_points(value).len() > 1
                             && !value.chars().any(has_upper_star))
                 }
                 None => false,
@@ -1565,7 +1753,7 @@ impl<'a, 'n> LatexParser<'a, 'n> {
             if let Some(negated) = negated_symbols().get(value.as_str()) {
                 return format!(" {negated} ");
             }
-            let characters: Vec<char> = value.chars().collect();
+            let characters: Vec<char> = js_code_points(&value);
             if characters.is_empty() {
                 self.supported = false;
                 return String::new();
@@ -1638,7 +1826,7 @@ impl<'a, 'n> LatexParser<'a, 'n> {
         }
         if let Some(accent) = accents(&command) {
             let value = self.parse_required_argument(true);
-            return if value.chars().count() == 1 {
+            return if js_code_points(&value).len() == 1 {
                 format!("{value}{accent}")
             } else {
                 format!("{command}({value})")
@@ -1646,8 +1834,8 @@ impl<'a, 'n> LatexParser<'a, 'n> {
         }
         if command == "mathbb" {
             let value = self.parse_required_argument(true);
-            return value
-                .chars()
+            return js_code_points(&value)
+                .into_iter()
                 .map(|c| blackboard(c).unwrap_or(c))
                 .collect();
         }
@@ -1890,7 +2078,7 @@ impl<'a, 'n> LatexParser<'a, 'n> {
         let end_marker: Vec<char> = format!("\\end{{{environment}}}")
             .chars()
             .collect();
-        let end = index_of_chars(self.source, &end_marker, self.position);
+        let end = index_of_chars(&self.source, &end_marker, self.position);
         let Some(end) = end else {
             self.supported = false;
             return String::new();
@@ -2139,9 +2327,9 @@ impl<'a, 'n> LatexParser<'a, 'n> {
 
     /// TS `renderNested(source, stackFractions = true)` (latex.ts:1470).
     fn render_nested(&mut self, source: &str, stack_fractions: bool) -> String {
-        let chars: Vec<char> = source.chars().collect();
+        // TS re-parses nested strings by UTF-16 unit too (`new LatexParser(source)`).
         let nested =
-            LatexParser::new(&chars, self.layout_nodes, self.display && stack_fractions);
+            LatexParser::new(js_units(source), self.layout_nodes, self.display && stack_fractions);
         match nested.render() {
             Some(rendered) => rendered,
             None => {
@@ -2204,9 +2392,9 @@ pub struct RenderLatexOptions {
 /// malformed syntax.
 pub fn render_latex(source: &str, options: &RenderLatexOptions) -> Option<String> {
     let mut layout_nodes: Vec<LayoutNode> = Vec::new();
-    let chars: Vec<char> = source.chars().collect();
+    let chars: Vec<char> = js_units(source);
     let rendered = {
-        let parser = LatexParser::new(&chars, &mut layout_nodes, options.display == Some(true));
+        let parser = LatexParser::new(chars, &mut layout_nodes, options.display == Some(true));
         parser.render()?
     };
     if layout_nodes.is_empty() {
@@ -2522,4 +2710,5 @@ b"#, false, Some("a b"));
     }
 
 }
+
 

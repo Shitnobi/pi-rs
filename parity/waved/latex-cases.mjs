@@ -156,4 +156,43 @@ export const latexCases = [
 	lx("display-mixed-structures", "\\sum_{k=0}^{n} \\binom{n}{k}", true),
 	lx("binom", "\\binom{n}{k}"),
 	lx("binom-display", "\\binom{n}{k}", true),
+
+	// ------------------------------------------- astral / UTF-16 unit semantics
+	// JS reads the source by UTF-16 code unit; an astral char (emoji) in a
+	// single-unit argument position splits into its two surrogate halves.
+	// Ground truth: node /tmp/pi-parity/redteam/astral-cases.mjs (TS side).
+	lx("astral-script-display", "x^\u{1F600}", true),
+	lx("astral-script-inline", "x^\u{1F600}"),
+	lx("astral-script-braced", "x^{\u{1F600}}"),
+	lx("astral-sqrt", "\\sqrt\u{1F600}"),
+	lx("astral-sqrt-braced", "\\sqrt{\u{1F600}}"),
+	lx("astral-sqrt-degree", "\\sqrt[\u{1F600}]{x}"),
+	lx("astral-sqrt-degree-script", "\\sqrt[x^\u{1F600}]{y}"),
+	lx("astral-sqrt-degree-3", "\\sqrt[3]{\u{1F600}}"),
+	lx("astral-underline", "\\underline\u{1F600}"),
+	lx("astral-overline", "\\overline\u{1F600}"),
+	lx("astral-vec", "\\vec\u{1F600}"),
+	lx("astral-hat", "\\hat\u{1F600}"),
+	lx("astral-hat-braced", "\\hat{\u{1F600}}"),
+	lx("astral-bar-two", "\\bar\u{1F600}\u{1F600}"),
+	lx("astral-frac-num", "\\frac\u{1F600}+"),
+	lx("astral-frac-both", "\\frac\u{1F600}\u{1F602}"),
+	lx("astral-frac-display", "\\frac\u{1F600}{+}", true),
+	lx("astral-pmod", "\\pmod\u{1F600}"),
+	lx("astral-not-braced", "\\not{\u{1F600}}"),
+	lx("astral-mathbb", "\\mathbb{\u{1F600}}"),
+	lx("astral-text-script", "\\text{x^\u{1F600}}"),
+	lx("astral-plain", "a\u{1F600}b"),
+	lx("astral-linear-b", "\\sqrt{\u{10000}}"),
+	lx("astral-unknown-cmd", "\\{1F600}"),
+	lx("astral-left", "\\left\u{1F600}"),
+	lx("astral-sub", "x_\u{1F600}"),
+	lx("astral-double-script", "x^\u{1F600}_\u{1F602}"),
+	lx("astral-double-script-display", "x^\u{1F600}_\u{1F602}", true),
+	lx("astral-double-caret", "x^^\u{1F600}"),
+	lx("astral-matrix-width", "\\begin{pmatrix} x^\u{1F600} \\\\ b \\end{pmatrix}", true),
+	lx("astral-cases-width", "\\begin{cases} x^\u{1F600} & c \\end{cases}", true),
+	lx("astral-sum-display", "\\sum^\u{1F600}", true),
+	lx("astral-lim-display", "\\lim^\u{1F600} x", true),
 ];
+

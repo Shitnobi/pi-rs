@@ -5,6 +5,7 @@
 //! consumes is ASCII. Where the original uses UTF-16 `String.length`
 //! semantics, that is preserved explicitly (see [`utf16_len`]).
 
+use crate::latex::{coalesce_surrogate_sentinels, is_surrogate_sentinel};
 use crate::unicode::{
     east_asian_width, grapheme_segments, is_control, is_cjk_script, is_default_ignorable,
     is_format, is_mark, is_punctuation, is_rgi_emoji, is_spacing_mark, is_surrogate,
@@ -123,7 +124,12 @@ fn is_terminal_spacing_mark(cp: u32) -> bool {
 /// `nonPrintingCharRegex` for a single codepoint:
 /// `Default_Ignorable | Control | Format | Mark | Surrogate`.
 fn is_non_printing(cp: u32) -> bool {
-    is_default_ignorable(cp) || is_control(cp) || is_format(cp) || is_mark(cp) || is_surrogate(cp)
+    is_default_ignorable(cp)
+        || is_control(cp)
+        || is_format(cp)
+        || is_mark(cp)
+        || is_surrogate(cp)
+        || crate::latex::sentinel_surrogate_unit_cp(cp).is_some()
 }
 
 /// Port of `couldBeEmoji` (cheap pre-filter for the RGI regex).
@@ -167,6 +173,7 @@ fn grapheme_width(segment: &str) -> usize {
             || is_control(c as u32)
             || is_mark(c as u32)
             || is_surrogate(c as u32)
+            || is_surrogate_sentinel(c)
     }) {
         return 0;
     }
@@ -255,6 +262,14 @@ pub fn visible_width(s: &str) -> usize {
         }
         stripped.push_str(&clean[copy_from..]);
         clean = stripped;
+    }
+
+    // JS UTF-16 surrogate-sentinel handling (see latex.rs): adjacent sentinel
+    // pairs coalesce into the real astral char (Intl.Segmenter joins them);
+    // lone sentinels stay and measure zero-width (lone surrogates match
+    // `\p{Surrogate}` in the TS zero-width regex).
+    if let Some(coalesced) = coalesce_surrogate_sentinels(&clean) {
+        clean = coalesced;
     }
 
     let mut width = 0usize;

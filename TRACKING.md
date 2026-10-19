@@ -180,12 +180,14 @@ Remaining, roughly in dependency order:
 | G8 | async | `NestedToolCallRunner` (drives the agent tool pipeline) and `file-mutation-queue.ts` (global registration queue + per-realpath mutation queues) need an async runtime and the agent session layer; deferred with the agent-loop tranche. `NestedCallRecorder` — the persisted half — is ported | 3+ |
 ## Parity suite status
 
-- 1125/1125 cases pass (stable across repeated runs; includes the built-in
+- 1204/1204 cases pass (stable across repeated runs; includes the built-in
   tools, core-runtime modules, and the TUI groups: `tui-utils`,
   `tui-colors`, `math`, `tui-word-navigation`, `tui-keys`,
   `tui-stdin-buffer`, `tui-components`, `tui-editor`, `tui-main`,
   `tui-alt`, `tui-terminal-colors`, `tui-terminal-image`,
-  `tui-markdown-lex`, `tui-latex`, `tui-markdown-render`)
+  `tui-markdown-lex`, `tui-latex`, `tui-markdown-render`; 79 astral/
+  surrogate regression cases added by the T6 redteam — see
+  docs/report-t6-R1.md and docs/report-t6-R2.md)
 - 1307 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
   plus fuzz corpora: ansi 2010 cases, decoder 800 cases, pi-photon
   byte-parity, segmenter corpus 1208 cases)
@@ -588,10 +590,12 @@ Remaining, roughly in dependency order:
   see TUI_PORT_PLAN.md); agent-session layer (Phase 3 continuation:
   `file-mutation-queue`, MCP/extensions, `agent-session*`, providers).
 
-### T6 redteam R1/R2 (IN PROGRESS — resume here)
+### T6 redteam R1/R2 (COMPLETE — see docs/report-t6-R1.md, docs/report-t6-R2.md)
 
-Status as of 2026-10-18 18:45 — item 1 (the confirmed divergence class)
-is FIXED and committed; items 2/3 (redteam re-runs) remain.
+Status as of 2026-10-18 21:00 — both redteam reviews completed
+(coordinator re-ran them after the delegate turn-limit failures; findings
+recovered from scratch batteries and re-verified), confirmed divergences
+fixed, full validation green.
 
 1. **[FIXED] JS regex `.` / `\s` / m-flag-anchor semantics in marked
    rules + JS `trim()` semantics.** All three divergence classes were
@@ -630,15 +634,56 @@ is FIXED and committed; items 2/3 (redteam re-runs) remain.
    errors. Note: `cargo fmt -p pi-tui` was run by mistake once and
    reverted wholesale — pi-tui is deliberately NOT rustfmt-formatted.
 
-2. **[UNKNOWN] second confirmed finding** from the failed markdown
-   redteam delegate — unknown content. Re-run the markdown/marked
-   redteam (line-by-line markdown.ts/markdown.rs + marked audit). The
-   previous delegate's instructions are in the session log; reuse them
-   (report → docs/report-t6-R1.md, findings table, SHIP/FIX verdict,
-   verify top findings by running both sides).
-3. **[NOT STARTED] latex redteam** — same instructions vs latex.ts →
-   docs/report-t6-R2.md (symbol tables codepoint audit, structure
-   handling, JS semantics; delegate 53 died before starting).
-4. After fixes: full `node parity/run-parity.mjs` (expect 1125+),
-   `cargo test --release`, clippy 0 errors, update this section +
-   parity-status counts, commit.
+2. **[DONE — no divergence found] markdown/marked redteam (R1).** The
+   delegate (20261019_1) hit its turn limit after identifying the astral
+   root cause (in the latex engine); its 38-case batch battery had a
+   harness-invocation bug (`harness tool` subcommand missing) that made
+   every Rust response an error — after fixing the wiring, 38/38 PASS.
+   A directed 59-case astral probe (emoji/math-alphanumeric/CJK-ext-B/
+   ZWJ/flag/skin-tone/keycap through every block+inline structure,
+   including latex-block/inline passthrough): **59/59 MATCH** — the
+   marked port is immune to the UTF-16-unit class of bug because its
+   rules are class/literal-based, never slicing at code-unit
+   granularity. Report: docs/report-t6-R1.md.
+3. **[DONE — one divergence class found and FIXED] latex redteam (R2).**
+   Delegate 20261019_2 built three batteries (936-case static-table
+   sweep, 149-case structural battery, 600-case deterministic fuzz)
+   before hitting its turn limit; re-run directly, all 0 mismatches
+   except the astral class. **Root cause:** the TS latex lexer is
+   UTF-16 code-unit indexed — an astral char in a single-unit argument
+   position (`x^😀`, `\sqrt 𐀀`, `\hat😀`, …) yields only the high
+   surrogate, leaving a lone low surrogate in the output (TS renders
+   `x^😀` display as `" \ud83d\nx\ude00"`). Rust `char` cannot hold a
+   lone surrogate, so 14/32 official astral repros mismatched.
+   **Fix (this commit):** sentinel-pair encoding in latex.rs (high
+   surrogates U+D800..U+DBFF → U+F1000..U+F13FF, low U+DC00..U+DFFF →
+   U+F1400..U+F17FF — plane-15 PUA above TS latex's own U+F0000..U+F0005
+   markers; applied via `js_units` at every parser entry including
+   render_nested re-parses, existing sentinels pass through), with
+   three boundary treatments: code-point semantics sites (JS Array.from
+   equivalents + u-flag regexes) coalesce pairs
+   (`js_code_points`/`with_coalesced_pairs`); the width path
+   (visible_width in utils.rs) coalesces pairs (Intl.Segmenter joining)
+   and treats lone sentinels as zero-width (TS \p{Surrogate}); the
+   harness output boundary (pi-cli main.rs) decodes sentinels so parity
+   JSON matches JSON.stringify of lone surrogates. Known accepted
+   limitation (documented in latex.rs): literal U+F1000..U+F17FF input
+   would be misdecoded — real pi usage never produces those code
+   points. Report: docs/report-t6-R2.md.
+   - Static sweep artifact dismissed: `SPACING_COMMANDS onlyTs:[""]
+     onlyRs:[","]` is an audit-script bug (naive comma-split mangles the
+     array's first element — the string `","`); lists verified identical
+     (latex.ts:510-523 == latex.rs:745-748), and a dedicated 32-case
+     spacing probe (`scripts/redteam/probe-spacing-cmds.mjs`) covering
+     the `\,` case the mangled set dropped confirms 32/32 MATCH.
+   - All batteries preserved as re-runnable scripts in scripts/redteam/
+     (probe-latex-astral, probe-md-astral, probe-spacing-cmds,
+     redteam-md-batch, redteam-latex-sweep, redteam-latex-battery2,
+     redteam-latex-fuzz) and re-verified from this commit.
+   - Regression cases added: +34 latex (parity/waved/latex-cases.mjs,
+     now 158), +33 markdown-lex (now 187), +12 markdown-render (now
+     127) — astral shapes through scripts/sqrt/fracs/matrices/accents/
+     mathbb, markdown blocks, and latex-block/inline passthrough.
+4. **Full validation green (this commit):** parity **1204/1204** (was
+   1125), `cargo test --workspace` 1307 passed / 0 failed, clippy
+   (pi-tui, pi-cli, --release) 0 errors.
