@@ -180,19 +180,19 @@ Remaining, roughly in dependency order:
 | G8 | async | `NestedToolCallRunner` (drives the agent tool pipeline) and `file-mutation-queue.ts` (global registration queue + per-realpath mutation queues) need an async runtime and the agent session layer; deferred with the agent-loop tranche. `NestedCallRecorder` — the persisted half — is ported | 3+ |
 ## Parity suite status
 
-- 1218/1218 cases pass (stable across repeated runs; includes the built-in
+- 1262/1262 cases pass (stable across repeated runs; includes the built-in
   tools, core-runtime modules, and the TUI groups: `tui-utils`,
   `tui-colors`, `math`, `tui-word-navigation`, `tui-keys`,
   `tui-stdin-buffer`, `tui-components`, `tui-editor`, `tui-main`,
   `tui-alt`, `tui-terminal-colors`, `tui-terminal-image`,
   `tui-markdown-lex`, `tui-latex`, `tui-markdown-render`; 79 astral/
   surrogate regression cases added by the T6 redteam — see
-  docs/report-t6-R1.md and docs/report-t6-R2.md — plus 14 fuzz
+  docs/report-t6-R1.md and docs/report-t6-R2.md — plus 58 fuzz
   regressions auto-written by the T7 batter — see the T7 section)
-- 1307 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
+- 1228 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
   plus fuzz corpora: ansi 2010 cases, decoder 800 cases, pi-photon
   byte-parity, segmenter corpus 1208 cases)
-- `cargo clippy --all-targets`: 0 errors, ~190 warnings. The warnings are
+- `cargo clippy --all-targets`: 0 errors, ~160 warnings. The warnings are
   predominantly intentional: ~56 non_snake_case mirrors of TS field names
   (e.g. markdown token fields) and small style lints in faithful-port code;
   the fdlibm constants/idioms are `allow`-annotated with justification.
