@@ -912,3 +912,28 @@ Framework/harness hardening driven by the same runs:
   18, editor 1, main 23, alt 2]).
 - `cargo test --workspace`: 1228 passed / 0 failed.
 - `cargo clippy --workspace --all-targets`: 0 errors.
+
+### Phase 3 roadmap: remaining layers (planned 2026-10-19)
+
+Port plans researched and written by parallel subagents (see `docs/plans/`):
+`phase3-providers.md` (provider/model/auth layer, ~4,400 LOC TS → new `pi-providers`
+crate), `phase3-mcp-extensions.md` (MCP + extensions subsystem; phase-3 scope is the
+pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-session.md`
+(agent loop, sliced into parity-green tranches), `phase3-cli.md` (CLI/TUI app layer,
+`config.ts` + Stage-A pieces first).
+
+- [x] **G8 async-runtime decision**: tokio with `new_current_thread()` runtime for the
+  agent-session layer; providers and MCP parity layers stay fully synchronous (pure
+  logic + sync traits with scripted fakes). Rationale and layer scoping in
+  `docs/decisions/G8-async-runtime.md`.
+- [x] `crates/pi-providers` scaffolded (Cargo.toml, module stubs, workspace member).
+- [ ] Providers tranche: foundation (pi-ai type surface, config_value, http_config,
+      auth_guidance, runtime_credentials, models_store, virtual_models) →
+      config/resolution (model_config, model_resolver, provider_attribution) →
+      auth/composer (auth_storage, provider_composer, remote_catalog) → facades
+      (model_runtime, model_registry) — each wave parity-green via new module-level
+      harness entries, then batter targets + regressions.
+- [ ] MCP pure-logic tranche: `pi-core/src/mcp_servers.rs`, `mcp_tools.rs`,
+      `tool_search.rs`.
+- [ ] CLI Stage A: `pi-cli/src/config.rs`, `migrations.rs`, `cli/args.rs`.
+- [ ] Agent-session tranches (tokio, per plan §5.5).

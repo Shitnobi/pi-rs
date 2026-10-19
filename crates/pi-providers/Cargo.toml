@@ -1,0 +1,9 @@
+[package]
+name = "pi-providers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pi-core = { path = "../pi-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
