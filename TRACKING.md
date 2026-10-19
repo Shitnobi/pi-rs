@@ -180,13 +180,13 @@ Remaining, roughly in dependency order:
 | G8 | async | `NestedToolCallRunner` (drives the agent tool pipeline) and `file-mutation-queue.ts` (global registration queue + per-realpath mutation queues) need an async runtime and the agent session layer; deferred with the agent-loop tranche. `NestedCallRecorder` — the persisted half — is ported | 3+ |
 ## Parity suite status
 
-- 1077/1077 cases pass (stable across repeated runs; includes the built-in
+- 1125/1125 cases pass (stable across repeated runs; includes the built-in
   tools, core-runtime modules, and the TUI groups: `tui-utils`,
   `tui-colors`, `math`, `tui-word-navigation`, `tui-keys`,
   `tui-stdin-buffer`, `tui-components`, `tui-editor`, `tui-main`,
   `tui-alt`, `tui-terminal-colors`, `tui-terminal-image`,
   `tui-markdown-lex`, `tui-latex`, `tui-markdown-render`)
-- 1303 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
+- 1307 Rust unit tests pass (pi-core, pi-tools, pi-session, pi-cli, pi-tui;
   plus fuzz corpora: ansi 2010 cases, decoder 800 cases, pi-photon
   byte-parity, segmenter corpus 1208 cases)
 - `cargo clippy --all-targets`: 0 errors, ~190 warnings. The warnings are
@@ -575,7 +575,7 @@ Remaining, roughly in dependency order:
   under a deterministic marker theme identical on both sides). Harness
   entries wired on both sides (`pi-cli harness tool tui-latex|
   tui-markdown-render`, TS dynamic-imports the sources). Final:
-  **parity 1077/1077, 1303 Rust tests, clippy 0 errors.**
+  **parity 1125/1125, 1307 Rust tests, clippy 0 errors.**
 - Clippy error fixes (pre-existing, surfaced by rustc 1.97 lints):
   fdlibm.rs now `allow`s `approx_constant`/`excessive_precision`/`eq_op`
   with justification (verbatim fdlibm literals and the `x - x` NaN
@@ -590,51 +590,46 @@ Remaining, roughly in dependency order:
 
 ### T6 redteam R1/R2 (IN PROGRESS — resume here)
 
-Status as of 2026-10-18 17:10 — everything committed through 9e57130
-(T6 Wave D); tree is clean. Two redteam delegates (markdown/marked,
-latex) were dispatched but BOTH FAILED before writing reports
-(`docs/report-t6-R1.md` / `report-t6-R2.md` do NOT exist). The markdown
-delegate confirmed (verbally, pre-report) **two findings, one fully
-characterized**; the second was never specified. The latex redteam has
-NOT been done at all. Resume checklist:
+Status as of 2026-10-18 18:45 — item 1 (the confirmed divergence class)
+is FIXED and committed; items 2/3 (redteam re-runs) remain.
 
-1. **[CONFIRMED DIVERGENCE — fix next] JS `.` vs Rust `.` in marked
-   rules.** Reproduced on both sides (tui-markdown-lex):
-   `"# aa\u2028bb"` and `"# aa\u2029bb"` → TS lexes a **paragraph**;
-   Rust lexes a **heading**. Root cause: JS regex `.` (non-`u`, non-`s`)
-   excludes `\n \r U+2028 U+2029`; fancy-regex `.` excludes only `\n`.
-   The heading rule `crates/pi-tui/src/marked/rules.rs:217`
-   `^ {0,3}(#{1,6})(?=[ \t\n\r\f\x0b]|$)(.*)(?:\n+|$)` is affected, and
-   so is EVERY other bare `.` outside a character class, at least:
-   - `lheading` (rules.rs:220): `((?:.|\n(?!...))+?)` — same dot issue
-   - `paragraph` + `table` (rules.rs:226-227): ` *([^\n ].*)\n` and
-     `.*(?:\n|$)` inside the table-row lookahead — bare `.` again
-   - `html` (rules.rs:224): audit (`[\w.:-]` is inside a class = literal
-     dot, fine; look for bare `.`)
-   - ALL inline rules (rules.rs InlineRules struct + inline.rs) — audit
-   Fix approach: the file already has the divergence-guard translator
-   `js_pattern_to_ascii` (rules.rs:24) but it (a) only handles
-   `\d/\w/\s/\b`, NOT `.`, and (b) is NOT called by `rx()` — the ASCII
-   class translations are baked into the static dump strings. Correct
-   fix: extend the translator with `.` → `[^\n\r\u{2028}\u{2029}]`
-   (outside classes, unescaped) AND wire it through `rx()` so all
-   statics get it (or regenerate the statics). Preserve: `\.` literal
-   dots and `[.]`/class-internal dots untouched. After fixing, rebuild,
-   re-run the repro (must MATCH), add regression parity cases to
-   `parity/waved/markdown-lex-cases.mjs` AND
-   `markdown-render-cases.mjs` (heading + lheading + table + paragraph
-   shapes containing U+2028/U+2029), full parity must stay green.
-   Repro one-liner (canonical compare, not raw-string — TS prints
-   compact, Rust pretty):
-   ```
-   node -e 'spawnSync node parity/ts-harness.js /tmp/pi-parity/redteam
-     with {tool:"tui-markdown-lex",args:{fn:"lex",source:"# aa\u2028bb"}}
-     vs target/release/pi-cli harness tool tui-markdown-lex --cwd ...
-     with {fn:"lex",source:...}'   (session log 2026-10-18 17:00 has it)
-   ```
-   NOTE: `\r` cases ("# aa\rbb", "# aa\r") already MATCH — marked
-   normalizes/short-circuits `\r` elsewhere; only U+2028/U+2029
-   observed diverging so far (test `\r` inside lheading/table too).
+1. **[FIXED] JS regex `.` / `\s` / m-flag-anchor semantics in marked
+   rules + JS `trim()` semantics.** All three divergence classes were
+   fixed in one pass:
+   - `rules.rs`: statics are now regenerated RAW from marked v18
+     (`scripts/dump-marked-rules.mjs` + `scripts/gen-marked-rules.mjs`)
+     and translated at compile time by the rewritten
+     `translate_js_pattern(src, multi_line)`:
+     - `.` (outside classes) → `[^\n\r\u{2028}\u{2029}]` (JS dot);
+     - `\s`/`\S` → explicit JS whitespace set (Unicode-aware; includes
+       U+FEFF, excludes U+0085 — Rust `\s` differs on both), also
+       inside character classes;
+     - `\d`/`\w` (+`\D`/`\W`) → ASCII classes, now ALSO inside
+       character classes (e.g. `[\w:-]` in the tag rule);
+     - `[\s\S]` idiom kept verbatim (== "any char" in both engines);
+     - m-flag `^`/`$` → explicit JS line-terminator anchors (JS m-mode
+       treats `\r` U+2028 U+2029 as terminators; Rust only `\n`);
+       builder multi_line stays OFF.
+   - `helpers.rs`: added `is_js_whitespace` + `js_trim`/`js_trim_start`/
+     `js_trim_end` (JS trim removes WhiteSpace+LineTerminator = the
+     `\s` set; Rust `str::trim` differs on U+0085/U+FEFF). Replaced
+     every marked-port `.trim()`/`.trim_end()` that mirrors a JS
+     `String.trim*` call (fences lang, heading text, list marker/items,
+     lheading, table row/cells, latex block text, link href/title,
+     splitCells).
+   - `inline.rs`: local JS_WS/JS_DOT consts now re-exported from
+     `rules.rs` (single source of truth).
+   - Verified: 143/143 whitespace probe cases match
+     (`scripts/probe-ws-parity.mjs`, 13 ws chars x 11 block shapes),
+     including the original repros (`# aa\u2028bb`, `#\u00a0foo`,
+     BOM fence langs, `a\ufeffb\n===` setext, NEL cases).
+   - Regression cases added: 30 lex + 19 render (ls/ps/nbsp/bom/nel
+     shapes) in parity/waved/markdown-lex-cases.mjs and
+     markdown-render-cases.mjs.
+   Full suite after fix: 1125/1125 parity, 1307 Rust tests, clippy 0
+   errors. Note: `cargo fmt -p pi-tui` was run by mistake once and
+   reverted wholesale — pi-tui is deliberately NOT rustfmt-formatted.
+
 2. **[UNKNOWN] second confirmed finding** from the failed markdown
    redteam delegate — unknown content. Re-run the markdown/marked
    redteam (line-by-line markdown.ts/markdown.rs + marked audit). The
@@ -644,6 +639,6 @@ NOT been done at all. Resume checklist:
 3. **[NOT STARTED] latex redteam** — same instructions vs latex.ts →
    docs/report-t6-R2.md (symbol tables codepoint audit, structure
    handling, JS semantics; delegate 53 died before starting).
-4. After fixes: full `node parity/run-parity.mjs` (expect 1077+new),
+4. After fixes: full `node parity/run-parity.mjs` (expect 1125+),
    `cargo test --release`, clippy 0 errors, update this section +
    parity-status counts, commit.

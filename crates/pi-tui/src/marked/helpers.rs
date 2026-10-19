@@ -145,6 +145,45 @@ pub(crate) fn js_index_of(text: &str, needle: &str) -> i64 {
 
 /// `$` (rtrim): strip trailing `c` chars; when `keep` is set, strip trailing
 /// chars that are NOT `c`.
+/// True for the chars JS `String.prototype.trim{,Start,End}` removes —
+/// exactly WhiteSpace + LineTerminator, i.e. the same set `\s` matches.
+/// Rust's `char::is_whitespace` (White_Space) differs on U+0085 (Rust
+/// trims it, JS keeps it) and U+FEFF (JS trims it, Rust keeps it).
+pub(crate) fn is_js_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n'
+            | '\u{0b}'
+            | '\u{0c}'
+            | '\r'
+            | ' '
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
+/// JS `String.prototype.trim`.
+pub(crate) fn js_trim(s: &str) -> &str {
+    s.trim_matches(is_js_whitespace)
+}
+
+/// JS `String.prototype.trimStart`.
+pub(crate) fn js_trim_start(s: &str) -> &str {
+    s.trim_start_matches(is_js_whitespace)
+}
+
+/// JS `String.prototype.trimEnd`.
+pub(crate) fn js_trim_end(s: &str) -> &str {
+    s.trim_end_matches(is_js_whitespace)
+}
+
 pub(crate) fn rtrim(text: &str, c: char, keep: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -233,10 +272,10 @@ pub(crate) fn split_cells(
     // Pass 2: split on " |" (JS split(/ \|/)).
     let mut cells: Vec<String> = pass1.split(" |").map(|s| s.to_string()).collect();
     // Drop leading cell when blank; drop trailing cell when blank.
-    if cells[0].trim().is_empty() {
+    if js_trim(&cells[0]).is_empty() {
         cells.remove(0);
     }
-    if !cells.is_empty() && cells.last().map(|s| s.trim().is_empty()).unwrap_or(false) {
+    if !cells.is_empty() && cells.last().map(|s| js_trim(s).is_empty()).unwrap_or(false) {
         cells.pop();
     }
     if let Some(max) = max {
@@ -250,7 +289,7 @@ pub(crate) fn split_cells(
     }
     // Trim each cell and unescape \| (slashPipe = /\\\|/g).
     for cell in cells.iter_mut() {
-        let trimmed = cell.trim().to_string();
+        let trimmed = js_trim(cell).to_string();
         *cell = js_replace(slash_pipe, &trimmed, |_| "|".to_string());
     }
     cells

@@ -32,8 +32,8 @@ use fancy_regex::Regex;
 
 use super::helpers::{
     indent_code_compensation, js_replace, js_replace_once, js_search, js_split_first_line,
-    latex_looks_like_pending_dollar_math, rtrim, split_cells, split_spaces,
-    trim_trailing_blank_lines,
+    js_trim, js_trim_end, latex_looks_like_pending_dollar_math, rtrim, split_cells,
+    split_spaces, trim_trailing_blank_lines,
 };
 use super::{Lexer, NumOrStr, TableCell, Token, TokenList, new_token_list};
 
@@ -133,7 +133,7 @@ impl Lexer {
             None => None,
             Some(m) if m.as_str().is_empty() => Some(String::new()),
             Some(m) => {
-                let trimmed = m.as_str().trim().to_string();
+                let trimmed = js_trim(m.as_str()).to_string();
                 Some(js_replace(&self.rules.inline.anyPunctuation, &trimmed, |c| {
                     c.get(1).map(|g| g.as_str().to_string()).unwrap_or_default()
                 }))
@@ -148,13 +148,13 @@ impl Lexer {
     /// `Tokenizer.heading(src)` (~639).
     pub(crate) fn heading(&mut self, src: &str) -> Option<Token> {
         let caps = self.rules.block.heading.captures(src).ok().flatten()?;
-        let mut text = caps.get(2).unwrap().as_str().trim().to_string();
+        let mut text = js_trim(caps.get(2).unwrap().as_str()).to_string();
         if self.rules.other.endingHash.is_match(&text).unwrap() {
             let s = rtrim(&text, '#', false);
             // JS `(pedantic || !s || endingSpaceChar.test(s)) && (n = s.trim())`
             // with pedantic=false.
             if s.is_empty() || self.rules.other.endingSpaceChar.is_match(&s).unwrap() {
-                text = s.trim().to_string();
+                text = js_trim(&s).to_string();
             }
         }
         let raw = rtrim_newlines(caps.get(0).unwrap().as_str());
@@ -298,7 +298,7 @@ impl Lexer {
     pub(crate) fn list(&mut self, src: &str) -> Option<Token> {
         let caps = self.rules.block.list.captures(src).ok().flatten()?;
         let mut e = src;
-        let marker = caps.get(1).unwrap().as_str().trim().to_string(); // n
+        let marker = js_trim(caps.get(1).unwrap().as_str()).to_string(); // n
         let ordered = marker.chars().count() > 1; // s
         let mut loose = false;
         let mut raw = String::new();
@@ -332,7 +332,7 @@ impl Lexer {
             let t2 = item_caps.get(2).map(|g| g.as_str()).unwrap_or("");
             let mut line = split_spaces(js_split_first_line(t2), t1_len); // h
             let next_line = js_split_first_line(e).to_string(); // d
-            let mut is_blank = line.trim().is_empty(); // O = !h.trim()
+            let mut is_blank = js_trim(&line).is_empty(); // O = !h.trim()
             let indent: i64; // g
             if is_blank {
                 indent = t1_len as i64 + 1;
@@ -373,7 +373,7 @@ impl Lexer {
                         break;
                     }
                     if js_search(&self.rules.other.nonSpaceChar, &dd) >= indent
-                        || d.trim().is_empty()
+                        || js_trim(d).is_empty()
                     {
                         item_text.push('\n');
                         item_text.push_str(&skip_chars(&dd, indent.max(0) as usize));
@@ -394,7 +394,7 @@ impl Lexer {
                         item_text.push('\n');
                         item_text.push_str(d);
                     }
-                    is_blank = d.trim().is_empty();
+                    is_blank = js_trim(d).is_empty();
                     item_raw.push_str(&cur_line);
                     item_raw.push('\n');
                     e = advance_past_line(e, cur_line.len());
@@ -422,12 +422,12 @@ impl Lexer {
         let Some(last_item) = items.last_mut() else {
             return None;
         };
-        last_item.raw = last_item.raw.trim_end().to_string();
+        last_item.raw = js_trim_end(&last_item.raw).to_string();
         if let Some(t) = last_item.text.as_mut() {
             // JS trimEnd; Rust trim_end trims the same practical set.
-            *t = t.trim_end().to_string();
+            *t = js_trim_end(t).to_string();
         }
-        let raw = raw.trim_end().to_string();
+        let raw = js_trim_end(&raw).to_string();
         for item in items.iter_mut() {
             self.state.top = false;
             let text = item.text.clone().unwrap_or_default();
@@ -633,7 +633,7 @@ impl Lexer {
         // r = t[3]?.trim() ? t[3].replace(tableRowBlankLine, "").split("\n") : []
         // (tableRowBlankLine has no g flag)
         let body_lines: Vec<String> = match caps.get(3).map(|m| m.as_str()) {
-            Some(s) if !s.trim().is_empty() => js_replace_once(
+            Some(s) if !js_trim(s).is_empty() => js_replace_once(
                 &self.rules.other.tableRowBlankLine,
                 s,
                 |_| String::new(),
@@ -692,7 +692,7 @@ impl Lexer {
     /// `Tokenizer.lheading(src)` (~1040).
     pub(crate) fn lheading(&mut self, src: &str) -> Option<Token> {
         let caps = self.rules.block.lheading.captures(src).ok().flatten()?;
-        let text = caps.get(1).unwrap().as_str().trim().to_string();
+        let text = js_trim(caps.get(1).unwrap().as_str()).to_string();
         let depth = if caps.get(2).and_then(|m| m.as_str().chars().next()) == Some('=') {
             1
         } else {
@@ -755,7 +755,7 @@ impl Lexer {
                 let mut token = Token::new("latexBlock", c.get(0).unwrap().as_str());
                 // JS String.prototype.trim trims WhiteSpace+LineTerminator —
                 // the same practical set as Rust str::trim.
-                token.text = Some(g.as_str().trim().to_string());
+                token.text = Some(js_trim(g.as_str()).to_string());
                 return Some(token);
             }
         }
@@ -763,7 +763,7 @@ impl Lexer {
         if let Some(c) = &bracket_match {
             if let Some(g) = c.get(1).filter(|g| !g.as_str().is_empty()) {
                 let mut token = Token::new("latexBlock", c.get(0).unwrap().as_str());
-                token.text = Some(g.as_str().trim().to_string());
+                token.text = Some(js_trim(g.as_str()).to_string());
                 return Some(token);
             }
         }

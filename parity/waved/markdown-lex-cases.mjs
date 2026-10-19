@@ -266,4 +266,41 @@ export const markdownLexCases = [
 	),
 	ml("unicode-text", "café — naïve 中文 🎉 emoji"),
 	ml("tabs-normalization", "a\tb\n\n\tindented after tab"),
+
+	// ------------------------------------------------------------------
+	// JS \s / JS dot semantics (U+2028/U+2029/U+00A0/U+FEFF/U+0085)
+	//
+	// JS `.` excludes all four line terminators and JS `\s` is the
+	// WhiteSpace+LineTerminator set (incl. U+FEFF, excl. U+0085) — both
+	// differ from Rust regex/trim defaults and are regression-guarded here.
+	// ------------------------------------------------------------------
+	ml("ls-heading-paragraph", "# aa\u2028bb"),
+	ml("ps-heading-paragraph", "# aa\u2029bb"),
+	ml("ls-in-heading-text", "# foo\u2028bar"),
+	ml("ls-paragraph-join", "foo\u2028bar"),
+	ml("ls-setext", "foo\u2028===\n"),
+	ml("ls-in-table", "| a\u2028b |\n| --- |\n| c |"),
+	ml("ls-hr-shape", "*\u2028*\u2028*\n"),
+	ml("ps-paragraph-join", "foo\u2029bar"),
+	ml("nbsp-heading", "#\u00a0foo"),
+	ml("nbsp-heading-after", "# foo\u00a0bar"),
+	ml("u1680-heading", "#\u1680foo"),
+	ml("u2000-heading", "#\u2000foo"),
+	ml("u200a-heading", "#\u200afoo"),
+	ml("nnbsp-heading", "#\u202ffoo"),
+	ml("mmsp-heading", "#\u205ffoo"),
+	ml("ideo-heading", "#\u3000foo"),
+	ml("bom-heading", "#\ufefffoo"),
+	ml("bom-heading-after", "# foo\ufeffbar"),
+	ml("nel-heading", "#\u0085foo"),
+	ml("bom-fence-lang", "```\ufeffjs\nx\n```"),
+	ml("nel-fence-lang", "```\u0085js\nx\n```"),
+	ml("bom-list-item", "-\ufefffoo"),
+	ml("bom-blockquote", ">\ufefffoo"),
+	ml("bom-table-cell", "| a |\n| --- |\n| \ufeffb |"),
+	ml("bom-lheading-trim", "a\ufeffb\n==="),
+	ml("nel-lheading-trim", "a\u0085b\n==="),
+	ml("nbsp-list", "-\u00a0foo"),
+	ml("ls-code-indent", "   \u2028x"),
+	ml("bom-inline-text", "a\ufeff*b*c"),
 ];

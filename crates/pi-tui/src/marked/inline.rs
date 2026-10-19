@@ -27,8 +27,9 @@ use std::sync::OnceLock;
 use fancy_regex::Regex;
 
 use super::helpers::{
-    find_closing_bracket, js_match_all, js_replace, latex_find_closing_delimiter,
-    latex_looks_like_pending_dollar_math, output_link, rtrim, StrCaptures,
+    find_closing_bracket, js_match_all, js_replace, js_trim,
+    latex_find_closing_delimiter, latex_looks_like_pending_dollar_math, output_link, rtrim,
+    StrCaptures,
 };
 use super::{new_token_list, Lexer, LinkDef, Token, TokenList};
 
@@ -86,16 +87,9 @@ fn char_boundary_after(text: &str, pos: usize) -> usize {
     i
 }
 
-/// JS `\s` character class (ECMAScript WhiteSpace + LineTerminator, valid
-/// even without the `u` flag). Rust/fancy-regex `\s` (Unicode White_Space)
-/// differs on \u{85} (matches in Rust, not JS) and \u{feff} (matches in JS,
-/// not Rust), so the exact JS set is spelled out for the locally-compiled
-/// regexes below.
-const JS_WS_CLASS: &str = r"\t\n\x0b\f\r \u{a0}\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}";
-
-/// JS `.` (dot) without the `s` flag: anything but \n, \r, U+2028, U+2029.
-/// (fancy-regex `.` excludes only \n.)
-const JS_DOT_CLASS: &str = r"[^\n\r\u{2028}\u{2029}]";
+// JS `\s` / JS `.` semantics are shared with the marked rule tables — see
+// the constants and translator in `rules.rs` (`JS_WS_SET` / `JS_DOT_SET`).
+use super::rules::{JS_DOT_SET as JS_DOT_CLASS, JS_WS_SET as JS_WS_CLASS};
 
 /// pi-tui's STRICT_STRIKETHROUGH_REGEX (markdown.ts line 5), ASCII-\s and
 /// JS-dot translated:
@@ -216,7 +210,7 @@ impl Lexer {
         let t2_orig = caps.get(2).map(|m| m.as_str()).unwrap_or("");
         let t3_orig: Option<&str> = caps.get(3).map(|m| m.as_str());
 
-        let n = t2_orig.trim().to_string();
+        let n = js_trim(t2_orig).to_string();
         let mut t2 = t2_orig.to_string();
         let mut t0 = t0_full.to_string();
         let mut cut_paren = false; // whether t[2]/t[0]/t[3] got rewritten below
@@ -242,9 +236,7 @@ impl Lexer {
                     + t1.chars().count() as i64
                     + close;
                 t2 = first_n_chars(&t2, close as usize);
-                t0 = first_n_chars(t0_full, u.max(0) as usize)
-                    .trim()
-                    .to_string();
+                t0 = js_trim(&first_n_chars(t0_full, u.max(0) as usize)).to_string();
                 cut_paren = true; // t[3] = ""
             }
         }
@@ -257,7 +249,7 @@ impl Lexer {
                 r = js_slice(t3, 1, -1);
             }
         }
-        s = s.trim().to_string();
+        s = js_trim(&s).to_string();
         if rules.other.startAngleBracket.is_match(&s).unwrap() {
             // non-pedantic branch: s = s.slice(1, -1)
             s = js_slice(&s, 1, -1);

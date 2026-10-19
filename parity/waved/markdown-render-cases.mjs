@@ -182,4 +182,28 @@ export const markdownRenderCases = [
 		"streaming-fence-progression",
 		["```\nline one\nline two\n``"].join("\n"),
 	),
+
+	// ------------------------------------------------- JS \s / dot semantics
+	// Regression guards for the JS-regex/trim whitespace semantics
+	// (U+2028/U+2029 line terminators, Unicode \s in headings/fences,
+	// U+FEFF vs U+0085 trim behavior).
+	mr("ls-heading-paragraph", "# aa\u2028bb"),
+	mr("ps-heading-paragraph", "# aa\u2029bb"),
+	mr("ls-paragraph-join", "foo\u2028bar"),
+	mr("ls-setext", "foo\u2028===\n"),
+	mr("ls-in-table", "| a\u2028b |\n| --- |\n| c |"),
+	mr("nbsp-heading", "#\u00a0foo"),
+	mr("u2000-heading", "#\u2000foo"),
+	mr("ideo-heading", "#\u3000foo"),
+	mr("bom-heading", "#\ufefffoo"),
+	mr("bom-heading-after", "# foo\ufeffbar"),
+	mr("nel-heading", "#\u0085foo"),
+	mr("bom-fence-lang", "```\ufeffjs\nx\n```"),
+	mr("nel-fence-lang", "```\u0085js\nx\n```"),
+	mr("bom-list-item", "-\ufefffoo"),
+	mr("bom-blockquote", ">\ufefffoo"),
+	mr("bom-lheading-trim", "a\ufeffb\n==="),
+	mr("nel-lheading-trim", "a\u0085b\n==="),
+	mr("bom-inline-text", "a\ufeff*b*c"),
+	mr("ls-hr-shape", "*\u2028*\u2028*\n"),
 ];
