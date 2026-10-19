@@ -10,6 +10,10 @@ use std::io::Read;
 
 use serde_json::Value;
 
+mod cli;
+mod config;
+mod migrations;
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = run(&args);
