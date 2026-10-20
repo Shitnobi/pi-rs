@@ -26,6 +26,9 @@
  * - "runtime-credentials": core/runtime-credentials.js overlay over the
  *   real pi-ai InMemoryCredentialStore
  * - "virtual-models": core/virtual-models.js virtual model helpers
+ * - "provider-attribution": core/provider-attribution.js header merge
+ * - "model-config": core/model-config.js load with injected inputs
+ * - "model-resolver": core/model-resolver.js resolution functions
  */
 const path = require("path");
 const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
@@ -1816,6 +1819,167 @@ async function runModule(tool, args, cwd) {
 				return { result: { model: vm.createVirtualModel(args.definition) } };
 			default:
 				throw new Error("unknown virtual-models fn: " + args.fn);
+		}
+	}
+	if (tool === "provider-attribution") {
+		const pa = require(path.join(distDir, "core", "provider-attribution.js"));
+		switch (args.fn) {
+			case "mergeProviderAttributionHeaders": {
+				// isInstallTelemetryEnabled consults process.env.PI_TELEMETRY
+				// first; the harness owns env concerns, so clear it for the
+				// call and let the stub settings manager decide.
+				delete process.env.PI_TELEMETRY;
+				const settingsManager = { getEnableInstallTelemetry: () => args.telemetryEnabled };
+				const result = pa.mergeProviderAttributionHeaders(
+					args.model,
+					settingsManager,
+					args.sessionId ?? undefined,
+					...(args.headerSources || []).map((headers) => (headers === null ? undefined : headers)),
+				);
+				return { result: result ?? null };
+			}
+			default:
+				throw new Error("unknown provider-attribution fn: " + args.fn);
+		}
+	}
+	if (tool === "model-config") {
+		const mc = require(path.join(distDir, "core", "model-config.js"));
+		const { stripJsonComments } = require(path.join(distDir, "utils", "json.js"));
+		const { stripBom } = require(path.join(distDir, "utils", "text.js"));
+		// The compiled validator is module-private in model-config.js, so
+		// rebuild it from the exported ModelsConfigSchema with the REAL
+		// typebox Compile, resolved from the coding-agent package's
+		// node_modules (same version the dist module itself loads).
+		const { createRequire } = require("module");
+		const pkgRequire = createRequire(path.join(distDir, "core", "model-config.js"));
+		const { Compile } = pkgRequire("typebox/compile");
+		const validate = Compile(mc.ModelsConfigSchema);
+		// formatValidationPath is module-private; replicate it verbatim.
+		const formatValidationPath = (error) => {
+			if (error.keyword === "required") {
+				const requiredProperties = error.params?.requiredProperties;
+				const requiredProperty = requiredProperties?.[0];
+				if (requiredProperty) {
+					const basePath = error.instancePath.replace(/^\//, "").replace(/\//g, ".");
+					return basePath ? `${basePath}.${requiredProperty}` : requiredProperty;
+				}
+			}
+			const p = error.instancePath.replace(/^\//, "").replace(/\//g, ".");
+			return p || "root";
+		};
+		switch (args.fn) {
+			case "load": {
+				// Mirror ModelConfig.load(modelsJsonPath) with injected inputs
+				// instead of the fs (deterministic parity):
+				// path null → modelsJsonPath undefined → empty config.
+				if (args.path === null || args.path === undefined) {
+					return { result: { providers: {}, providerIds: [], error: null } };
+				}
+				if (typeof args.content === "string") {
+					let parsed;
+					try {
+						parsed = JSON.parse(stripJsonComments(stripBom(args.content)));
+					} catch (error) {
+						return {
+							result: {
+								providers: {},
+								providerIds: [],
+								error: `Failed to parse models.json: ${error instanceof Error ? error.message : error}\n\nFile: ${args.path}`,
+							},
+						};
+					}
+					if (!validate.Check(parsed)) {
+						const errors =
+							[...validate.Errors(parsed)]
+								.map((error) => `  - ${formatValidationPath(error)}: ${error.message}`)
+								.join("\n") || "Unknown schema error";
+						return {
+							result: {
+								providers: {},
+								providerIds: [],
+								error: `Invalid models.json schema:\n${errors}\n\nFile: ${args.path}`,
+							},
+						};
+					}
+					// deepFreeze(structuredClone(x)) is JSON-identical to the
+					// raw parsed provider; keep parsed key order.
+					return { result: { providers: parsed.providers, providerIds: Object.keys(parsed.providers), error: null } };
+				}
+				if (typeof args.ioError === "string") {
+					return {
+						result: {
+							providers: {},
+							providerIds: [],
+							error: `Failed to load models.json: ${args.ioError}\n\nFile: ${args.path}`,
+						},
+					};
+				}
+				// content null + ioError null → readFile ENOENT → empty config.
+				return { result: { providers: {}, providerIds: [], error: null } };
+			}
+			default:
+				throw new Error("unknown model-config fn: " + args.fn);
+		}
+	}
+	if (tool === "model-resolver") {
+		const mr = require(path.join(distDir, "core", "model-resolver.js"));
+		// Reduced ModelRuntime over the injected args (deterministic, no env).
+		const modelRuntime = {
+			getModels: () => args.models,
+			getModel: (provider, modelId) =>
+				args.models.find((model) => model.provider === provider && model.id === modelId),
+			getAvailableSnapshot: () => args.availableModels,
+			hasConfiguredAuth: (provider) => (args.configuredAuth || []).includes(provider),
+		};
+		switch (args.fn) {
+			case "resolveModelReference":
+				// Verbatim: undefined fields drop out of JSON.stringify.
+				return {
+					result: mr.resolveModelReference(
+						{ text: args.text, provider: args.provider, thinkingSuffix: args.thinkingSuffix, fuzzy: args.fuzzy },
+						args.models,
+						(provider) => (args.usable || []).includes(provider),
+					),
+				};
+			case "findExactModelReferenceMatch":
+				return { result: mr.findExactModelReferenceMatch(args.modelReference, args.models) ?? null };
+			case "resolveModelScopeFromModels":
+				return { result: mr.resolveModelScopeFromModels(args.patterns, args.models) };
+			case "resolveCliModel":
+				return {
+					result: mr.resolveCliModel({
+						cliProvider: args.cliProvider,
+						cliModel: args.cliModel,
+						cliThinking: args.cliThinking,
+						inlineApiKey: args.inlineApiKey,
+						modelRuntime,
+					}),
+				};
+			case "findInitialModel": {
+				const r = await mr.findInitialModel({
+					scopedModels: args.scopedModels || [],
+					isContinuing: args.isContinuing,
+					defaultProvider: args.defaultProvider,
+					defaultModelId: args.defaultModelId,
+					defaultThinkingLevel: args.defaultThinkingLevel,
+					modelThinkingLevels: args.modelThinkingLevels,
+					modelRuntime,
+				});
+				return { result: { model: r.model ?? null, thinkingLevel: r.thinkingLevel, fallbackMessage: r.fallbackMessage ?? null } };
+			}
+			case "restoreModelFromSession": {
+				// shouldPrintMessages: false — no console output.
+				const r = await mr.restoreModelFromSession(
+					args.savedProvider,
+					args.savedModelId,
+					args.currentModel ?? undefined,
+					false,
+					modelRuntime,
+				);
+				return { result: { model: r.model ?? null, fallbackMessage: r.fallbackMessage ?? null } };
+			}
+			default:
+				throw new Error("unknown model-resolver fn: " + args.fn);
 		}
 	}
 	return undefined;

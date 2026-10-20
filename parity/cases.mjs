@@ -5544,6 +5544,241 @@ export const cases = [
 			maxTokens: 8192,
 		},
 	}),
+	// ------------------------------------------ provider-attribution (module)
+	// core/provider-attribution.ts: mergeProviderAttributionHeaders. Only
+	// provider+baseUrl of the model matter; telemetry gates the default
+	// attribution headers; session headers apply to opencode providers/hosts.
+	paCase("telemetry-off-no-headers", paModel(), false),
+	paCase("telemetry-on-anthropic-null", paModel(), true),
+	paCase("openrouter-provider", paModel({ provider: "openrouter", baseUrl: "https://openrouter.ai/api/v1" }), true),
+	paCase("openrouter-provider-telemetry-off", paModel({ provider: "openrouter", baseUrl: "https://openrouter.ai/api/v1" }), false),
+	paCase("openrouter-baseurl-substring", paModel({ provider: "myprov", baseUrl: "https://proxy.example/openrouter.ai/v1" }), true),
+	paCase("openrouter-baseurl-substring-lookalike-host", paModel({ provider: "myprov", baseUrl: "https://openrouter.ai.example.com/v1" }), true),
+	paCase("openrouter-baseurl-mixed-case-no-substring", paModel({ provider: "myprov", baseUrl: "https://OpenRouter.AI/v1" }), true),
+	paCase("nvidia-provider", paModel({ provider: "nvidia", baseUrl: "https://integrate.api.nvidia.com/v1" }), true),
+	paCase("nvidia-host", paModel({ provider: "myprov", baseUrl: "https://integrate.api.nvidia.com/v1" }), true),
+	paCase("nvidia-host-mixed-case", paModel({ provider: "myprov", baseUrl: "https://Integrate.API.NVIDIA.COM/v1" }), true),
+	paCase("nvidia-substring-not-hostname", paModel({ provider: "myprov", baseUrl: "https://evil.example/integrate.api.nvidia.com" }), true),
+	paCase("cloudflare-workers-ai-provider", paModel({ provider: "cloudflare-workers-ai", baseUrl: "https://api.cloudflare.com/client/v4" }), true),
+	paCase("cloudflare-ai-gateway-provider", paModel({ provider: "cloudflare-ai-gateway", baseUrl: "https://gateway.ai.cloudflare.com/v1" }), true),
+	paCase("cloudflare-api-host", paModel({ provider: "myprov", baseUrl: "https://api.cloudflare.com/client/v4/accounts/abc" }), true),
+	paCase("cloudflare-gateway-host", paModel({ provider: "myprov", baseUrl: "https://gateway.ai.cloudflare.com/v1/abc/anthropic" }), true),
+	paCase("opencode-provider-session", paModel({ provider: "opencode", baseUrl: "https://opencode.ai/api" }), false, { sessionId: "s-1" }),
+	paCase("opencode-provider-session-telemetry-on", paModel({ provider: "opencode", baseUrl: "https://opencode.ai/api" }), true, { sessionId: "s-1" }),
+	paCase("opencode-go-provider-session", paModel({ provider: "opencode-go" }), false, { sessionId: "s-1" }),
+	paCase("opencode-host-session", paModel({ provider: "myprov", baseUrl: "https://opencode.ai/api" }), false, { sessionId: "s-1" }),
+	paCase("opencode-session-id-undefined", paModel({ provider: "opencode" }), true),
+	paCase("session-id-non-opencode-ignored", paModel(), false, { sessionId: "s-1" }),
+	paCase("opencode-session-plus-nvidia-host", paModel({ provider: "opencode", baseUrl: "https://integrate.api.nvidia.com/v1" }), true, { sessionId: "s-1" }),
+	paCase("garbage-url-nvidia-provider", paModel({ provider: "nvidia", baseUrl: "not a url" }), true),
+	paCase("garbage-url-cloudflare-provider", paModel({ provider: "cloudflare-ai-gateway", baseUrl: "not a url" }), true),
+	paCase("garbage-url-opencode-provider-session", paModel({ provider: "opencode", baseUrl: "not a url" }), false, { sessionId: "s-1" }),
+	paCase("garbage-url-plain-null", paModel({ provider: "myprov", baseUrl: "not a url" }), true),
+	paCase("header-sources-merge", paModel(), true, { headerSources: [{ "x-a": "1" }, null] }),
+	paCase("header-sources-override-default", paModel({ provider: "openrouter", baseUrl: "https://openrouter.ai/api/v1" }), true, { headerSources: [{ "X-OpenRouter-Title": "custom" }] }),
+	paCase("header-sources-later-wins", paModel(), false, { headerSources: [{ a: "1" }, { a: "2", b: "3" }] }),
+	paCase("header-sources-only-telemetry-off", paModel(), false, { headerSources: [{ "x-only": "src" }] }),
+	paCase("empty-merge-null", paModel(), false),
+
+	// -------------------------------------------------- model-config (module)
+	// core/model-config.ts: ModelConfig.load. `path` is a label passed through
+	// verbatim into error strings; `content` is the raw file text (comments,
+	// trailing commas and BOM are handled by the loader); `ioError` simulates
+	// a non-ENOENT read failure. Expected error strings follow the typebox
+	// ground truth captured in the wave-2 spec.
+	mcCase("path-null", null, null, null),
+	mcCase("enoent-empty", "/models.json", null, null),
+	mcCase("io-error", "/models.json", null, "EACCES: permission denied, open '/models.json'"),
+	mcCase("io-error-path-label-verbatim", "/deep/dir/models.json", null, "EISDIR: illegal operation on a directory, read"),
+	mcCase("parse-not-json", "/m.json", "not json", null),
+	mcCase("parse-open-brace", "/m.json", "{", null),
+	mcCase("parse-trailing-garbage", "/m.json", "{} garbage", null),
+	mcCase("parse-block-comment-not-stripped", "/m.json", '{"providers": /* NOT stripped - only // per the regex */ {}}', null),
+	mcCase("strip-line-comment", "/m.json", '{\n  // top-level comment\n  "providers": {} // trailing\n}', null),
+	mcCase("strip-trailing-comma", "/m.json", '{"providers": {},}', null),
+	mcCase("strip-trailing-comma-in-array", "/m.json", '{"providers":{"a":{"models":[{"id":"m",},],},},}', null),
+	mcCase("comma-inside-string", "/m.json", '{"providers":{"a":{"name":"x, y"}}}', null),
+	mcCase("double-slash-inside-string", "/m.json", '{"providers":{"a":{"name":"http://x"}}}', null),
+	mcCase("bom", "/m.json", "\uFEFF" + '{"providers":{}}', null),
+	mcCase("bom-plus-comment", "/m.json", "\uFEFF" + '{ // c\n"providers": {"a": {}},}', null),
+	mcCase("valid-empty-providers", "/m.json", '{"providers":{}}', null),
+	mcCase("valid-one-provider", "/m.json", '{"providers":{"anthropic":{"name":"Anthropic","baseUrl":"https://api.anthropic.com","apiKey":"sk-test"}}}', null),
+	mcCase("valid-provider-order", "/m.json", '{"providers":{"b":{},"a":{},"c":{}}}', null),
+	mcCase("valid-model-full", "/m.json", '{"providers":{"p":{"models":[{"id":"full","name":"Full","api":"anthropic","baseUrl":"https://x.example","reasoning":true,"thinkingLevelMap":{"high":"max","low":null},"input":["text","image"],"inputLimits":{"maxRequestBytes":1000,"images":{"resize":{"maxWidth":1024,"maxHeight":768,"maxBytes":100000,"jpegQuality":80},"maxPerMessage":5,"maxPerRequest":20}},"cost":{"input":3,"output":15,"cacheRead":0.3,"cacheWrite":3.75,"tiers":[{"inputTokensAbove":0,"input":3,"output":15,"cacheRead":0.3,"cacheWrite":3.75},{"inputTokensAbove":1000,"input":1.5,"output":7.5,"cacheRead":0.15,"cacheWrite":1.875}]},"promptCache":{"short":0.5,"long":1},"contextWindow":200000,"maxTokens":64000,"samplingParams":{"temperature":0.6,"any":{"nested":[1,2]},"nul":null},"samplingParamsByThinkingLevel":{"high":{"temperature":1},"off":{}},"headers":{"x-custom":"v"},"compat":{"maxTokensField":"max_completion_tokens","thinkingFormat":"openai","thinkingTokenBudgetField":"thinking_budget","cacheControlFormat":"anthropic","sessionAffinityFormat":"openai","supportsTemperature":true,"vllmPriority":3}}]}}}', null),
+	mcCase("valid-model-minimal", "/m.json", '{"providers":{"a":{"models":[{"id":"m"}]}}}', null),
+	mcCase("valid-model-overrides", "/m.json", '{"providers":{"p":{"modelOverrides":{"m":{"name":"Renamed","reasoning":false,"contextWindow":1000,"cost":{"input":1}}}}}}', null),
+	mcCase("valid-schema-key", "/m.json", '{"$schema":"https://example.com/schema.json","providers":{}}', null),
+	mcCase("valid-unicode-strings", "/m.json", '{"providers":{"ünïcode":{"name":"Ünïcode ✓","models":[{"id":"mødel","name":"名前"}]}}}', null),
+	mcCase("valid-oauth-radius", "/m.json", '{"providers":{"r":{"oauth":"radius","name":"Radius"}}}', null),
+	mcCase("valid-cost-zero-negative", "/m.json", '{"providers":{"a":{"models":[{"id":"m","cost":{"input":0,"output":-1,"cacheRead":0,"cacheWrite":0}}]}}}', null),
+	mcCase("valid-sampling-params-arbitrary", "/m.json", '{"providers":{"a":{"models":[{"id":"m","samplingParams":{"temperature":0.7,"obj":{"nested":[1,2]},"nul":null,"str":"s","arr":[{"x":1}]}}]}}}', null),
+	mcCase("valid-sampling-params-by-thinking-level", "/m.json", '{"providers":{"a":{"models":[{"id":"m","samplingParamsByThinkingLevel":{"high":{"temperature":1},"off":{},"max":{"x":null}}}]}}}', null),
+	mcCase("valid-compat-chat-template-kwargs", "/m.json", '{"providers":{"p":{"compat":{"chatTemplateKwargs":{"budget":{"$var":"thinking.budget","omitWhenOff":true},"enabled":"thinking.enabled"}}}}}', null),
+	mcCase("valid-compat-openrouter-routing", "/m.json", '{"providers":{"p":{"compat":{"openRouterRouting":{"allow_fallbacks":false,"data_collection":"deny","only":["a","b"],"sort":{"by":"throughput","partition":null},"max_price":{"prompt":0.5,"completion":"auto"}}}}}}', null),
+	mcCase("valid-compat-allowed-fallback-models", "/m.json", '{"providers":{"p":{"compat":{"allowedFallbackModels":[{"provider":"openai","model":"gpt-5.5","cost":{"input":1,"output":2,"cacheRead":0.5,"cacheWrite":1}}]}}}}', null),
+	mcCase("error-missing-providers", "/m.json", "{}", null),
+	mcCase("error-root-not-object", "/m.json", "[]", null),
+	mcCase("error-providers-array", "/m.json", '{"providers":[]}', null),
+	mcCase("error-provider-value-number", "/m.json", '{"providers":{"a":1}}', null),
+	mcCase("error-model-missing-id", "/m.json", '{"providers":{"a":{"models":[{}]}}}', null),
+	mcCase("error-model-empty-id", "/m.json", '{"providers":{"a":{"models":[{"id":""}]}}}', null),
+	mcCase("error-model-id-number", "/m.json", '{"providers":{"a":{"models":[{"id":5}]}}}', null),
+	mcCase("error-context-window-zero", "/m.json", '{"providers":{"a":{"models":[{"id":"m","contextWindow":0}]}}}', null),
+	mcCase("error-max-tokens-negative", "/m.json", '{"providers":{"a":{"models":[{"id":"m","maxTokens":-1}]}}}', null),
+	mcCase("error-context-window-string", "/m.json", '{"providers":{"a":{"models":[{"id":"m","contextWindow":"1000"}]}}}', null),
+	mcCase("error-reasoning-string", "/m.json", '{"providers":{"a":{"models":[{"id":"m","reasoning":"yes"}]}}}', null),
+	mcCase("error-oauth-wrong-literal", "/m.json", '{"providers":{"a":{"oauth":"github"}}}', null),
+	mcCase("error-input-bogus-modality", "/m.json", '{"providers":{"a":{"models":[{"id":"m","input":["text","audio"]}]}}}', null),
+	mcCase("error-thinking-level-map-number", "/m.json", '{"providers":{"a":{"models":[{"id":"m","thinkingLevelMap":{"high":5}}]}}}', null),
+	mcCase("error-headers-non-string", "/m.json", '{"providers":{"a":{"headers":{"x":1}}}}', null),
+	mcCase("error-cost-missing-required", "/m.json", '{"providers":{"a":{"models":[{"id":"m","cost":{"input":1}}]}}}', null),
+	mcCase("error-cost-tier-missing-required", "/m.json", '{"providers":{"a":{"models":[{"id":"m","cost":{"input":1,"output":1,"cacheRead":1,"cacheWrite":1,"tiers":[{"input":2}]}}]}}}', null),
+	mcCase("error-prompt-cache-zero", "/m.json", '{"providers":{"a":{"models":[{"id":"m","promptCache":{"short":0}}]}}}', null),
+	mcCase("error-max-request-bytes-zero", "/m.json", '{"providers":{"a":{"models":[{"id":"m","inputLimits":{"maxRequestBytes":0}}]}}}', null),
+	mcCase("error-max-request-bytes-string", "/m.json", '{"providers":{"a":{"models":[{"id":"m","inputLimits":{"maxRequestBytes":"x"}}]}}}', null),
+	mcCase("error-jpeg-quality-101", "/m.json", '{"providers":{"a":{"models":[{"id":"m","inputLimits":{"images":{"resize":{"jpegQuality":101}}}}]}}}', null),
+	mcCase("error-compat-max-tokens-field", "/m.json", '{"providers":{"a":{"compat":{"maxTokensField":"bogus"}}}}', null),
+	mcCase("error-two-bad-props-reverse-instance-order", "/m.json", '{"providers":{"a":{"models":[{"id":"m","contextWindow":0,"reasoning":"x"}]}}}', null),
+	mcCase("error-two-providers-insertion-order", "/m.json", '{"providers":{"z":{"models":[{"id":"m","contextWindow":0}]},"a":{"models":[{"id":"m","maxTokens":-1}]}}}', null),
+
+	// ------------------------------------------------- model-resolver (module)
+	// core/model-resolver.ts: reference/scope/CLI/initial/session model
+	// resolution over a synthetic catalog (mrCatalog at the bottom of this
+	// file). All inputs are literal; `usable`/`configuredAuth` stand in for
+	// credential state.
+	mrRef("exact-bare-id", "gpt-5.5"),
+	mrRef("exact-provider-slash-id", "anthropic/claude-opus-4-8"),
+	mrRef("provider-slash-case-insensitive", "ANTHROPIC/claude-opus-4-8"),
+	mrRef("ambiguous-same-id-two-providers", "claude-sonnet-4-5", { usable: [] }),
+	mrRef("ambiguous-usable-one", "claude-sonnet-4-5", { usable: ["openai"] }),
+	mrRef("ambiguous-usable-both", "claude-sonnet-4-5", { usable: ["anthropic", "openai"] }),
+	mrRef("gateway-id-provider-prefix", "gateway/zai/glm-5"),
+	mrRef("gateway-id-bare", "zai/glm-5"),
+	mrRef("tie-named-usable-wins", "myprov/aab", { usable: ["myprov"] }),
+	mrRef("tie-sole-usable-raw-wins", "myprov/aab", { usable: ["other"] }),
+	mrRef("tie-unusable-named-preferred", "myprov/aab", { usable: [] }),
+	mrRef("prefix-target-gateway", "gateway/claude-sonnet-4-5", { usable: [] }),
+	mrRef("thinking-none-suffix-stays", "gpt-5.5:high", { thinkingSuffix: "none" }),
+	mrRef("thinking-strict-high", "gpt-5.5:high", { thinkingSuffix: "strict" }),
+	mrRef("thinking-strict-bogus", "gpt-5.5:bogus", { thinkingSuffix: "strict" }),
+	mrRef("thinking-lenient-bogus-warning", "gpt-5.5:bogus", { thinkingSuffix: "lenient" }),
+	mrRef("colon-id-strict-suffix-part-of-id", "qwen/qwen3-coder:exacto", { thinkingSuffix: "strict" }),
+	mrRef("colon-id-plus-thinking", "qwen/qwen3-coder:exacto:high", { thinkingSuffix: "strict" }),
+	mrRef("fuzzy-substring-id", "glm", { fuzzy: true, usable: ["anthropic", "openai", "openrouter", "gateway", "myprov", "other", "moonshotai"] }),
+	mrRef("fuzzy-substring-name", "zenith", { fuzzy: true, usable: ["anthropic", "openai", "openrouter", "gateway", "myprov", "other", "moonshotai"] }),
+	mrRef("fuzzy-off-name-miss", "zenith", { fuzzy: false }),
+	mrRef("fuzzy-sonnet-ambiguous", "sonnet", { fuzzy: true, usable: [] }),
+	mrRef("fuzzy-sonnet-usable-one-alias-wins", "sonnet", { fuzzy: true, usable: ["anthropic"] }),
+	mrRef("fuzzy-kimi-best-match-sort", "kimi", { fuzzy: true, usable: [] }),
+	mrRef("fuzzy-dated-substring", "claude-sonnet-4-5-2025092", { fuzzy: true, usable: [] }),
+	mrRef("provider-constraint", "claude-sonnet-4-5", { provider: "openai" }),
+	mrRef("provider-constraint-case-insensitive", "claude-opus-4-8", { provider: "Anthropic" }),
+	mrRef("provider-constraint-not-found-target", "nope-model", { provider: "anthropic" }),
+	mrRef("not-found-provider-prefix", "anthropic/nope-model"),
+	mrRef("not-found-prefix-with-thinking", "anthropic/nope-model:high"),
+	mrRef("not-found-unknown-prefix", "unknownprov/x"),
+	mrRef("empty-text", ""),
+	mrRef("text-trimmed", "  gpt-5.5  "),
+	mrExact("hit-bare-id", "gpt-5.5"),
+	mrExact("miss-fuzzy-only", "glm"),
+	mrExact("hit-provider-slash", "anthropic/claude-opus-4-8"),
+	mrExact("ambiguous-null", "claude-sonnet-4-5"),
+	mrExact("hit-gateway-id", "gateway/zai/glm-5"),
+	mrExact("thinking-suffix-null", "gpt-5.5:high"),
+	mrScope("exact-bare-id", ["gpt-5.5"]),
+	mrScope("exact-provider-id", ["anthropic/claude-opus-4-8"]),
+	mrScope("exact-thinking-high", ["gpt-5.5:high"]),
+	mrScope("invalid-suffix-warning", ["gpt-5.5:bogus"]),
+	mrScope("provider-id-invalid-suffix", ["anthropic/claude-opus-4-8:bogus"]),
+	mrScope("ambiguous-bare-id", ["claude-sonnet-4-5"]),
+	mrScope("thinking-suffix-ambiguous", ["claude-sonnet-4-5:high"]),
+	mrScope("glob-star-sonnet-bare-id-only", ["*sonnet*"]),
+	mrScope("glob-provider-star", ["anthropic/*"]),
+	mrScope("glob-brace-providers", ["{anthropic,openai}/*"]),
+	mrScope("glob-doublestar-kimi", ["**/kimi*"]),
+	mrScope("glob-question-single-char", ["myprov/a?b"]),
+	mrScope("glob-bracketed-exact-id-first", ["bracketed-model[1m]"]),
+	mrScope("glob-no-match", ["*nomatch*"]),
+	mrScope("no-match-non-glob", ["does-not-exist"]),
+	mrScope("duplicate-adds-deduped", ["gpt-5.5", "openai/gpt-5.5", "*gpt*"]),
+	mrScope("multiple-patterns-accumulate", ["anthropic/claude-opus-4-8", "myprov/aab", "nope"]),
+	mrScope("empty-patterns", []),
+	mrCli("no-model", {}),
+	mrCli("empty-models-error", { cliModel: "x", models: [] }),
+	mrCli("unknown-provider", { cliProvider: "nope", cliModel: "x" }),
+	mrCli("resolved-bare", { cliModel: "gpt-5.5" }),
+	mrCli("resolved-provider-flag", { cliProvider: "anthropic", cliModel: "claude-opus-4-8" }),
+	mrCli("resolved-provider-case-insensitive", { cliProvider: "OpenAI", cliModel: "gpt-5.5" }),
+	mrCli("resolved-with-thinking", { cliModel: "gpt-5.5:high" }),
+	mrCli("resolved-gateway-id", { cliModel: "gateway/zai/glm-5" }),
+	mrCli("ambiguous-no-auth", { cliModel: "claude-sonnet-4-5", configuredAuth: [] }),
+	mrCli("ambiguous-both-auth", { cliModel: "claude-sonnet-4-5", configuredAuth: ["anthropic", "openai"] }),
+	mrCli("ambiguous-inline-key", { cliModel: "claude-sonnet-4-5", inlineApiKey: true }),
+	mrCli("strict-bogus-suffix-not-found", { cliModel: "gpt-5.5:bogus" }),
+	mrCli("fallback-custom-model-default-present", { cliProvider: "anthropic", cliModel: "claude-future-9" }),
+	mrCli("fallback-custom-model-thinking", { cliModel: "anthropic/claude-future-9:high" }),
+	mrCli("fallback-no-default-first-model", { cliProvider: "myprov", cliModel: "brand-new-model" }),
+	mrCli("fallback-cli-thinking-suppresses-suffix", { cliProvider: "anthropic", cliModel: "claude-future-9:high", cliThinking: "low" }),
+	mrInitial("scoped-wins", { scopedModels: [mrScoped(mrFind("gpt-5.5", "openai"), "high")] }),
+	mrInitial("scoped-per-model-thinking", { scopedModels: [mrScoped(mrFind("gpt-5.5", "openai"))], modelThinkingLevels: { "openai/gpt-5.5": "low" } }),
+	mrInitial("scoped-default-thinking", { scopedModels: [mrScoped(mrFind("claude-opus-4-8", "anthropic"))], defaultThinkingLevel: "max" }),
+	mrInitial("continuing-skips-scoped", {
+		scopedModels: [mrScoped(mrFind("gpt-5.5", "openai"), "high")],
+		isContinuing: true,
+		defaultProvider: "anthropic",
+		defaultModelId: "claude-opus-4-8",
+		defaultThinkingLevel: "low",
+		configuredAuth: ["anthropic"],
+	}),
+	mrInitial("saved-default-with-auth", {
+		defaultProvider: "anthropic",
+		defaultModelId: "claude-opus-4-8",
+		configuredAuth: ["anthropic"],
+	}),
+	mrInitial("saved-default-per-model-thinking", {
+		defaultProvider: "anthropic",
+		defaultModelId: "claude-opus-4-8",
+		modelThinkingLevels: { "anthropic/claude-opus-4-8": "xhigh" },
+		configuredAuth: ["anthropic"],
+	}),
+	mrInitial("saved-default-no-auth-falls-through", {
+		defaultProvider: "anthropic",
+		defaultModelId: "claude-opus-4-8",
+		configuredAuth: [],
+		availableModels: [mrFind("gpt-5.5", "openai")],
+	}),
+	mrInitial("available-default-model-match", {
+		availableModels: [mrFind("gpt-5.5", "openai"), mrFind("claude-opus-4-8", "anthropic")],
+	}),
+	mrInitial("available-first-fallback", {
+		availableModels: [mrFind("aab", "myprov"), mrFind("abc", "myprov")],
+	}),
+	mrInitial("no-models", {}),
+	mrRestore("ok", { savedProvider: "anthropic", savedModelId: "claude-opus-4-8", configuredAuth: ["anthropic"] }),
+	mrRestore("model-no-longer-exists", {
+		savedProvider: "anthropic",
+		savedModelId: "gone-model",
+		availableModels: [mrFind("gpt-5.5", "openai")],
+	}),
+	mrRestore("no-auth-configured", {
+		savedProvider: "anthropic",
+		savedModelId: "claude-opus-4-8",
+		configuredAuth: [],
+		availableModels: [mrFind("aab", "myprov")],
+	}),
+	mrRestore("current-model-fallback", {
+		savedProvider: "anthropic",
+		savedModelId: "gone-model",
+		currentModel: mrFind("abc", "myprov"),
+		availableModels: [mrFind("gpt-5.5", "openai")],
+	}),
+	mrRestore("available-default-model-fallback", {
+		savedProvider: "anthropic",
+		savedModelId: "gone-model",
+		availableModels: [mrFind("aab", "myprov"), mrFind("claude-opus-4-8", "anthropic")],
+	}),
+	mrRestore("nothing-available", { savedProvider: "anthropic", savedModelId: "gone-model" }),
+
 ];
 
 // config-value sub-case builder (hoisted; used by the cases above).
@@ -5795,4 +6030,122 @@ function pasteSeq(content) {
 }
 function manyLines(n) {
 	return Array.from({ length: n }, (_, i) => "line " + (i + 1)).join("\n");
+}
+
+// provider-attribution sub-case builders (hoisted; see the
+// provider-attribution section). Only provider+baseUrl of the model matter,
+// so paModel reuses the full msModel chat-model shape.
+function paCase(name, model, telemetryEnabled, o = {}) {
+	return {
+		name: "provider-attribution/" + name,
+		tool: "provider-attribution",
+		args: {
+			fn: "mergeProviderAttributionHeaders",
+			model,
+			telemetryEnabled,
+			...(o.sessionId !== undefined ? { sessionId: o.sessionId } : {}),
+			...(o.headerSources !== undefined ? { headerSources: o.headerSources } : {}),
+		},
+	};
+}
+function paModel(o = {}) {
+	return msModel({ provider: o.provider ?? "anthropic", baseUrl: o.baseUrl ?? "https://api.anthropic.com" });
+}
+
+// model-config sub-case builder (hoisted; see the model-config section).
+// path is a label passed through verbatim into error strings (null = no
+// modelsJsonPath); content is the raw file text; ioError simulates a
+// non-ENOENT read failure. Null content + null ioError = ENOENT.
+function mcCase(name, path, content, ioError) {
+	return { name: "model-config/" + name, tool: "model-config", args: { fn: "load", path, content, ioError } };
+}
+
+// model-resolver sub-case builders (hoisted; see the model-resolver section).
+// mrCatalog builds the synthetic catalog shared by the resolver cases:
+// same id on two providers (claude-sonnet-4-5), alias vs dated ids, ids with
+// "/" and ":" (gateway/openrouter style), a bracketed id, and name-substring
+// fuzzy targets. Models use the full msModel chat-model shape.
+function mrCatalog() {
+	const defs = [
+		["claude-sonnet-4-5", "anthropic", "Claude Sonnet 4.5"],
+		["claude-sonnet-4-5-20250929", "anthropic", "Claude Sonnet 4.5 (dated)"],
+		["claude-opus-4-8", "anthropic", "Claude Opus 4.8"],
+		["claude-sonnet-4-5", "openai", "Sonnet Custom"],
+		["gpt-5.5", "openai", "GPT-5.5"],
+		["moonshotai/kimi-k2.6", "openrouter", "Kimi K2.6"],
+		["qwen/qwen3-coder:exacto", "openrouter", "Qwen3 Coder"],
+		["zai/glm-5", "gateway", "GLM-5"],
+		["bracketed-model[1m]", "myprov", "Bracketed"],
+		["aab", "myprov", "AAB"],
+		["abc", "myprov", "ABC"],
+		["mystery-1", "myprov", "Zenith Special"],
+		["myprov/aab", "other", "Prefixed aab"],
+		["kimi-for-coding", "moonshotai", "Kimi for coding"],
+	];
+	return defs.map((d) => msModel({ id: d[0], provider: d[1], name: d[2] }));
+}
+function mrFind(id, provider) {
+	for (const model of mrCatalog()) {
+		if (model.id === id && model.provider === provider) return model;
+	}
+	throw new Error("mrFind: no catalog model " + provider + "/" + id);
+}
+function mrCase(name, args) {
+	return { name: "model-resolver/" + name, tool: "model-resolver", args };
+}
+function mrRef(name, text, o = {}) {
+	return mrCase("ref-" + name, {
+		fn: "resolveModelReference",
+		text,
+		...(o.provider !== undefined ? { provider: o.provider } : {}),
+		thinkingSuffix: o.thinkingSuffix ?? "none",
+		fuzzy: o.fuzzy ?? false,
+		models: o.models ?? mrCatalog(),
+		usable: o.usable ?? [],
+	});
+}
+function mrExact(name, modelReference) {
+	return mrCase("exact-" + name, { fn: "findExactModelReferenceMatch", modelReference, models: mrCatalog() });
+}
+function mrScope(name, patterns) {
+	return mrCase("scope-" + name, { fn: "resolveModelScopeFromModels", patterns, models: mrCatalog() });
+}
+function mrCli(name, o = {}) {
+	return mrCase("cli-" + name, {
+		fn: "resolveCliModel",
+		...(o.cliProvider !== undefined ? { cliProvider: o.cliProvider } : {}),
+		...(o.cliModel !== undefined ? { cliModel: o.cliModel } : {}),
+		...(o.cliThinking !== undefined ? { cliThinking: o.cliThinking } : {}),
+		...(o.inlineApiKey !== undefined ? { inlineApiKey: o.inlineApiKey } : {}),
+		models: o.models ?? mrCatalog(),
+		configuredAuth: o.configuredAuth ?? [],
+	});
+}
+function mrInitial(name, o = {}) {
+	return mrCase("initial-" + name, {
+		fn: "findInitialModel",
+		scopedModels: o.scopedModels ?? [],
+		isContinuing: o.isContinuing ?? false,
+		...(o.defaultProvider !== undefined ? { defaultProvider: o.defaultProvider } : {}),
+		...(o.defaultModelId !== undefined ? { defaultModelId: o.defaultModelId } : {}),
+		...(o.defaultThinkingLevel !== undefined ? { defaultThinkingLevel: o.defaultThinkingLevel } : {}),
+		...(o.modelThinkingLevels !== undefined ? { modelThinkingLevels: o.modelThinkingLevels } : {}),
+		models: o.models ?? mrCatalog(),
+		availableModels: o.availableModels ?? [],
+		configuredAuth: o.configuredAuth ?? [],
+	});
+}
+function mrRestore(name, o = {}) {
+	return mrCase("restore-" + name, {
+		fn: "restoreModelFromSession",
+		savedProvider: o.savedProvider,
+		savedModelId: o.savedModelId,
+		currentModel: o.currentModel ?? null,
+		models: o.models ?? mrCatalog(),
+		availableModels: o.availableModels ?? [],
+		configuredAuth: o.configuredAuth ?? [],
+	});
+}
+function mrScoped(model, thinkingLevel) {
+	return { model, ...(thinkingLevel !== undefined ? { thinkingLevel } : {}) };
 }
