@@ -22,9 +22,13 @@ pub mod macros;
 pub mod compat;
 pub mod credential;
 pub mod js;
+pub mod lazy;
 pub mod model;
+pub mod model_operations;
 pub mod models;
+pub mod models_error;
 pub mod models_store;
+pub mod transcript;
 pub mod provider;
 
 /// The vendored builtin provider catalog (parsed once, shared).

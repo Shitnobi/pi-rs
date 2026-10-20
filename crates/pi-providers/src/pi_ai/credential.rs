@@ -325,6 +325,29 @@ pub trait ApiKeyAuth {
 		credential: Option<&ApiKeyCredential>,
 		signal: Option<&AbortFlag>,
 	) -> Result<Option<AuthResult>, JsError>;
+
+	// -- Facade-wave additions (models_impl login support) --
+	//
+	// TS `ApiKeyAuth` has an optional `login` method that `Models.login`
+	// dispatches to. The flows are async in TS; here they are sync seams
+	// with `has_login` reporting support (additive: defaulted, so existing
+	// implementors are unchanged and report "no login" like TS providers
+	// without a `login` method).
+
+	/// Whether this auth method supports login (TS `method?.login`).
+	fn has_login(&self) -> bool {
+		false
+	}
+
+	/// Run the provider-owned login flow (only called when
+	/// [`ApiKeyAuth::has_login`] is true).
+	fn login(
+		&self,
+		_interaction: &mut dyn crate::pi_ai::models::AuthInteraction,
+		_options: Option<&crate::pi_ai::models::LoginOptions>,
+	) -> Result<Credential, JsError> {
+		Err(JsError::new("login not supported"))
+	}
 }
 
 /// TS `OAuthAuth`, sync port. `login`/`refresh` are deferred (network flows);
@@ -338,6 +361,35 @@ pub trait OAuthAuth {
 	fn login_label(&self) -> Option<&str>;
 	/// Side-effect-free derivation of request auth from a valid credential.
 	fn to_auth(&self, credential: &OAuthCredential) -> Result<ModelAuth, JsError>;
+
+	// -- Facade-wave additions (models_impl refresh/login support) --
+	//
+	// TS `OAuthAuth` carries `refresh` and (optionally) `login`; the data
+	// port deferred them. `ModelsImpl` needs both seams, so they are added
+	// here with defaults (additive: existing implementors are unchanged
+	// and behave like TS providers without those methods).
+
+	/// Refresh an expiring credential (TS `refresh`, a network flow; the
+	/// sync port performs it inline under the credential-store lock).
+	fn refresh(&self, credential: &OAuthCredential) -> Result<OAuthCredential, JsError> {
+		let _ = credential;
+		Err(JsError::new("OAuth refresh not supported"))
+	}
+
+	/// Whether this auth method supports login (TS `method?.login`).
+	fn has_login(&self) -> bool {
+		false
+	}
+
+	/// Run the provider-owned login flow (only called when
+	/// [`OAuthAuth::has_login`] is true).
+	fn login(
+		&self,
+		_interaction: &mut dyn crate::pi_ai::models::AuthInteraction,
+		_options: Option<&crate::pi_ai::models::LoginOptions>,
+	) -> Result<Credential, JsError> {
+		Err(JsError::new("login not supported"))
+	}
 }
 
 /// TS `ProviderAuth` — at least one of `api_key`/`oauth` must be present.
