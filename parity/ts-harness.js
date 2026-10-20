@@ -35,6 +35,14 @@
  *   scripted fetch response and Date.now
  * - "provider-composer": core/provider-composer.js composition over
  *   scripted base/extension/modelConfig inputs
+ * - "event-bus": core/event-bus.js script-driven bus with numbered handlers
+ *   and captured console.error handler-error reports
+ * - "timings": core/timings.js script-driven timings with an injected
+ *   Date.now clock and captured console.error print stream
+ * - "slash-commands": core/slash-commands.js builtin list + serde round-trip
+ * - "settings-defaults": core/settings-defaults.js SETTINGS_DEFAULTS
+ * - "settings-schema": core/settings-schema.js Compile(SettingsSchema)
+ *   .Errors(value) rendered through formatValidationPath
  */
 const path = require("path");
 const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
@@ -2871,7 +2879,226 @@ async function runModule(tool, args, cwd) {
 		out.routes = routes;
 		return { result: out };
 	}
+
+	// ---- landed core-module wave (event-bus, timings, slash-commands, -------
+	// settings-defaults, settings-schema); mirrors pi-cli core_harness.rs.
+
+	if (tool === "event-bus") {
+		// Script-driven createEventBus() with numbered handlers. The safe
+		// handler reports caught errors via console.error(template, err);
+		// handlers throw STRINGS so the captured report renders identically
+		// to the Rust error sink ("Event handler error (ch): msg").
+		const { createEventBus } = require(path.join(distDir, "core", "event-bus.js"));
+		const ops = args.ops;
+		if (!Array.isArray(ops)) throw new Error("missing ops");
+		const log = [];
+		const errors = [];
+		const realError = console.error;
+		console.error = (...msgs) => errors.push(msgs.join(" "));
+		const bus = createEventBus();
+		// id -> { channel, unsub: fn | null }; entries persist after off so
+		// ids are never reused (mirrors the Rust live map).
+		const live = new Map();
+		const offId = (id) => {
+			const entry = live.get(id);
+			if (entry && entry.unsub) {
+				const unsub = entry.unsub;
+				entry.unsub = null;
+				unsub();
+			}
+		};
+		const isId = (v) => typeof v === "number" && Number.isInteger(v) && v >= 0;
+		try {
+			for (const op of ops) {
+				const kind = op.op;
+				if (typeof kind !== "string") throw new Error("missing op");
+				if (kind === "on" || kind === "once") {
+					if (typeof op.channel !== "string") throw new Error("missing channel");
+					if (!isId(op.handler)) throw new Error("missing handler");
+					if (op.throws !== undefined && typeof op.throws !== "string") throw new Error("throws must be a string");
+					if (op.clear !== undefined && typeof op.clear !== "boolean") throw new Error("clear must be a boolean");
+					if (op.unsub !== undefined && !Array.isArray(op.unsub)) throw new Error("unsub must be an array");
+					const unsubIds = op.unsub || [];
+					for (const u of unsubIds) if (!isId(u)) throw new Error("unsub entries must be ids");
+					const id = op.handler;
+					if (live.has(id)) throw new Error(`handler ${id} already registered`);
+					const once = kind === "once";
+					const unsub = bus.on(op.channel, (data) => {
+						// Node `once` removes the listener before invoking it.
+						if (once) offId(id);
+						log.push(op.channel + ":" + JSON.stringify(data));
+						for (const target of unsubIds) offId(target);
+						if (op.clear) bus.clear();
+						if (op.throws !== undefined) throw op.throws;
+					});
+					live.set(id, { channel: op.channel, unsub });
+				} else if (kind === "off") {
+					if (typeof op.channel !== "string") throw new Error("missing channel");
+					if (op.handler !== undefined && !isId(op.handler)) throw new Error("handler must be an id");
+					if (op.handler !== undefined) {
+						offId(op.handler);
+					} else {
+						for (const [id, entry] of [...live]) {
+							if (entry.channel === op.channel && entry.unsub) offId(id);
+						}
+					}
+				} else if (kind === "emit") {
+					if (typeof op.channel !== "string") throw new Error("missing channel");
+					bus.emit(op.channel, op.data === undefined ? null : op.data);
+				} else if (kind === "clear") {
+					bus.clear();
+				} else {
+					throw new Error("unknown op: " + kind);
+				}
+			}
+		} finally {
+			console.error = realError;
+		}
+		return { result: { log, errors } };
+	}
+
+	if (tool === "timings") {
+		// Script-driven core/timings.js with an injected clock. ENABLED is
+		// captured from PI_TIMING at module load, so the env var is set
+		// before a cache-busting dynamic import (fresh instance per case).
+		const { pathToFileURL } = require("url");
+		const enabled = args.enabled === undefined ? true : args.enabled;
+		if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean");
+		const steps = args.steps === undefined ? [] : args.steps;
+		if (!Array.isArray(steps)) throw new Error("missing steps");
+		process.env.PI_TIMING = enabled ? "1" : "0";
+		globalThis.__piParityTimingsSeq = (globalThis.__piParityTimingsSeq || 0) + 1;
+		const t = await import(
+			pathToFileURL(path.join(distDir, "core", "timings.js")).href +
+				"?parity=" + globalThis.__piParityTimingsSeq
+		);
+		const namespace = (step) => {
+			if (step.namespace === undefined || step.namespace === "main") return "main";
+			if (step.namespace === "extensions") return "extensions";
+			throw new Error("unknown namespace: " + step.namespace);
+		};
+		let now = 1000;
+		const realDateNow = Date.now;
+		Date.now = () => now;
+		const outputs = [];
+		const realError = console.error;
+		let capturing = false;
+		const chunks = [];
+		console.error = (...msgs) => {
+			if (capturing) chunks.push(msgs.join(" "));
+			else realError(...msgs);
+		};
+		try {
+			for (const step of steps) {
+				switch (step.step) {
+					case "reset":
+						t.resetTimings(namespace(step));
+						break;
+					case "time":
+						if (typeof step.label !== "string") throw new Error("missing label");
+						t.time(step.label, namespace(step));
+						break;
+					case "advance":
+						if (typeof step.ms !== "number" || !Number.isInteger(step.ms)) throw new Error("missing ms");
+						now += step.ms;
+						break;
+					case "set":
+						if (typeof step.ms !== "number" || !Number.isInteger(step.ms)) throw new Error("missing ms");
+						now = step.ms;
+						break;
+					case "print":
+						capturing = true;
+						try {
+							t.printTimings();
+						} finally {
+							capturing = false;
+						}
+						// Each console.error(msg) line contributes msg + "\n".
+						outputs.push(chunks.map((c) => c + "\n").join(""));
+						chunks.length = 0;
+						break;
+					default:
+						throw new Error("unknown step: " + step.step);
+				}
+			}
+		} finally {
+			console.error = realError;
+			Date.now = realDateNow;
+		}
+		return { result: { outputs } };
+	}
+
+	if (tool === "slash-commands") {
+		const { BUILTIN_SLASH_COMMANDS } = require(path.join(distDir, "core", "slash-commands.js"));
+		if (typeof args.op !== "string") throw new Error("missing op");
+		if (args.op === "list") {
+			// APP_NAME is baked from package.json at module load ("pi" in the
+			// shipped package) and is not injectable; args.app is ignored.
+			return { result: { commands: BUILTIN_SLASH_COMMANDS.map((c) => ({ ...c })) } };
+		}
+		if (args.op === "roundtrip") {
+			if (typeof args.kind !== "string") throw new Error("missing kind");
+			if (args.kind !== "builtin" && args.kind !== "info") throw new Error("unknown kind: " + args.kind);
+			const value = args.value;
+			if (value === undefined || value === null || typeof value !== "object" || Array.isArray(value)) {
+				throw new Error("missing value");
+			}
+			// The TS module performs no runtime validation: return as-is.
+			return { result: { value: JSON.parse(JSON.stringify(value)) } };
+		}
+		throw new Error("unknown op: " + args.op);
+	}
+
+	if (tool === "settings-defaults") {
+		const { SETTINGS_DEFAULTS } = require(path.join(distDir, "core", "settings-defaults.js"));
+		if (args.calls === undefined) return { result: { defaults: SETTINGS_DEFAULTS } };
+		if (typeof args.calls !== "number" || !Number.isInteger(args.calls) || args.calls < 0) {
+			throw new Error("calls must be a non-negative integer");
+		}
+		const defaults = [];
+		for (let i = 0; i < args.calls; i++) defaults.push(SETTINGS_DEFAULTS);
+		return { result: { defaults } };
+	}
+
+	if (tool === "settings-schema") {
+		const { pathToFileURL } = require("url");
+		const { createRequire } = require("module");
+		const { SettingsSchema } = await import(
+			pathToFileURL(path.join(distDir, "core", "settings-schema.js")).href
+		);
+		// Resolve typebox from the dist tree (ts-harness has no node_modules).
+		const distRequire = createRequire(path.join(distDir, "core", "anchor.js"));
+		const { Compile } = distRequire("typebox/compile");
+		if (args.settings === undefined) throw new Error("missing settings");
+		const compiled = Compile(SettingsSchema);
+		const errors = [...compiled.Errors(args.settings)].map((error) => ({
+			path: formatValidationPath(error),
+			instancePath: error.instancePath,
+			message: error.message,
+		}));
+		return { result: { errors } };
+	}
+
 	return undefined;
+}
+
+/**
+ * `formatValidationPath` from core/model-config.ts, shared by the
+ * settings-schema harness arm: dotted instance path, `required` errors point
+ * at the first missing property, an empty base renders as "root". Mirrors
+ * `SettingsValidationError::format_path` on the Rust side.
+ */
+function formatValidationPath(error) {
+	if (error.keyword === "required") {
+		const requiredProperties = error.params?.requiredProperties;
+		const requiredProperty = requiredProperties?.[0];
+		if (requiredProperty) {
+			const basePath = error.instancePath.replace(/^\//, "").replace(/\//g, ".");
+			return basePath ? `${basePath}.${requiredProperty}` : requiredProperty;
+		}
+	}
+	const path = error.instancePath.replace(/^\//, "").replace(/\//g, ".");
+	return path || "root";
 }
 
 let input = "";

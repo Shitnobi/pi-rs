@@ -19,6 +19,7 @@ mod resolver_harness;
 mod auth_harness;
 mod composer_harness;
 mod runtime_harness;
+mod core_harness;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -214,6 +215,10 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         }
         "model-runtime" | "model-registry" => {
             return runtime_harness::run(name, &input)
+        }
+        "event-bus" | "timings" | "slash-commands" | "settings-defaults"
+        | "settings-schema" => {
+            return core_harness::run(name, &input)
         }
         _ => {}
     }

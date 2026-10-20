@@ -67,6 +67,9 @@ import { altCases } from "./wavec/alt-cases.mjs";
 import { interactionCases } from "./wavec/interaction-cases.mjs";
 import { terminalImageCases } from "./waved/terminal-image-cases.mjs";
 import { markdownLexCases } from "./waved/markdown-lex-cases.mjs";
+// Ground-truth TS defaults, reused by the settings-schema valid-defaults
+// case (stays in sync with the TS tree automatically).
+import { SETTINGS_DEFAULTS } from "file:///tmp/pi-repo/packages/coding-agent/dist/core/settings-defaults.js";
 import { latexCases } from "./waved/latex-cases.mjs";
 import { markdownRenderCases } from "./waved/markdown-render-cases.mjs";
 import { regressionCases } from "./regressions/index.mjs";
@@ -6332,6 +6335,607 @@ export const cases = [
 	__cases.push(reg("classify-error", mrSteps([
 		{ fn: "classify", model: { provider: "cloudflare-workers-ai", modelId: "@cf/cloudflare/clef" }, context: { state: {}, questions: {} } },
 	])));
+
+	return __cases;
+})(),
+
+// ---- landed core-module wave: event-bus, timings, slash-commands, ----------
+// settings-defaults, settings-schema (see pi-cli core_harness.rs and the
+// matching arms in ts-harness.js for the wire protocol).
+
+// event-bus: script-driven bus with numbered handlers.
+...(() => {
+	const eb = (name, ops) => ({ tool: "event-bus", name: "eb-" + name, args: { ops } });
+	const __cases = [];
+
+	// basic delivery
+	__cases.push(eb("single-handler", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "emit", channel: "evt", data: { n: 1 } },
+	]));
+	__cases.push(eb("two-handlers-order", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "on", channel: "evt", handler: 2 },
+		{ op: "emit", channel: "evt", data: "x" },
+	]));
+	__cases.push(eb("emit-no-listeners", [
+		{ op: "emit", channel: "nobody", data: 42 },
+	]));
+	__cases.push(eb("channels-isolated", [
+		{ op: "on", channel: "a", handler: 1 },
+		{ op: "on", channel: "b", handler: 2 },
+		{ op: "emit", channel: "a", data: 1 },
+		{ op: "emit", channel: "b", data: 2 },
+		{ op: "emit", channel: "c", data: 3 },
+	]));
+
+	// data shapes (the bus signature is single-data emit)
+	__cases.push(eb("data-null", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "emit", channel: "evt" },
+	]));
+	__cases.push(eb("data-array", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "emit", channel: "evt", data: [1, "two", { three: 3 }] },
+	]));
+	__cases.push(eb("data-bool-int", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "emit", channel: "evt", data: false },
+		{ op: "emit", channel: "evt", data: 0 },
+	]));
+	__cases.push(eb("data-nested-object", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "emit", channel: "evt", data: { a: { b: [null, true] }, c: "d" } },
+	]));
+
+	// unsubscribe
+	__cases.push(eb("off-removes-handler", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "emit", channel: "evt", data: 1 },
+		{ op: "off", channel: "evt", handler: 1 },
+		{ op: "emit", channel: "evt", data: 2 },
+	]));
+	__cases.push(eb("off-idempotent", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "off", channel: "evt", handler: 1 },
+		{ op: "off", channel: "evt", handler: 1 },
+		{ op: "emit", channel: "evt", data: 1 },
+	]));
+	__cases.push(eb("off-unknown-id-noop", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "off", channel: "evt", handler: 9 },
+		{ op: "emit", channel: "evt", data: 1 },
+	]));
+	__cases.push(eb("off-all-channel", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "on", channel: "evt", handler: 2 },
+		{ op: "on", channel: "other", handler: 3 },
+		{ op: "off", channel: "evt" },
+		{ op: "emit", channel: "evt", data: 1 },
+		{ op: "emit", channel: "other", data: 2 },
+	]));
+	__cases.push(eb("off-all-unused-channel", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "off", channel: "nope" },
+		{ op: "emit", channel: "evt", data: 1 },
+	]));
+	__cases.push(eb("re-register-after-off-errors", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "off", channel: "evt", handler: 1 },
+		{ op: "on", channel: "evt", handler: 1 },
+	]));
+	__cases.push(eb("handler-reuse-errors", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "on", channel: "other", handler: 1 },
+	]));
+
+	// clear
+	__cases.push(eb("clear-removes-all", [
+		{ op: "on", channel: "a", handler: 1 },
+		{ op: "on", channel: "b", handler: 2 },
+		{ op: "clear" },
+		{ op: "emit", channel: "a", data: 1 },
+		{ op: "emit", channel: "b", data: 2 },
+	]));
+	__cases.push(eb("clear-then-re-register", [
+		{ op: "on", channel: "a", handler: 1 },
+		{ op: "clear" },
+		{ op: "on", channel: "a", handler: 2 },
+		{ op: "emit", channel: "a", data: 3 },
+	]));
+
+	// once (harness-level emulation: self-unsubscribe, Node once semantics)
+	__cases.push(eb("once-fires-once", [
+		{ op: "once", channel: "evt", handler: 1 },
+		{ op: "emit", channel: "evt", data: 1 },
+		{ op: "emit", channel: "evt", data: 2 },
+	]));
+	__cases.push(eb("once-among-regular", [
+		{ op: "once", channel: "evt", handler: 1 },
+		{ op: "on", channel: "evt", handler: 2 },
+		{ op: "emit", channel: "evt", data: "a" },
+		{ op: "emit", channel: "evt", data: "b" },
+	]));
+	__cases.push(eb("once-throws-still-removed", [
+		{ op: "once", channel: "evt", handler: 1, throws: "boom" },
+		{ op: "emit", channel: "evt", data: 1 },
+		{ op: "emit", channel: "evt", data: 2 },
+	]));
+
+	// error paths (handler throws a string; report captured on both sides)
+	__cases.push(eb("throws-captured", [
+		{ op: "on", channel: "boom", handler: 1, throws: "kaput" },
+		{ op: "emit", channel: "boom", data: 42 },
+	]));
+	__cases.push(eb("throws-later-handlers-run", [
+		{ op: "on", channel: "boom", handler: 1, throws: "kaput" },
+		{ op: "on", channel: "boom", handler: 2 },
+		{ op: "emit", channel: "boom", data: 42 },
+	]));
+	__cases.push(eb("throws-multiple-order", [
+		{ op: "on", channel: "boom", handler: 1, throws: "one" },
+		{ op: "on", channel: "boom", handler: 2 },
+		{ op: "on", channel: "boom", handler: 3, throws: "two" },
+		{ op: "emit", channel: "boom", data: null },
+	]));
+	__cases.push(eb("throws-non-first", [
+		{ op: "on", channel: "boom", handler: 1 },
+		{ op: "on", channel: "boom", handler: 2, throws: "late" },
+		{ op: "emit", channel: "boom", data: "z" },
+	]));
+
+	// emit over the listener snapshot: off/clear during an emit
+	__cases.push(eb("unsub-during-emit-still-runs", [
+		{ op: "on", channel: "evt", handler: 1 },
+		{ op: "on", channel: "evt", handler: 2, unsub: [2] },
+		{ op: "emit", channel: "evt", data: 1 },
+		{ op: "emit", channel: "evt", data: 2 },
+	]));
+	__cases.push(eb("unsub-other-during-emit", [
+		{ op: "on", channel: "evt", handler: 1, unsub: [3] },
+		{ op: "on", channel: "evt", handler: 2 },
+		{ op: "on", channel: "evt", handler: 3 },
+		{ op: "emit", channel: "evt", data: "a" },
+		{ op: "emit", channel: "evt", data: "b" },
+	]));
+	__cases.push(eb("unsub-self-during-emit", [
+		{ op: "on", channel: "evt", handler: 1, unsub: [1] },
+		{ op: "on", channel: "evt", handler: 2 },
+		{ op: "emit", channel: "evt", data: "a" },
+		{ op: "emit", channel: "evt", data: "b" },
+	]));
+	__cases.push(eb("unsub-multiple-during-emit", [
+		{ op: "on", channel: "evt", handler: 1, unsub: [2, 3] },
+		{ op: "on", channel: "evt", handler: 2 },
+		{ op: "on", channel: "evt", handler: 3 },
+		{ op: "on", channel: "evt", handler: 4 },
+		{ op: "emit", channel: "evt", data: 1 },
+		{ op: "emit", channel: "evt", data: 2 },
+	]));
+	__cases.push(eb("clear-during-emit-still-runs", [
+		{ op: "on", channel: "evt", handler: 1, clear: true },
+		{ op: "on", channel: "evt", handler: 2 },
+		{ op: "emit", channel: "evt", data: "a" },
+		{ op: "emit", channel: "evt", data: "b" },
+	]));
+	__cases.push(eb("unsub-and-throw-during-emit", [
+		{ op: "on", channel: "evt", handler: 1, unsub: [2], throws: "after" },
+		{ op: "on", channel: "evt", handler: 2 },
+		{ op: "emit", channel: "evt", data: 1 },
+		{ op: "emit", channel: "evt", data: 2 },
+	]));
+	__cases.push(eb("once-unsub-other-during-emit", [
+		{ op: "once", channel: "evt", handler: 1, unsub: [2] },
+		{ op: "on", channel: "evt", handler: 2 },
+		{ op: "emit", channel: "evt", data: "a" },
+		{ op: "emit", channel: "evt", data: "b" },
+	]));
+
+	// protocol misuse (in-band errors, identical messages on both sides)
+	__cases.push(eb("unknown-op", [{ op: "nope", channel: "evt" }]));
+	__cases.push(eb("missing-op", [{ channel: "evt" }]));
+	__cases.push({ tool: "event-bus", name: "eb-missing-ops", args: {} });
+
+	return __cases;
+})(),
+
+// timings: script-driven timings with an injected clock.
+...(() => {
+	const tm = (name, steps, extra = {}) => ({
+		tool: "timings", name: "tm-" + name, args: { steps, ...extra },
+	});
+	const __cases = [];
+
+	__cases.push(tm("disabled", [
+		{ step: "reset" },
+		{ step: "time", label: "a" },
+		{ step: "print" },
+	], { enabled: false }));
+	__cases.push(tm("enabled-explicit", [
+		{ step: "time", label: "a" },
+		{ step: "print" },
+	], { enabled: true }));
+	__cases.push(tm("basic-elapsed", [
+		{ step: "reset" },
+		{ step: "advance", ms: 10 },
+		{ step: "time", label: "a" },
+		{ step: "advance", ms: 20 },
+		{ step: "time", label: "b" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("no-print", [
+		{ step: "reset" },
+		{ step: "advance", ms: 5 },
+		{ step: "time", label: "a" },
+	]));
+	__cases.push(tm("implicit-reset-constant-clock", [
+		{ step: "time", label: "only" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("implicit-reset-then-more", [
+		{ step: "time", label: "first" },
+		{ step: "advance", ms: 7 },
+		{ step: "time", label: "second" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("negative-filtered", [
+		{ step: "reset" },
+		{ step: "time", label: "a" },
+		{ step: "set", ms: 500 },
+		{ step: "time", label: "bad" },
+		{ step: "set", ms: 600 },
+		{ step: "time", label: "c" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("all-negative-omits-group", [
+		{ step: "reset" },
+		{ step: "set", ms: 2000 },
+		{ step: "time", label: "bad" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("namespaces-first-touch-order", [
+		{ step: "time", label: "m1" },
+		{ step: "time", label: "e1", namespace: "extensions" },
+		{ step: "time", label: "m2" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("extensions-first", [
+		{ step: "reset", namespace: "extensions" },
+		{ step: "time", label: "e1", namespace: "extensions" },
+		{ step: "time", label: "m1" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("reset-preserves-position", [
+		{ step: "time", label: "m1" },
+		{ step: "time", label: "e1", namespace: "extensions" },
+		{ step: "reset" },
+		{ step: "time", label: "m2" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("reset-clears-entries", [
+		{ step: "reset" },
+		{ step: "advance", ms: 3 },
+		{ step: "time", label: "a" },
+		{ step: "reset" },
+		{ step: "time", label: "b" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("empty-group-omitted", [
+		{ step: "reset" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("print-twice-identical", [
+		{ step: "reset" },
+		{ step: "advance", ms: 4 },
+		{ step: "time", label: "a" },
+		{ step: "print" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("time-after-print", [
+		{ step: "reset" },
+		{ step: "advance", ms: 1 },
+		{ step: "time", label: "a" },
+		{ step: "print" },
+		{ step: "advance", ms: 2 },
+		{ step: "time", label: "b" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("advance-negative", [
+		{ step: "reset" },
+		{ step: "advance", ms: 50 },
+		{ step: "advance", ms: -20 },
+		{ step: "time", label: "a" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("zero-elapsed-prints", [
+		{ step: "reset" },
+		{ step: "time", label: "a" },
+		{ step: "time", label: "b" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("many-entries", [
+		{ step: "reset" },
+		{ step: "advance", ms: 1 },
+		{ step: "time", label: "a" },
+		{ step: "advance", ms: 2 },
+		{ step: "time", label: "b" },
+		{ step: "advance", ms: 3 },
+		{ step: "time", label: "c" },
+		{ step: "advance", ms: 4 },
+		{ step: "time", label: "d" },
+		{ step: "print" },
+	]));
+	__cases.push(tm("unknown-step", [{ step: "bogus" }]));
+	__cases.push(tm("unknown-namespace", [{ step: "reset", namespace: "bogus" }]));
+	__cases.push({ tool: "timings", name: "tm-missing-steps", args: {} });
+
+	return __cases;
+})(),
+
+// slash-commands: builtin list + type round-trip.
+...(() => {
+	const sc = (name, args) => ({ tool: "slash-commands", name: "sc-" + name, args });
+	const __cases = [];
+
+	__cases.push(sc("list", { op: "list" }));
+	__cases.push(sc("list-app-ignored", { op: "list", app: "pi" }));
+	const info = (extra = {}) => ({
+		name: "review",
+		source: "skill",
+		sourceInfo: {
+			path: "/skills/review/skill.json",
+			source: "skills",
+			scope: "project",
+			origin: "top-level",
+		},
+		...extra,
+	});
+	__cases.push(sc("info-minimal", { op: "roundtrip", kind: "info", value: info() }));
+	__cases.push(sc("info-with-description", {
+		op: "roundtrip", kind: "info", value: info({ description: "Run a review" }),
+	}));
+	__cases.push(sc("info-with-base-dir", {
+		op: "roundtrip",
+		kind: "info",
+		value: info({ sourceInfo: { path: "p", source: "builtin", scope: "user", origin: "package", baseDir: "/x" } }),
+	}));
+	for (const source of ["extension", "prompt", "skill"]) {
+		__cases.push(sc("info-source-" + source, {
+			op: "roundtrip", kind: "info", value: info({ source }),
+		}));
+	}
+	for (const scope of ["user", "project", "temporary"]) {
+		__cases.push(sc("info-scope-" + scope, {
+			op: "roundtrip",
+			kind: "info",
+			value: info({ sourceInfo: { path: "p", source: "s", scope, origin: "package" } }),
+		}));
+	}
+	for (const origin of ["package", "top-level"]) {
+		__cases.push(sc("info-origin-" + origin, {
+			op: "roundtrip",
+			kind: "info",
+			value: info({ sourceInfo: { path: "p", source: "s", scope: "user", origin } }),
+		}));
+	}
+	__cases.push(sc("builtin-minimal", {
+		op: "roundtrip", kind: "builtin", value: { name: "settings", description: "Open settings menu" },
+	}));
+	__cases.push(sc("builtin-with-hint", {
+		op: "roundtrip",
+		kind: "builtin",
+		value: { name: "model", description: "Select model", argumentHint: "<provider/model>" },
+	}));
+	__cases.push(sc("unknown-op", { op: "bogus" }));
+	__cases.push(sc("unknown-kind", { op: "roundtrip", kind: "bogus", value: {} }));
+	__cases.push({ tool: "slash-commands", name: "sc-missing-op", args: {} });
+
+	return __cases;
+})(),
+
+// settings-defaults: fresh SETTINGS_DEFAULTS per call.
+...(() => {
+	const sd = (name, args) => ({ tool: "settings-defaults", name: "sd-" + name, args });
+	return [
+		sd("default", {}),
+		sd("calls-1", { calls: 1 }),
+		sd("calls-3", { calls: 3 }),
+		sd("calls-0", { calls: 0 }),
+		sd("calls-negative", { calls: -1 }),
+	];
+})(),
+
+// settings-schema: validate_settings vs Compile(SettingsSchema).Errors.
+...(() => {
+	const ss = (name, settings) => ({ tool: "settings-schema", name: "ss-" + name, args: { settings } });
+	const __cases = [];
+
+	// valid
+	__cases.push(ss("valid-empty", {}));
+	__cases.push(ss("valid-assorted", {
+		$schema: "https://example.com/schema.json",
+		lastChangelogVersion: "1.2.3",
+		defaultProvider: "anthropic",
+		defaultModel: "claude-fable-5",
+		defaultThinkingLevel: "high",
+		modelThinkingLevels: { "anthropic/claude-fable-5": "low", "openai/gpt-5.2": "off" },
+		transport: "websocket",
+		sessionShareDestination: "gist",
+		steeringMode: "all",
+		followUpMode: "one-at-a-time",
+		theme: "dark",
+		compaction: {
+			enabled: false,
+			reserveTokens: 1000,
+			keepRecentTokens: 2000,
+			modelOverrides: { "anthropic/claude-fable-5": { reserveTokens: 500, keepRecentTokens: 700 } },
+		},
+		branchSummary: { reserveTokens: 2048, skipPrompt: true },
+		retry: {
+			enabled: false,
+			maxRetries: 5,
+			baseDelayMs: 500,
+			maxAgentDelayMs: 10000,
+			provider: { timeoutMs: 30000, maxRetries: 2, maxRetryDelayMs: 30000 },
+			maxDelayMs: 9000,
+		},
+		hideThinkingBlock: true,
+		showCacheMissNotices: true,
+		externalEditor: "vim",
+		shellPath: "/bin/bash",
+		quietStartup: "header",
+		defaultProjectTrust: "always",
+		shellCommandPrefix: "docker exec",
+		npmCommand: ["mise", "exec", "--", "npm"],
+		collapseChangelog: true,
+		enableInstallTelemetry: false,
+		enableAnalytics: true,
+		trackingId: "abc",
+		packages: ["some-pkg", { source: "other-pkg", autoload: false, extensions: ["a"], skills: ["b"], prompts: ["c"], themes: ["d"] }],
+		extensions: ["/path/to/ext"],
+		deviceId: "uuid",
+		skills: ["/skills/dir"],
+		prompts: ["/prompts"],
+		themes: ["/themes"],
+		enableSkillCommands: false,
+		terminal: {
+			showImages: false,
+			imageWidthCells: 80,
+			clearOnShrink: true,
+			showTerminalProgress: true,
+			hyperlinks: "auto",
+			images: "kitty",
+			trueColor: false,
+		},
+		images: { autoResize: false, blockImages: true },
+		enabledModels: ["anthropic/*"],
+		defaultTools: ["+read", "-bash"],
+		doubleEscapeAction: "fork",
+		treeFilterMode: "no-tools",
+		thinkingBudgets: { minimal: 1024, low: 2048, medium: 4096, high: 8192 },
+		editorPaddingX: 2,
+		outputPad: 1,
+		autocompleteMaxVisible: 7,
+		showHardwareCursor: true,
+		markdown: { codeBlockIndent: "    ", mermaid: "off" },
+		warnings: { anthropicExtraUsage: false },
+		codemode: { mode: "only", inlineBudget: 1000 },
+		sessionDir: "/sessions",
+		httpProxy: "http://proxy.example",
+		httpIdleTimeoutMs: "disabled",
+		websocketConnectTimeoutMs: 0,
+		tuiMode: "regular",
+		fullscreenExitOutput: "resume-hint",
+		fullscreenScrollbar: "always",
+		fullscreenCopyOnSelect: false,
+		fullscreenWheelScrollLines: 3,
+		queueMode: "all",
+		websockets: true,
+	}));
+	__cases.push(ss("valid-defaults-object", SETTINGS_DEFAULTS));
+
+	// root type violations
+	__cases.push(ss("root-array", []));
+	__cases.push(ss("root-string", "nope"));
+	__cases.push(ss("root-number", 42));
+	__cases.push(ss("root-null", null));
+	__cases.push(ss("root-boolean", true));
+
+	// unknown keys are permissive (additionalProperties: true)
+	__cases.push(ss("unknown-keys-ok", { totallyUnknown: 123, nested: { deep: true } }));
+	__cases.push(ss("unknown-in-compaction", { compaction: { bogus: "x", enabled: true } }));
+
+	// top-level type/enum violations
+	__cases.push(ss("transport-wrong-type", { transport: 42 }));
+	__cases.push(ss("transport-bad-literal", { transport: "nope" }));
+	__cases.push(ss("session-share-bad", { sessionShareDestination: "github" }));
+	__cases.push(ss("steering-mode-bad", { steeringMode: "one" }));
+	__cases.push(ss("follow-up-mode-bad", { followUpMode: [] }));
+	__cases.push(ss("default-project-trust-bad", { defaultProjectTrust: "maybe" }));
+	__cases.push(ss("quiet-startup-bad", { quietStartup: "loud" }));
+	__cases.push(ss("double-escape-bad", { doubleEscapeAction: "jump" }));
+	__cases.push(ss("tree-filter-bad", { treeFilterMode: "some" }));
+	__cases.push(ss("tui-mode-bad", { tuiMode: "windowed" }));
+	__cases.push(ss("fullscreen-exit-bad", { fullscreenExitOutput: "nothing" }));
+	__cases.push(ss("fullscreen-scrollbar-bad", { fullscreenScrollbar: "sometimes" }));
+	__cases.push(ss("fullscreen-wheel-bad", { fullscreenWheelScrollLines: "fast" }));
+	__cases.push(ss("fullscreen-wheel-null", { fullscreenWheelScrollLines: null }));
+	__cases.push(ss("queue-mode-bad", { queueMode: "sometimes" }));
+	__cases.push(ss("default-thinking-bad", { defaultThinkingLevel: "ultra" }));
+	__cases.push(ss("model-thinking-levels-bad-value", { modelThinkingLevels: { "a/b": "ultra" } }));
+	__cases.push(ss("model-thinking-levels-not-object", { modelThinkingLevels: "nope" }));
+	__cases.push(ss("schema-not-string", { $schema: 5 }));
+	__cases.push(ss("last-changelog-not-string", { lastChangelogVersion: 1.2 }));
+	__cases.push(ss("npm-command-not-array", { npmCommand: "npm" }));
+	__cases.push(ss("npm-command-bad-entry", { npmCommand: ["mise", 5] }));
+	__cases.push(ss("enabled-models-not-array", { enabledModels: "anthropic/*" }));
+	__cases.push(ss("default-tools-bad-entry", { defaultTools: ["+read", 7] }));
+	__cases.push(ss("http-idle-timeout-bad", { httpIdleTimeoutMs: "nope" }));
+	__cases.push(ss("http-idle-timeout-negative", { httpIdleTimeoutMs: -1 }));
+	__cases.push(ss("websocket-connect-timeout-bad", { websocketConnectTimeoutMs: true }));
+
+	// nested: compaction
+	__cases.push(ss("compaction-not-object", { compaction: "nope" }));
+	__cases.push(ss("compaction-enabled-bad", { compaction: { enabled: "yes" } }));
+	__cases.push(ss("compaction-reserve-negative", { compaction: { reserveTokens: -1 } }));
+	__cases.push(ss("compaction-reserve-fractional", { compaction: { reserveTokens: 1.5 } }));
+	__cases.push(ss("compaction-reserve-string", { compaction: { reserveTokens: "5" } }));
+	__cases.push(ss("compaction-keep-recent-null", { compaction: { keepRecentTokens: null } }));
+	__cases.push(ss("compaction-overrides-bad-value", {
+		compaction: { modelOverrides: { "prov/model": { reserveTokens: -5 } } },
+	}));
+	__cases.push(ss("compaction-overrides-not-object", {
+		compaction: { modelOverrides: { "prov/model": "nope" } },
+	}));
+	__cases.push(ss("compaction-overrides-not-record", { compaction: { modelOverrides: [1, 2] } }));
+
+	// nested: branchSummary, retry
+	__cases.push(ss("branch-summary-skip-prompt-bad", { branchSummary: { skipPrompt: 1 } }));
+	__cases.push(ss("branch-summary-reserve-bad", { branchSummary: { reserveTokens: "2048" } }));
+	__cases.push(ss("retry-max-retries-bad", { retry: { maxRetries: "3" } }));
+	__cases.push(ss("retry-provider-not-object", { retry: { provider: [] } }));
+	__cases.push(ss("retry-provider-max-delay-negative", { retry: { provider: { maxRetryDelayMs: -5 } } }));
+	__cases.push(ss("retry-max-delay-bad", { retry: { maxDelayMs: true } }));
+
+	// nested: terminal, images, markdown, warnings, codemode
+	__cases.push(ss("terminal-show-images-bad", { terminal: { showImages: "true" } }));
+	__cases.push(ss("terminal-image-width-bad", { terminal: { imageWidthCells: "wide" } }));
+	__cases.push(ss("terminal-images-bad-literal", { terminal: { images: "foo" } }));
+	__cases.push(ss("terminal-images-number", { terminal: { images: 0 } }));
+	__cases.push(ss("terminal-hyperlinks-bad", { terminal: { hyperlinks: "nope" } }));
+	__cases.push(ss("terminal-true-color-bad", { terminal: { trueColor: 1 } }));
+	__cases.push(ss("images-auto-resize-bad", { images: { autoResize: "yes" } }));
+	__cases.push(ss("images-not-object", { images: ["kitty"] }));
+	__cases.push(ss("markdown-mermaid-bad", { markdown: { mermaid: "sometimes" } }));
+	__cases.push(ss("markdown-indent-bad", { markdown: { codeBlockIndent: 4 } }));
+	__cases.push(ss("warnings-usage-bad", { warnings: { anthropicExtraUsage: "no" } }));
+	__cases.push(ss("codemode-mode-bad", { codemode: { mode: "off" } }));
+	__cases.push(ss("codemode-inline-budget-negative", { codemode: { inlineBudget: -1 } }));
+
+	// nested: thinkingBudgets, outputPad, packages, skills
+	__cases.push(ss("thinking-budgets-bad", { thinkingBudgets: { low: "5" } }));
+	__cases.push(ss("thinking-budgets-null-entry", { thinkingBudgets: { minimal: null } }));
+	__cases.push(ss("output-pad-bad-literal", { outputPad: 2 }));
+	__cases.push(ss("output-pad-bad-type", { outputPad: "1" }));
+	__cases.push(ss("packages-not-array", { packages: "pkg" }));
+	__cases.push(ss("packages-bad-object", { packages: [{ source: 5 }] }));
+	__cases.push(ss("packages-bad-autoload", { packages: [{ source: "p", autoload: "yes" }] }));
+	__cases.push(ss("packages-bad-extensions-entry", { packages: [{ source: "p", extensions: ["a", 5] }] }));
+	__cases.push(ss("skills-object-bad", { skills: { enableSkillCommands: "yes" } }));
+	__cases.push(ss("skills-array-bad-entry", { skills: ["/dir", 5] }));
+	__cases.push(ss("prompts-bad-entry", { prompts: ["/p", true] }));
+
+	// error volume / maxErrors cap
+	__cases.push(ss("cap-many-errors", {
+		transport: 42,
+		sessionShareDestination: 42,
+		steeringMode: 42,
+		followUpMode: 42,
+		defaultProjectTrust: 42,
+		doubleEscapeAction: 42,
+		treeFilterMode: 42,
+		tuiMode: 42,
+	}));
 
 	return __cases;
 })(),
