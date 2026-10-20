@@ -1,53 +1,36 @@
 # pi-rs Port Tracking
 
-## ⚠️ Current checkpoint (2026-10-19, night) — resume here
+# pi-rs Port Tracking
 
-**State: config/resolution wave COMPLETE and parity-green (1564/1564).**
-Landed on main (wave-a merged as f4920d2, wave-b as b42e897+6ab79f4):
+## ⚠️ Current checkpoint (2026-10-20) — resume here
 
-- `pi-core/src/text.rs`: `strip_json_comments` (port of utils/json.ts,
-  two-pass scanner, string literals untouched).
-- `pi-providers/src/provider_attribution.rs` (366 LOC, 21 tests):
-  `merge_provider_attribution_headers` — opencode session headers,
-  telemetry-gated attribution defaults, later-wins header sources;
-  host checks via WHATWG-lowercased hostname, raw-substring
-  `baseUrl.includes("openrouter.ai")`.
-- `pi-providers/src/model_config.rs` (1340 LOC, 48 tests): `ModelConfig`
-  load pipeline (stripBom + stripJsonComments + js_json_parse V8 errors)
-  plus a typebox-subset validator reproducing typebox v1.3.27
-  `Compile(...).Errors()` output exactly for ModelsConfigSchema:
-  required-first traversal in SCHEMA property order, maxErrors=8 global
-  cap, literal dual errors, maxItems-after-items ordering, instancePath
-  format. Probed schema tree vendored at /home/shinobi/compat-probe.json.
-- `pi-providers/src/minimatch.rs` (1074 LOC): minimatch 10.2.6-compatible
-  matcher (subset) + 8174-case differential fixture vs the real package
-  (vendored minimatch_cases.json/expected). Documented divergences:
-  POSIX fast-path backslash behavior, `!()` approximation, no {a..b..step}.
-- `pi-providers/src/model_resolver.rs` (1230 LOC): full port of
-  model-resolver.ts (resolveModelReference, findExactModelReferenceMatch,
-  resolveModelScopeFromModels, resolveCliModel, findInitialModel,
-  restoreModelFromSession; fuzzy fallback with alias preference and
-  stable descending js localeCompare; glob scope resolution exact-id-first
-  then minimatch on provider/id AND bare id; verbatim
-  defaultModelPerProvider static, insertion order = behavior).
-  Fixed an is_alias inversion (dated -YYYYMMDD ids) caught by parity.
-- `pi-providers/src/pi_ai/js.rs`: `js_locale_compare` (UTF-16 code-unit
-  compare; probed ≡ Node en-US localeCompare on catalog strings),
-  `is_valid_thinking_level`, `DEFAULT_THINKING_LEVEL = "medium"`.
-- New harness tools `provider-attribution`, `model-config` (config_harness.rs)
-  and `model-resolver` (resolver_harness.rs, 6 fns; reduced ModelRuntime =
-  models/availableModels/configuredAuth args).
-- 174 new parity cases (31 + 54 + 89). **Full parity: 1564/1564.**
-  `cargo test --workspace`: all green (pi-providers 102). Clippy: 0 new
-  findings in wave files.
+**State: facade wave COMPLETE and parity-green (1760/1760).**
+Landed on main through 0f55321:
 
-**Next steps (in order):**
-1. Auth/composer wave: full `auth_storage` (AuthStorage/ReadOnly/
-   InMemoryAuthStorageBackend — only the backend trait is ported),
-   `provider_composer`, `remote_catalog`.
-2. Facade wave: `model_runtime`, `model_registry`.
-Each wave parity-green via new harness entries, then batter targets +
-regressions.
+- `pi_ai/{models_error,model_operations,transcript,lazy,models_impl}.rs`
+  (commits 07c008d, cad9e79): pi-ai prerequisites — ModelsError,
+  assert/image/classifier error results, normalizeContext, lazyStream
+  semantics, and ModelsImpl/createModels implementing MutableModels
+  (refresh generations/supersede, publication chains, getAuth precedence,
+  login/logout, refresh with publication.update invocation). merge_headers
+  pub for reuse.
+- `model_runtime.rs` (~2800 LOC) + `model_registry.rs` (commits c5e979f):
+  full ModelRuntime/ModelRegistry ports — create() with injected
+  env/offline/catalog hooks, composition layer, snapshot machine with
+  availability seqs, credential op queue + CredentialSynchronizationError,
+  getProviderAuthStatus precedence, prepareRequest merging, virtual-model
+  registration/routing, register/unregister (TS void-refresh deliberately
+  NOT run inline — synchronous-facade observable contract; harness settle
+  step emulates it), getError ordering.
+- Parity harness: `runtime_harness.rs` + ts-harness entries + 85 cases
+  (54 mr-*, 31 reg-*) — commit 0f55321. builtin-catalog.json refreshed
+  from pi-ai dist data (42 providers, 1731 entries).
+- **Full parity: 1760/1760.** cargo test --workspace green.
+  Clippy at baseline (~349 warnings).
+
+**Next steps:** remaining core modules per roadmap (agent-session,
+session-manager, settings, extensions, tools/*), each wave parity-green
+via new harness entries.
 
 **Resume note (2026-10-19 23:59 — partial provider_composer work in tree):**
 `crates/pi-providers/src/provider_composer.rs` + `pi_ai/compat.rs` (new) +
