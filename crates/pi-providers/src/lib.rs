@@ -25,4 +25,5 @@ pub mod provider_attribution;
 pub mod provider_composer;
 pub mod remote_catalog;
 pub mod runtime_credentials;
+pub mod settings_schema;
 pub mod virtual_models;
