@@ -43,6 +43,10 @@
  * - "settings-defaults": core/settings-defaults.js SETTINGS_DEFAULTS
  * - "settings-schema": core/settings-schema.js Compile(SettingsSchema)
  *   .Errors(value) rendered through formatValidationPath
+ * - "prompt-templates": core/prompt-templates.js pure ops + per-case temp
+ *   fixture load (paths `<base>`-normalized, arrays order-insensitive)
+ * - "skills": core/skills.js loadFromDir/load (same fixture style) +
+ *   formatForPrompt over inline skill objects
  */
 const path = require("path");
 const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
@@ -3465,6 +3469,177 @@ async function runModule(tool, args, cwd) {
 		}
 	}
 
+	if (tool === "prompt-templates") {
+		// core/prompt-templates.js: pure ops plus a `load` op with a per-case
+		// temp fixture. `files` is materialized under mkdtemp, `$HOME` is
+		// injected so `~` expansion matches the Rust home_dir option, and
+		// template/diagnostic arrays are base-normalized (`<base>`) and
+		// sorted by (filePath, name) / (path, message) — readdir order
+		// differs between the two sides.
+		const { pathToFileURL } = require("url");
+		const fs = require("fs");
+		const os = require("os");
+		const op = args.op;
+		if (typeof op !== "string") throw new Error("missing op");
+		const mod = await import(pathToFileURL(path.join(distDir, "core", "prompt-templates.js")).href);
+		if (op === "parseCommandArgs") {
+			if (typeof args.argsString !== "string") throw new Error("missing argsString");
+			return { result: mod.parseCommandArgs(args.argsString) };
+		}
+		if (op === "substituteArgs") {
+			if (typeof args.content !== "string") throw new Error("content must be a string");
+			const list = args.args ?? [];
+			if (!Array.isArray(list) || list.some((v) => typeof v !== "string")) {
+				throw new Error("args must be an array of strings");
+			}
+			return { result: mod.substituteArgs(args.content, list) };
+		}
+		if (op === "expandPromptTemplate") {
+			if (typeof args.text !== "string") throw new Error("text must be a string");
+			const templatesIn = args.templates ?? [];
+			if (!Array.isArray(templatesIn)) throw new Error("templates must be an array");
+			const templates = templatesIn.map((t) => {
+				if (t === null || typeof t !== "object" || Array.isArray(t)) {
+					throw new Error("templates entries must be objects");
+				}
+				if (typeof t.name !== "string") throw new Error("templates entries must have a string name");
+				if (t.content !== undefined && typeof t.content !== "string") {
+					throw new Error("templates entry content must be a string");
+				}
+				if (t.description !== undefined && typeof t.description !== "string") {
+					throw new Error("templates entry description must be a string");
+				}
+				return { name: t.name, description: t.description ?? "", content: t.content ?? "", filePath: "" };
+			});
+			return { result: mod.expandPromptTemplate(args.text, templates) };
+		}
+		if (op === "load") {
+			const files = parityValidateFiles(args.files);
+			const optionsIn = args.options ?? {};
+			if (optionsIn === null || typeof optionsIn !== "object" || Array.isArray(optionsIn)) {
+				throw new Error("options must be an object");
+			}
+			const cwdRel = parityOptString(optionsIn, "cwd", "options.cwd must be a string") ?? "";
+			const agentRel = parityOptString(optionsIn, "agentDir", "options.agentDir must be a string") ?? "";
+			const homeRel = parityOptString(optionsIn, "homeDir", "options.homeDir must be a string") ?? "home";
+			const promptPaths = parityOptStrings(optionsIn, "promptPaths", "options.promptPaths must be an array of strings") ?? [];
+			const includeDefaults = parityOptBool(optionsIn, "includeDefaults", "options.includeDefaults must be a boolean") ?? false;
+			const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parity-pt-"));
+			parityMaterialize(files, base);
+			const savedHome = process.env.HOME;
+			process.env.HOME = path.join(base, homeRel);
+			try {
+				const result = mod.loadPromptTemplates({
+					cwd: parityJoinRel(base, cwdRel),
+					agentDir: parityJoinRel(base, agentRel),
+					promptPaths,
+					includeDefaults,
+				});
+				return {
+					result: {
+						templates_or_skills: result.templates.map((t) => parityNormalizeBase(t, base)).sort(parityCmp2("filePath", "name")),
+						diagnostics: result.diagnostics.map((d) => parityNormalizeBase(d, base)).sort(parityCmp2("path", "message")),
+					},
+				};
+			} finally {
+				if (savedHome === undefined) delete process.env.HOME;
+				else process.env.HOME = savedHome;
+				fs.rmSync(base, { recursive: true, force: true });
+			}
+		}
+		throw new Error("unknown prompt-templates op: " + op);
+	}
+
+	if (tool === "skills") {
+		// core/skills.js: loadFromDir / load with the same per-case fixture
+		// style, plus formatForPrompt over inline skill objects.
+		const { pathToFileURL } = require("url");
+		const fs = require("fs");
+		const os = require("os");
+		const op = args.op;
+		if (typeof op !== "string") throw new Error("missing op");
+		const mod = await import(pathToFileURL(path.join(distDir, "core", "skills.js")).href);
+		if (op === "loadFromDir") {
+			const files = parityValidateFiles(args.files);
+			if (typeof args.source !== "string") throw new Error("missing source");
+			const dirRel = parityOptString(args, "dir", "dir must be a string") ?? "";
+			const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parity-sk-"));
+			parityMaterialize(files, base);
+			try {
+				const result = mod.loadSkillsFromDir({ dir: parityJoinRel(base, dirRel), source: args.source });
+				return {
+					result: {
+						templates_or_skills: result.skills.map((s) => parityNormalizeBase(s, base)).sort(parityCmp2("name", "filePath")),
+						diagnostics: result.diagnostics.map((d) => parityNormalizeBase(d, base)).sort(parityCmp2("path", "message")),
+					},
+				};
+			} finally {
+				fs.rmSync(base, { recursive: true, force: true });
+			}
+		}
+		if (op === "load") {
+			const files = parityValidateFiles(args.files);
+			const optionsIn = args.options ?? {};
+			if (optionsIn === null || typeof optionsIn !== "object" || Array.isArray(optionsIn)) {
+				throw new Error("options must be an object");
+			}
+			const cwdRel = parityOptString(optionsIn, "cwd", "options.cwd must be a string") ?? "";
+			const agentRel = parityOptString(optionsIn, "agentDir", "options.agentDir must be a string") ?? "";
+			const homeRel = parityOptString(optionsIn, "homeDir", "options.homeDir must be a string") ?? "home";
+			const skillPaths = parityOptStrings(optionsIn, "skillPaths", "options.skillPaths must be an array of strings") ?? [];
+			const includeDefaults = parityOptBool(optionsIn, "includeDefaults", "options.includeDefaults must be a boolean") ?? false;
+			const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parity-sk-"));
+			parityMaterialize(files, base);
+			const savedHome = process.env.HOME;
+			process.env.HOME = path.join(base, homeRel);
+			try {
+				const result = mod.loadSkills({
+					cwd: parityJoinRel(base, cwdRel),
+					agentDir: parityJoinRel(base, agentRel),
+					skillPaths,
+					includeDefaults,
+				});
+				return {
+					result: {
+						templates_or_skills: result.skills.map((s) => parityNormalizeBase(s, base)).sort(parityCmp2("name", "filePath")),
+						diagnostics: result.diagnostics.map((d) => parityNormalizeBase(d, base)).sort(parityCmp2("path", "message")),
+					},
+				};
+			} finally {
+				if (savedHome === undefined) delete process.env.HOME;
+				else process.env.HOME = savedHome;
+				fs.rmSync(base, { recursive: true, force: true });
+			}
+		}
+		if (op === "formatForPrompt") {
+			const skillsIn = args.skills ?? [];
+			if (!Array.isArray(skillsIn)) throw new Error("skills must be an array");
+			const skills = skillsIn.map((s) => {
+				if (s === null || typeof s !== "object" || Array.isArray(s)) {
+					throw new Error("skills entries must be objects");
+				}
+				for (const k of ["name", "description", "filePath"]) {
+					if (typeof s[k] !== "string") {
+						throw new Error("skills entries must have string name, description and filePath");
+					}
+				}
+				return {
+					name: s.name,
+					description: s.description,
+					filePath: s.filePath,
+					disableModelInvocation: Boolean(s.disableModelInvocation),
+				};
+			});
+			let tool = "read";
+			if (args.fileReadTool !== undefined && args.fileReadTool !== null) {
+				if (typeof args.fileReadTool !== "string") throw new Error("fileReadTool must be a string");
+				tool = args.fileReadTool;
+			}
+			return { result: mod.formatSkillsForPrompt(skills, tool) };
+		}
+		throw new Error("unknown skills op: " + op);
+	}
+
 	return undefined;
 }
 
@@ -3485,6 +3660,74 @@ function formatValidationPath(error) {
 	}
 	const path = error.instancePath.replace(/^\//, "").replace(/\//g, ".");
 	return path || "root";
+}
+
+/** Fixture helpers shared by the prompt-templates / skills entries. */
+function parityValidateFiles(files) {
+	if (files === undefined || files === null) return {};
+	if (typeof files !== "object" || Array.isArray(files)) throw new Error("files must be an object");
+	for (const v of Object.values(files)) {
+		const ok = typeof v === "string" ||
+			(v !== null && typeof v === "object" && !Array.isArray(v) &&
+				Object.keys(v).length === 1 && typeof v.symlink === "string");
+		if (!ok) throw new Error("files values must be a string or {symlink}");
+	}
+	return files;
+}
+
+function parityMaterialize(files, base) {
+	const fs = require("fs");
+	const path = require("path");
+	for (const [rel, v] of Object.entries(files)) {
+		const target = path.join(base, rel);
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		if (typeof v === "string") fs.writeFileSync(target, v);
+		else fs.symlinkSync(v.symlink, target);
+	}
+}
+
+function parityJoinRel(base, rel) {
+	const trimmed = String(rel).replace(/^\/+/, "");
+	if (trimmed === "" || trimmed === ".") return base;
+	return base.replace(/\/+$/, "") + "/" + trimmed;
+}
+
+function parityNormalizeBase(value, base) {
+	if (typeof value === "string") return value.split(base).join("<base>");
+	if (Array.isArray(value)) return value.map((v) => parityNormalizeBase(v, base));
+	if (value !== null && typeof value === "object") {
+		const out = {};
+		for (const [k, v] of Object.entries(value)) out[k] = parityNormalizeBase(v, base);
+		return out;
+	}
+	return value;
+}
+
+/** Array.sort comparator over two string keys (missing → ""). */
+function parityCmp2(a, b) {
+	const cmp = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+	return (x, y) => cmp(x[a] ?? "", y[a] ?? "") || cmp(x[b] ?? "", y[b] ?? "");
+}
+
+function parityOptString(obj, key, err) {
+	const v = obj[key];
+	if (v === undefined || v === null) return undefined;
+	if (typeof v !== "string") throw new Error(err);
+	return v;
+}
+
+function parityOptStrings(obj, key, err) {
+	const v = obj[key];
+	if (v === undefined || v === null) return undefined;
+	if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) throw new Error(err);
+	return v;
+}
+
+function parityOptBool(obj, key, err) {
+	const v = obj[key];
+	if (v === undefined || v === null) return undefined;
+	if (typeof v !== "boolean") throw new Error(err);
+	return v;
 }
 
 let input = "";

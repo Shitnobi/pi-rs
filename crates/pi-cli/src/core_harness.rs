@@ -24,6 +24,8 @@ pub fn run(tool: &str, input: &Value) -> Result<Value, String> {
         "settings-defaults" => run_settings_defaults_harness(input),
         "settings-schema" => run_settings_schema_harness(input),
         "settings-manager" => run_settings_manager_harness(input),
+        "prompt-templates" => run_prompt_templates_harness(input),
+        "skills" => run_skills_harness(input),
         other => Err(format!("core_harness: unknown tool {other:?}")),
     }
 }
@@ -1489,5 +1491,486 @@ fn sm_call_method(
             Ok(Value::Null)
         }
         other => Err(format!("unknown settings-manager method: {other}")),
+    }
+}
+
+// ============================================================================
+// prompt-templates / skills (shared per-case fixture helpers)
+// ============================================================================
+
+/// Validate the `files` map shape (`{relpath: content | {symlink: target}}`).
+/// Byte-identical error messages with the TS entries.
+fn validate_files(files: Option<&Value>) -> Result<(), String> {
+    let files = files.unwrap_or(&Value::Null);
+    if !matches!(files, Value::Null | Value::Object(_)) {
+        return Err("files must be an object".to_string());
+    }
+    if let Value::Object(map) = files {
+        for v in map.values() {
+            let ok = matches!(v, Value::String(_))
+                || matches!(v, Value::Object(o)
+                    if o.len() == 1 && o.get("symlink").is_some_and(|s| s.as_str().is_some()));
+            if !ok {
+                return Err("files values must be a string or {symlink}".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Materialize the pre-validated `files` map under a fresh temp dir.
+/// Mirrors the TS `mkdtempSync` + `writeFileSync`/`symlinkSync` fixture; the
+/// absolute base never leaks into results (see `normalize_base`).
+fn create_fixture(files: Option<&Value>, prefix: &str) -> Result<std::path::PathBuf, String> {
+    static DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let files = files.unwrap_or(&Value::Null);
+    let seq = DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = std::env::temp_dir()
+        .join(format!("pi-parity-{prefix}-{}-{}", std::process::id(), seq));
+    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    if let Value::Object(map) = files {
+        for (rel, v) in map {
+            let target = base.join(rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            match v {
+                Value::String(content) => {
+                    std::fs::write(&target, content).map_err(|e| e.to_string())?
+                }
+                Value::Object(_) => {
+                    let link = v.get("symlink").and_then(|s| s.as_str()).unwrap_or("");
+                    std::os::unix::fs::symlink(link, &target).map_err(|e| e.to_string())?;
+                }
+                _ => unreachable!("validated by validate_files"),
+            }
+        }
+    }
+    Ok(base)
+}
+
+/// Node-ish `path.join(base, rel)` for harness-level roots (cases use clean
+/// relative subpaths; `""` / `"."` mean the base itself).
+fn join_rel(base: &str, rel: &str) -> String {
+    let rel = rel.trim_start_matches('/');
+    if rel.is_empty() || rel == "." {
+        return base.to_string();
+    }
+    format!("{}/{}", base.trim_end_matches('/'), rel)
+}
+
+/// Rewrite every occurrence of the per-case temp `base` in `value` to
+/// `<base>` so results from the two sides compare equal.
+fn normalize_base(value: &mut Value, base: &str) {
+    match value {
+        Value::String(s) => {
+            if s.contains(base) {
+                *s = s.replace(base, "<base>");
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_base(item, base);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                normalize_base(item, base);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Optional string field (`null`/absent → `None`) with a shared type error.
+fn opt_string_field(obj: &Value, key: &str, err: &str) -> Result<Option<String>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(err.to_string()),
+    }
+}
+
+fn opt_strings_field(obj: &Value, key: &str, err: &str) -> Result<Option<Vec<String>>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(
+                    item.as_str()
+                        .ok_or_else(|| err.to_string())?
+                        .to_string(),
+                );
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err(err.to_string()),
+    }
+}
+
+fn opt_bool_field(obj: &Value, key: &str, err: &str) -> Result<Option<bool>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(err.to_string()),
+    }
+}
+
+/// JS truthiness for `disableModelInvocation`-style flags.
+fn js_truthy(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Number(n)) => n
+            .as_f64()
+            .map(|x| x != 0.0 && !x.is_nan())
+            .unwrap_or(true),
+        Some(_) => true,
+    }
+}
+
+/// Sort a serialized templates/skills/diagnostics array by two string keys —
+/// readdir iteration order differs between the two sides, so multi-file
+/// directories must never be asserted order-sensitively.
+fn sort_by_keys(items: &mut [Value], a: &str, b: &str) {
+    items.sort_by(|x, y| {
+        let key = |v: &Value| {
+            (
+                v[a].as_str().unwrap_or("").to_string(),
+                v[b].as_str().unwrap_or("").to_string(),
+            )
+        };
+        key(x).cmp(&key(y))
+    });
+}
+
+/// Serialize + normalize + sort a load result (shared by the `load` and
+/// `loadFromDir` ops of both tools).
+fn fixture_result(
+    primary: Vec<Value>,
+    diagnostics: Vec<Value>,
+    base: &str,
+    primary_keys: (&str, &str),
+) -> Value {
+    let mut primary = primary;
+    let mut diagnostics = diagnostics;
+    for v in primary.iter_mut().chain(diagnostics.iter_mut()) {
+        normalize_base(v, base);
+    }
+    sort_by_keys(&mut primary, primary_keys.0, primary_keys.1);
+    sort_by_keys(&mut diagnostics, "path", "message");
+    json!({
+        "templates_or_skills": primary,
+        "diagnostics": diagnostics,
+    })
+}
+
+// ============================================================================
+// prompt-templates
+// ============================================================================
+
+/// `prompt-templates` harness: `pi_core::prompt_templates` (TS
+/// `core/prompt-templates.js`). args `{ op: ... }`:
+/// - `{op:"parseCommandArgs", argsString}` → `Vec<String>`
+/// - `{op:"substituteArgs", content, args?}` → substituted string
+/// - `{op:"expandPromptTemplate", text, templates?}` → expanded string
+///   (entries need `name`; only name/content reach the module)
+/// - `{op:"load", files?, options?}` → `{templates_or_skills, diagnostics}`
+///   with `files` materialized under a per-case temp dir (`<base>`-normalized
+///   paths, `(filePath, name)` / `(path, message)` sort). `options.cwd` /
+///   `agentDir` / `homeDir` are relative roots joined to the base (homeDir
+///   defaults to `"home"` and backs `~` expansion; the TS side injects it as
+///   `$HOME`); `promptPaths` entries are passed verbatim and resolve against
+///   `cwd` like the module does. `configDirName` is fixed to the dist value
+///   `".pi"` on both sides (TS reads it from package.json at import time).
+fn run_prompt_templates_harness(input: &Value) -> Result<Value, String> {
+    use pi_core::prompt_templates::{
+        expand_prompt_template, load_prompt_templates, parse_command_args, substitute_args,
+        LoadPromptTemplatesOptions, PromptTemplate, SourceInfo, SourceOrigin, SourceScope,
+    };
+
+    let op = input["op"].as_str().ok_or("missing op")?;
+    match op {
+        "parseCommandArgs" => {
+            let args_string = input["argsString"].as_str().ok_or("missing argsString")?;
+            Ok(json!({ "result": parse_command_args(args_string) }))
+        }
+        "substituteArgs" => {
+            let content = input["content"]
+                .as_str()
+                .ok_or("content must be a string")?;
+            let args: Vec<String> = match input.get("args") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .ok_or_else(|| "args must be an array of strings".to_string())
+                    })
+                    .collect::<Result<_, _>>()?,
+                Some(_) => return Err("args must be an array of strings".to_string()),
+            };
+            Ok(json!({ "result": substitute_args(content, &args) }))
+        }
+        "expandPromptTemplate" => {
+            let text = input["text"].as_str().ok_or("text must be a string")?;
+            let templates_in = match input.get("templates") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(items)) => items.clone(),
+                Some(_) => return Err("templates must be an array".to_string()),
+            };
+            let mut templates = Vec::with_capacity(templates_in.len());
+            for t in &templates_in {
+                let obj = t
+                    .as_object()
+                    .ok_or("templates entries must be objects")?;
+                let name = obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or("templates entries must have a string name")?;
+                for (key, err) in [
+                    ("content", "templates entry content must be a string"),
+                    ("description", "templates entry description must be a string"),
+                ] {
+                    if let Some(v) = obj.get(key) {
+                        if !v.is_string() {
+                            return Err(err.to_string());
+                        }
+                    }
+                }
+                templates.push(PromptTemplate {
+                    name: name.to_string(),
+                    description: obj
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    argument_hint: None,
+                    content: obj
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    source_info: SourceInfo {
+                        path: String::new(),
+                        source: "local".to_string(),
+                        scope: SourceScope::Temporary,
+                        origin: SourceOrigin::TopLevel,
+                        base_dir: None,
+                    },
+                    file_path: String::new(),
+                });
+            }
+            Ok(json!({ "result": expand_prompt_template(text, &templates) }))
+        }
+        "load" => {
+            validate_files(input.get("files"))?;
+            let options_in = match input.get("options") {
+                None | Some(Value::Null) => json!({}),
+                Some(v @ Value::Object(_)) => v.clone(),
+                Some(_) => return Err("options must be an object".to_string()),
+            };
+            let cwd_rel = opt_string_field(&options_in, "cwd", "options.cwd must be a string")?
+                .unwrap_or_default();
+            let agent_rel =
+                opt_string_field(&options_in, "agentDir", "options.agentDir must be a string")?
+                    .unwrap_or_default();
+            let home_rel = opt_string_field(
+                &options_in,
+                "homeDir",
+                "options.homeDir must be a string",
+            )?
+            .unwrap_or_else(|| "home".to_string());
+            let prompt_paths = opt_strings_field(
+                &options_in,
+                "promptPaths",
+                "options.promptPaths must be an array of strings",
+            )?
+            .unwrap_or_default();
+            let include_defaults = opt_bool_field(
+                &options_in,
+                "includeDefaults",
+                "options.includeDefaults must be a boolean",
+            )?
+            .unwrap_or(false);
+
+            let base = create_fixture(input.get("files"), "pt")?;
+            let base_s = base.to_string_lossy().into_owned();
+            let options = LoadPromptTemplatesOptions {
+                cwd: join_rel(&base_s, &cwd_rel),
+                agent_dir: join_rel(&base_s, &agent_rel),
+                prompt_paths,
+                include_defaults,
+                config_dir_name: ".pi".to_string(),
+                home_dir: Some(join_rel(&base_s, &home_rel)),
+            };
+            let result = load_prompt_templates(&options);
+            let templates: Vec<Value> = result
+                .templates
+                .iter()
+                .map(|t| serde_json::to_value(t).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
+            let diagnostics: Vec<Value> = result
+                .diagnostics
+                .iter()
+                .map(|d| serde_json::to_value(d).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
+            let _ = std::fs::remove_dir_all(&base);
+            Ok(json!({ "result": fixture_result(templates, diagnostics, &base_s, ("filePath", "name")) }))
+        }
+        other => Err(format!("unknown prompt-templates op: {other}")),
+    }
+}
+
+// ============================================================================
+// skills
+// ============================================================================
+
+/// `skills` harness: `pi_core::skills` (TS `core/skills.js`). args
+/// `{ op: ... }`:
+/// - `{op:"loadFromDir", files?, source, dir?}` — `dir` is a relative
+///   subpath under the per-case base (default: the base itself; cases use a
+///   named subdir because the name fallback for root files is the parent
+///   directory name, which would leak the per-side temp basename).
+/// - `{op:"load", files?, options?}` — like the prompt-templates `load` op
+///   but with `skillPaths`; collisions and canonical-path dedupe are
+///   exercised through multiple paths / symlinks.
+/// - `{op:"formatForPrompt", skills?, fileReadTool?}` — the formatted
+///   string; `fileReadTool` maps `"read"`/`"bash"` and anything else to the
+///   indirect variant (mirroring the TS else-branch).
+fn run_skills_harness(input: &Value) -> Result<Value, String> {
+    use pi_core::prompt_templates::{SourceInfo, SourceOrigin, SourceScope};
+    use pi_core::skills::{
+        format_skills_for_prompt, load_skills, load_skills_from_dir, FileReadTool,
+        LoadSkillsOptions, Skill,
+    };
+
+    let op = input["op"].as_str().ok_or("missing op")?;
+    match op {
+        "loadFromDir" => {
+            validate_files(input.get("files"))?;
+            let source = input["source"].as_str().ok_or("missing source")?;
+            let dir_rel = opt_string_field(input, "dir", "dir must be a string")?
+                .unwrap_or_default();
+            let base = create_fixture(input.get("files"), "sk")?;
+            let base_s = base.to_string_lossy().into_owned();
+            let dir = join_rel(&base_s, &dir_rel);
+            let result = load_skills_from_dir(&dir, source);
+            let skills: Vec<Value> = result
+                .skills
+                .iter()
+                .map(|s| serde_json::to_value(s).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
+            let diagnostics: Vec<Value> = result
+                .diagnostics
+                .iter()
+                .map(|d| serde_json::to_value(d).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
+            let _ = std::fs::remove_dir_all(&base);
+            Ok(json!({ "result": fixture_result(skills, diagnostics, &base_s, ("name", "filePath")) }))
+        }
+        "load" => {
+            validate_files(input.get("files"))?;
+            let options_in = match input.get("options") {
+                None | Some(Value::Null) => json!({}),
+                Some(v @ Value::Object(_)) => v.clone(),
+                Some(_) => return Err("options must be an object".to_string()),
+            };
+            let cwd_rel = opt_string_field(&options_in, "cwd", "options.cwd must be a string")?
+                .unwrap_or_default();
+            let agent_rel =
+                opt_string_field(&options_in, "agentDir", "options.agentDir must be a string")?
+                    .unwrap_or_default();
+            let home_rel = opt_string_field(
+                &options_in,
+                "homeDir",
+                "options.homeDir must be a string",
+            )?
+            .unwrap_or_else(|| "home".to_string());
+            let skill_paths = opt_strings_field(
+                &options_in,
+                "skillPaths",
+                "options.skillPaths must be an array of strings",
+            )?
+            .unwrap_or_default();
+            let include_defaults = opt_bool_field(
+                &options_in,
+                "includeDefaults",
+                "options.includeDefaults must be a boolean",
+            )?
+            .unwrap_or(false);
+
+            let base = create_fixture(input.get("files"), "sk")?;
+            let base_s = base.to_string_lossy().into_owned();
+            let options = LoadSkillsOptions {
+                cwd: join_rel(&base_s, &cwd_rel),
+                agent_dir: join_rel(&base_s, &agent_rel),
+                skill_paths,
+                include_defaults,
+                config_dir_name: ".pi".to_string(),
+                home_dir: Some(join_rel(&base_s, &home_rel)),
+            };
+            let result = load_skills(&options);
+            let skills: Vec<Value> = result
+                .skills
+                .iter()
+                .map(|s| serde_json::to_value(s).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
+            let diagnostics: Vec<Value> = result
+                .diagnostics
+                .iter()
+                .map(|d| serde_json::to_value(d).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
+            let _ = std::fs::remove_dir_all(&base);
+            Ok(json!({ "result": fixture_result(skills, diagnostics, &base_s, ("name", "filePath")) }))
+        }
+        "formatForPrompt" => {
+            let skills_in = match input.get("skills") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(items)) => items.clone(),
+                Some(_) => return Err("skills must be an array".to_string()),
+            };
+            let mut skills = Vec::with_capacity(skills_in.len());
+            for s in &skills_in {
+                let obj = s.as_object().ok_or("skills entries must be objects")?;
+                let field = |key: &str| {
+                    obj.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+                        "skills entries must have string name, description and filePath"
+                            .to_string()
+                    })
+                };
+                let name = field("name")?;
+                let description = field("description")?;
+                let file_path = field("filePath")?;
+                skills.push(Skill {
+                    name: name.to_string(),
+                    description: description.to_string(),
+                    file_path: file_path.to_string(),
+                    base_dir: String::new(),
+                    source_info: SourceInfo {
+                        path: file_path.to_string(),
+                        source: "local".to_string(),
+                        scope: SourceScope::Temporary,
+                        origin: SourceOrigin::TopLevel,
+                        base_dir: None,
+                    },
+                    disable_model_invocation: js_truthy(obj.get("disableModelInvocation")),
+                });
+            }
+            let tool = match input.get("fileReadTool") {
+                None | Some(Value::Null) => FileReadTool::Read,
+                Some(Value::String(s)) => match s.as_str() {
+                    "read" => FileReadTool::Read,
+                    "bash" => FileReadTool::Bash,
+                    _ => FileReadTool::Indirect,
+                },
+                Some(_) => return Err("fileReadTool must be a string".to_string()),
+            };
+            Ok(json!({ "result": format_skills_for_prompt(&skills, tool) }))
+        }
+        other => Err(format!("unknown skills op: {other}")),
     }
 }

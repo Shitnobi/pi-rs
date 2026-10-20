@@ -220,6 +220,9 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         | "settings-schema" | "settings-manager" => {
             return core_harness::run(name, &input)
         }
+        "prompt-templates" | "skills" => {
+            return core_harness::run(name, &input)
+        }
         _ => {}
     }
     let result: Result<pi_tools::ToolOutput, String> = match name {

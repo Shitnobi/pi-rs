@@ -7141,6 +7141,311 @@ export const cases = [
 
 	return c.filter(Boolean);
 })(),
+
+// prompt-templates (core-module wave). Pure string ops plus `load` cases
+// with per-case temp fixtures (`files` maps materialized under `<base>`;
+// option paths are relative roots joined by the harness, `promptPaths`
+// entries resolve against cwd like the module itself).
+...(() => {
+	const pt = (name, args) => ({ tool: "prompt-templates", name: "pt-" + name, args });
+	const c = [];
+	const sub = (name, content, args) => c.push(pt("sub-" + name, { op: "substituteArgs", content, args: args ?? [] }));
+	const load = (name, files, options) => c.push(pt("load-" + name, { op: "load", files, options }));
+
+	// --- parseCommandArgs ---
+	c.push(pt("parse-empty", { op: "parseCommandArgs", argsString: "" }));
+	c.push(pt("parse-simple", { op: "parseCommandArgs", argsString: "a b c" }));
+	c.push(pt("parse-dquote", { op: "parseCommandArgs", argsString: 'a "b c" d' }));
+	c.push(pt("parse-squote", { op: "parseCommandArgs", argsString: "a 'b c' d" }));
+	c.push(pt("parse-empty-quotes", { op: "parseCommandArgs", argsString: "'' \"\"" }));
+	c.push(pt("parse-unterminated", { op: "parseCommandArgs", argsString: 'a "bc' }));
+	c.push(pt("parse-quote-in-word", { op: "parseCommandArgs", argsString: 'a"b c"d' }));
+	c.push(pt("parse-mixed-quotes", { op: "parseCommandArgs", argsString: `"it's" 'say "hi"'` }));
+	c.push(pt("parse-nbsp", { op: "parseCommandArgs", argsString: "a\u00a0b" }));
+	c.push(pt("parse-bom-lsep", { op: "parseCommandArgs", argsString: "a\ufeffb\u2028c" }));
+
+	// --- substituteArgs ---
+	sub("positional", "a $1 b $2 c", ["x", "y"]);
+	sub("missing", "[$1][$5]", ["x"]);
+	sub("all-args", "[$@][$ARGUMENTS]", ["a", "b", "c"]);
+	sub("default-missing", "${1:-fallback}", []);
+	sub("default-present", "${1:-fallback}", ["value"]);
+	sub("default-empty", "${1:-fallback}", [""]);
+	sub("default-all", "[${@:-none}][${ARGUMENTS:-none}]", []);
+	sub("slice", "[${@:2}]", ["a", "b", "c"]);
+	sub("slice-len", "[${@:2:1}]", ["a", "b", "c"]);
+	sub("slice-zero", "[${@:0}]", ["a", "b"]);
+	sub("slice-beyond", "[${@:99}]", ["a"]);
+	sub("slice-bad", "[${@:1:2:3}][${@:x}]", ["a", "b"]);
+	sub("adjacent", "$1$2 $$1 x$1y", ["a", "b"]);
+	sub("no-resubstitute", "$1", ["$2"]);
+	sub("huge-index", "[$99999999999999999999]", ["a"]);
+	sub("ten", "${10:-d}", ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+
+	// --- expandPromptTemplate ---
+	c.push(pt("expand-plain", { op: "expandPromptTemplate", text: "hello world", templates: [] }));
+	c.push(pt("expand-exact", { op: "expandPromptTemplate", text: "/greet", templates: [{ name: "greet", content: "Hello $1" }] }));
+	c.push(pt("expand-args", { op: "expandPromptTemplate", text: "/greet world and moon", templates: [{ name: "greet", content: "Hello $1 and $2" }] }));
+	c.push(pt("expand-unknown", { op: "expandPromptTemplate", text: "/nope args here", templates: [{ name: "greet", content: "x" }] }));
+	c.push(pt("expand-slash-only", { op: "expandPromptTemplate", text: "/", templates: [{ name: "greet", content: "x" }] }));
+	c.push(pt("expand-space-after-slash", { op: "expandPromptTemplate", text: "/ greet", templates: [{ name: "greet", content: "x" }] }));
+	c.push(pt("expand-tabs", { op: "expandPromptTemplate", text: "/greet\ta\tb", templates: [{ name: "greet", content: "[$1][$2][$@]" }] }));
+	c.push(pt("expand-newline-args", { op: "expandPromptTemplate", text: "/greet a\nb", templates: [{ name: "greet", content: "[$1][$2]" }] }));
+	c.push(pt("expand-first-match", { op: "expandPromptTemplate", text: "/dup", templates: [{ name: "dup", content: "first" }, { name: "dup", content: "second" }] }));
+	c.push(pt("expand-quoted-args", { op: "expandPromptTemplate", text: '/greet "a b" c', templates: [{ name: "greet", content: "[$1][$2][$@]" }] }));
+	c.push(pt("expand-unicode-name", { op: "expandPromptTemplate", text: "/café x", templates: [{ name: "café", content: "Hola $1" }] }));
+
+	// --- load: defaults ---
+	load("defaults-global", { "agent/prompts/greet.md": "---\ndescription: Greets\n---\nHello $1\n" }, { agentDir: "agent", cwd: "proj", includeDefaults: true });
+	load("defaults-project", { "proj/.pi/prompts/note.md": "---\ndescription: Note\n---\nBody\n" }, { agentDir: "agent", cwd: "proj", includeDefaults: true });
+	load("defaults-both", {
+		"agent/prompts/global-tpl.md": "---\ndescription: G\n---\nG body\n",
+		"proj/.pi/prompts/proj-tpl.md": "---\ndescription: P\n---\nP body\n",
+	}, { agentDir: "agent", cwd: "proj", includeDefaults: true });
+	load("defaults-and-path", {
+		"agent/prompts/a.md": "---\ndescription: A\n---\nA\n",
+		"extra/b.md": "---\ndescription: B\n---\nB\n",
+	}, { agentDir: "agent", cwd: "proj", includeDefaults: true, promptPaths: ["../extra"] });
+
+	// --- load: explicit prompt paths ---
+	load("path-dir", { "tpls/a.md": "---\ndescription: A\n---\nA body\n" }, { cwd: "proj", promptPaths: ["../tpls"] });
+	load("path-dir-cwd-root", { "proj/a.md": "---\ndescription: A\n---\nA\n" }, { cwd: "proj", promptPaths: ["."] });
+	load("path-file", { "one.md": "---\ndescription: One\n---\nOne body\n" }, { cwd: "", promptPaths: ["one.md"] });
+	load("path-nonmd", { "x.txt": "hi" }, { cwd: "", promptPaths: ["x.txt"] });
+	load("path-missing", {}, { cwd: "", promptPaths: ["nope"] });
+	load("two-paths", {
+		"d1/a.md": "---\ndescription: A\n---\nA\n",
+		"d2/b.md": "---\ndescription: B\n---\nB\n",
+	}, { cwd: "", promptPaths: ["d1", "d2"] });
+	load("same-name-two-paths", {
+		"d1/greet.md": "---\ndescription: First\n---\n1\n",
+		"d2/greet.md": "---\ndescription: Second\n---\n2\n",
+	}, { cwd: "", promptPaths: ["d1", "d2"] });
+	load("tilde", { "home/tpls/t.md": "---\ndescription: T\n---\nT\n" }, { cwd: "", promptPaths: ["~/tpls"] });
+	load("path-dir-only-subdirs", { "tpls/sub/inner.md": "---\ndescription: I\n---\nI\n" }, { cwd: "", promptPaths: ["tpls"] });
+
+	// --- load: frontmatter variants ---
+	load("fm-quoted-dq", { "t/a.md": '---\ndescription: "say \\"hi\\" now"\n---\nB\n' }, { cwd: "", promptPaths: ["t"] });
+	load("fm-quoted-sq", { "t/a.md": "---\ndescription: 'it''s here'\n---\nB\n" }, { cwd: "", promptPaths: ["t"] });
+	load("fm-comment", { "t/a.md": "---\ndescription: value # comment\n---\nB\n" }, { cwd: "", promptPaths: ["t"] });
+	load("fm-number-desc", { "t/a.md": "---\ndescription: 42\n---\nFirst line body\n---\n" }, { cwd: "", promptPaths: ["t"] });
+	load("fm-bool-desc", { "t/a.md": "---\ndescription: true\n---\nBody line\n" }, { cwd: "", promptPaths: ["t"] });
+	load("fm-null-desc", { "t/a.md": "---\ndescription:\n---\nFallback line\n" }, { cwd: "", promptPaths: ["t"] });
+	load("fm-empty-desc", { "t/a.md": "---\ndescription: ''\n---\nFallback line\n" }, { cwd: "", promptPaths: ["t"] });
+	load("fm-arghint", { "t/a.md": '---\ndescription: D\nargument-hint: "[names...]"\n---\nB\n' }, { cwd: "", promptPaths: ["t"] });
+	// Unquoted flow sequence: eemeli/yaml parses [names...] as an ARRAY, so
+	// argumentHint is omitted (non-string frontmatter value) on both sides.
+	load("fm-arghint-flow", { "t/a.md": '---\ndescription: D\nargument-hint: [names...]\n---\nB\n' }, { cwd: "", promptPaths: ["t"] });
+	load("fm-arghint-empty", { "t/a.md": "---\ndescription: D\nargument-hint: ''\n---\nB\n" }, { cwd: "", promptPaths: ["t"] });
+
+	// --- load: frontmatter error shapes (yaml messages, byte-exact) ---
+	load("err-unterminated-dq", { "t/a.md": '---\ndescription: "abc\n---\nbody\n' }, { cwd: "", promptPaths: ["t"] });
+	load("err-unterminated-sq", { "t/a.md": "---\ndescription: 'abc\n---\nbody\n" }, { cwd: "", promptPaths: ["t"] });
+	load("err-nested-mapping", { "t/a.md": "---\ndescription: a: b\n---\nbody\n" }, { cwd: "", promptPaths: ["t"] });
+	load("err-duplicate-keys", { "t/a.md": "---\nname: a\nname: b\ndescription: D\n---\nbody\n" }, { cwd: "", promptPaths: ["t"] });
+
+	// --- load: description fallback from body ---
+	load("no-fm-first-line", { "t/a.md": "Hello world this is a template body\nsecond line\n" }, { cwd: "", promptPaths: ["t"] });
+	load("long-first-line", { "t/a.md": "x".repeat(70) + "\nrest\n" }, { cwd: "", promptPaths: ["t"] });
+	load("first-line-61", { "t/a.md": "y".repeat(61) + "\nrest\n" }, { cwd: "", promptPaths: ["t"] });
+	load("body-trim", { "t/a.md": "---\ndescription: D\n---\n\n\n  Body  \n\n" }, { cwd: "", promptPaths: ["t"] });
+	load("bom-crlf", { "t/a.md": "\uFEFF---\r\ndescription: D\r\n---\r\nBody\r\n" }, { cwd: "", promptPaths: ["t"] });
+	load("unicode", { "t/a.md": "---\ndescription: café ünïcode\n---\nCörps ✓\n" }, { cwd: "", promptPaths: ["t"] });
+
+	// --- load: directory scan rules ---
+	load("nonmd-ignored", {
+		"t/a.txt": "x",
+		"t/b.markdown": "y",
+		"t/c.MD": "z",
+	}, { cwd: "", promptPaths: ["t"] });
+	load("subdir-not-scanned", { "t/sub/inner.md": "---\ndescription: I\n---\nI\n" }, { cwd: "", promptPaths: ["t"] });
+	load("dotfile-md-loaded", { "t/.hidden.md": "---\ndescription: H\n---\nH\n" }, { cwd: "", promptPaths: ["t"] });
+	load("symlink-broken", { "t/broken.md": { symlink: "missing.md" } }, { cwd: "", promptPaths: ["t"] });
+	load("symlink-file", {
+		"real.md": "---\ndescription: Real\n---\nR\n",
+		"t/link.md": { symlink: "../real.md" },
+	}, { cwd: "", promptPaths: ["t"] });
+
+	// --- protocol misuse (identical in-band errors) ---
+	c.push(pt("err-missing-op", {}));
+	c.push(pt("err-unknown-op", { op: "bogus" }));
+	c.push(pt("err-missing-args-string", { op: "parseCommandArgs" }));
+	c.push(pt("err-bad-files", { op: "load", files: 5 }));
+	c.push(pt("err-bad-prompt-paths", { op: "load", options: { promptPaths: "x" } }));
+	c.push(pt("err-bad-include-defaults", { op: "load", options: { includeDefaults: "yes" } }));
+
+	return c.filter(Boolean);
+})(),
+
+// skills (core-module wave). Same fixture style: `loadFromDir` scans a named
+// subdir of `<base>` (never the base itself — the name fallback for root
+// files is the parent dir name, which would leak the per-side basename);
+// `load` exercises multi-path collisions and canonical-path dedupe;
+// `formatForPrompt` drives the XML prompt formatter.
+...(() => {
+	const sk = (name, args) => ({ tool: "skills", name: "sk-" + name, args });
+	const c = [];
+	const fromDir = (name, files, source, dir) =>
+		c.push(sk("dir-" + name, { op: "loadFromDir", files, source, ...(dir !== undefined ? { dir } : {}) }));
+	const load = (name, files, options) => c.push(sk("load-" + name, { op: "load", files, options }));
+	const SKILL = (name, desc, extra = "") => `---\n${name ? "name: " + name + "\n" : ""}description: ${desc}\n${extra}---\nbody\n`;
+
+	// --- loadFromDir: discovery ---
+	fromDir("root-skill", { "my-skill/SKILL.md": SKILL("my-skill", "Does things") }, "user", "my-skill");
+	fromDir("name-fallback", { "my-skill/SKILL.md": SKILL("", "Falls back") }, "user", "my-skill");
+	fromDir("nested", {
+		"root/a/SKILL.md": SKILL("alpha", "A"),
+		"root/b/inner/SKILL.md": SKILL("beta", "B"),
+	}, "path", "root");
+	fromDir("root-md-with-desc", { "root/note.md": "---\ndescription: has one\n---\nb\n" }, "path", "root");
+	fromDir("root-md-no-desc", { "root/note.md": "# nope\n" }, "path", "root");
+	fromDir("root-skillmd-wins", {
+		"root/SKILL.md": SKILL("rooty", "root"),
+		"root/sub/SKILL.md": SKILL("subby", "sub"),
+		"root/plain.md": "---\ndescription: plain\n---\nb\n",
+	}, "path", "root");
+	fromDir("subdir-plain-md-not-loaded", { "root/sub/note.md": "---\ndescription: d\n---\nb\n" }, "path", "root");
+	fromDir("missing-dir", {}, "user", "nope");
+	fromDir("empty-dir", {}, "user", "root");
+	fromDir("node-modules-skipped", { "root/node_modules/dep/SKILL.md": SKILL("dep", "d") }, "path", "root");
+	fromDir("dot-dirs-skipped", {
+		"root/.config/SKILL.md": SKILL("hidden", "h"),
+		"root/.hidden.md": "---\ndescription: hm\n---\nb\n",
+	}, "path", "root");
+
+	// --- loadFromDir: ignore files ---
+	fromDir("gitignore-dir", {
+		"root/.gitignore": "excluded/\n",
+		"root/excluded/SKILL.md": SKILL("ex", "no"),
+		"root/kept/SKILL.md": SKILL("keep", "yes"),
+	}, "path", "root");
+	fromDir("gitignore-negation-in-ignored-dir", {
+		"root/.gitignore": "excluded/\n!excluded/SKILL.md\n",
+		"root/excluded/SKILL.md": SKILL("ex", "no"),
+		"root/kept/SKILL.md": SKILL("keep", "yes"),
+	}, "path", "root");
+	fromDir("gitignore-negation", {
+		"root/.gitignore": "*.tmp\n!keep.md\n",
+		"root/keep.md": "---\ndescription: kept\n---\nb\n",
+		"root/skip.tmp.md": "---\ndescription: skipped\n---\nb\n",
+	}, "path", "root");
+	fromDir("gitignore-anchored", {
+		"root/.gitignore": "/*.md\n",
+		"root/plain.md": "---\ndescription: p\n---\nb\n",
+		"root/kept/SKILL.md": SKILL("keep", "yes"),
+	}, "path", "root");
+	fromDir("gitignore-comments", {
+		"root/.gitignore": "# a comment\n\nskip.md\n",
+		"root/skip.md": "---\ndescription: s\n---\nb\n",
+		"root/keep.md": "---\ndescription: k\n---\nb\n",
+	}, "path", "root");
+	fromDir("nested-gitignore", {
+		"root/sub/.gitignore": "ex/\n",
+		"root/sub/ex/SKILL.md": SKILL("ex", "no"),
+		"root/sub/ok/SKILL.md": SKILL("ok", "yes"),
+	}, "path", "root");
+	fromDir("ignore-and-fdignore", {
+		"root/.ignore": "a/\n",
+		"root/.fdignore": "b/\n",
+		"root/a/SKILL.md": SKILL("a", "no"),
+		"root/b/SKILL.md": SKILL("b", "no"),
+		"root/c/SKILL.md": SKILL("c", "yes"),
+	}, "path", "root");
+
+	// --- loadFromDir: validation + frontmatter ---
+	fromDir("name-invalid", { "root/Bad_Name/SKILL.md": SKILL("Bad_Name", "d") }, "user", "root");
+	fromDir("name-too-long", { "root/long/SKILL.md": SKILL("a".repeat(65), "d") }, "user", "root");
+	fromDir("name-hyphens", {
+		"root/lead/SKILL.md": SKILL("-lead", "d"),
+		"root/trail/SKILL.md": SKILL("trail-", "d"),
+		"root/dbl/SKILL.md": SKILL("dou--ble", "d"),
+	}, "user", "root");
+	fromDir("desc-missing", { "root/s/SKILL.md": "---\nname: ok\n---\nb\n" }, "user", "root");
+	fromDir("desc-too-long", { "root/s/SKILL.md": SKILL("ok", "d".repeat(1025)) }, "user", "root");
+	fromDir("disable-true", { "root/s/SKILL.md": SKILL("s", "d", "disable-model-invocation: true\n") }, "user", "root");
+	fromDir("disable-nonbool", { "root/s/SKILL.md": SKILL("s", "d", "disable-model-invocation: yes\n") }, "user", "root");
+	fromDir("fm-error-skillmd", { "root/s/SKILL.md": "---\nname: a\nname: b\ndescription: D\n---\nb\n" }, "user", "root");
+	fromDir("fm-error-plainmd", { "root/note.md": "---\nname: a\nname: b\n---\nb\n" }, "user", "root");
+
+	// --- loadFromDir: sources + symlinks ---
+	fromDir("source-project", { "root/s/SKILL.md": SKILL("s", "d") }, "project", "root");
+	fromDir("source-path", { "root/s/SKILL.md": SKILL("s", "d") }, "path", "root");
+	fromDir("source-custom", { "root/s/SKILL.md": SKILL("s", "d") }, "custom-source", "root");
+	fromDir("symlink-broken", { "root/broken/SKILL.md": { symlink: "missing.md" } }, "path", "root");
+	fromDir("symlink-skillmd", {
+		"real/SKILL.md": SKILL("linked", "via symlink"),
+		"root/link/SKILL.md": { symlink: "../../real/SKILL.md" },
+	}, "path", "root");
+
+	// --- load: explicit paths ---
+	load("single-path", { "skills/a/SKILL.md": SKILL("alpha", "A") }, { cwd: "proj", skillPaths: ["../skills"] });
+	load("file-direct", { "one.md": "---\nname: direct-skill\ndescription: D\n---\nb\n" }, { cwd: "proj", skillPaths: ["../one.md"] });
+	load("missing-path", {}, { cwd: "proj", skillPaths: ["nope"] });
+	load("nonmd", { "x.txt": "hi" }, { cwd: "proj", skillPaths: ["../x.txt"] });
+	load("collision", {
+		"a/SKILL.md": SKILL("dup", "first"),
+		"b/SKILL.md": SKILL("dup", "second"),
+	}, { cwd: "proj", skillPaths: ["../a", "../b"] });
+	load("same-file-twice", { "a/SKILL.md": SKILL("once", "only") }, { cwd: "proj", skillPaths: ["../a/SKILL.md", "../a/SKILL.md"] });
+	load("symlink-alias", {
+		"real/SKILL.md": SKILL("aliased", "real"),
+		"link.md": { symlink: "real/SKILL.md" },
+	}, { cwd: "proj", skillPaths: ["../real", "../link.md"] });
+	load("multiple-skills-one-dir", {
+		"root/a/SKILL.md": SKILL("aa", "A"),
+		"root/b/SKILL.md": SKILL("bb", "B"),
+	}, { cwd: "proj", skillPaths: ["../root"] });
+	load("empty", {}, { cwd: "proj", skillPaths: [] });
+	load("tilde", { "home/sk/SKILL.md": SKILL("homed", "H") }, { cwd: "proj", skillPaths: ["~/sk"] });
+
+	// --- load: defaults + source classification ---
+	load("defaults-user-project", {
+		"agent/skills/user-skill/SKILL.md": SKILL("user-skill", "user skill"),
+		"proj/.pi/skills/proj-skill/SKILL.md": SKILL("proj-skill", "project skill"),
+	}, { cwd: "proj", agentDir: "agent", includeDefaults: true });
+	load("path-under-user-dir", { "agent/skills/user-skill/SKILL.md": SKILL("user-skill", "u") },
+		{ cwd: "proj", agentDir: "agent", skillPaths: ["../agent/skills"] });
+	load("path-under-project-dir", { "proj/.pi/skills/proj-skill/SKILL.md": SKILL("proj-skill", "p") },
+		{ cwd: "proj", agentDir: "agent", skillPaths: [".pi/skills"] });
+	load("defaults-path-under-user", { "agent/skills/user-skill/SKILL.md": SKILL("user-skill", "u") },
+		{ cwd: "proj", agentDir: "agent", includeDefaults: true, skillPaths: ["../agent/skills"] });
+	load("collision-default-vs-path", {
+		"agent/skills/dup/SKILL.md": SKILL("dup", "winner"),
+		"other/SKILL.md": SKILL("dup", "loser"),
+	}, { cwd: "proj", agentDir: "agent", includeDefaults: true, skillPaths: ["../other"] });
+
+	// --- formatForPrompt ---
+	const fsSkill = (name, description, extra = {}) => ({
+		name,
+		description,
+		filePath: "/x/" + name + "/SKILL.md",
+		...extra,
+	});
+	c.push(sk("fmt-empty", { op: "formatForPrompt", skills: [] }));
+	c.push(sk("fmt-all-disabled", { op: "formatForPrompt", skills: [fsSkill("a", "d", { disableModelInvocation: true })] }));
+	c.push(sk("fmt-read", { op: "formatForPrompt", skills: [fsSkill("a", "d")], fileReadTool: "read" }));
+	c.push(sk("fmt-default-tool", { op: "formatForPrompt", skills: [fsSkill("a", "d")] }));
+	c.push(sk("fmt-bash", { op: "formatForPrompt", skills: [fsSkill("a", "d")], fileReadTool: "bash" }));
+	c.push(sk("fmt-indirect", { op: "formatForPrompt", skills: [fsSkill("a", "d")], fileReadTool: "indirect" }));
+	c.push(sk("fmt-unknown-tool", { op: "formatForPrompt", skills: [fsSkill("a", "d")], fileReadTool: "weird" }));
+	c.push(sk("fmt-escaping", { op: "formatForPrompt", skills: [fsSkill("a<b", "d&<e>\"f'g", { filePath: "/x&p/Q.md" })] }));
+	c.push(sk("fmt-mixed", {
+		op: "formatForPrompt",
+		skills: [fsSkill("one", "first"), fsSkill("two", "second", { disableModelInvocation: true }), fsSkill("three", "third")],
+	}));
+	c.push(sk("fmt-unicode", { op: "formatForPrompt", skills: [fsSkill("café", "Ünïcode ✓")] }));
+	c.push(sk("fmt-truthy-disable", { op: "formatForPrompt", skills: [fsSkill("a", "d", { disableModelInvocation: "yes" })] }));
+
+	// --- protocol misuse ---
+	c.push(sk("err-missing-op", {}));
+	c.push(sk("err-unknown-op", { op: "bogus" }));
+	c.push(sk("err-missing-source", { op: "loadFromDir" }));
+	c.push(sk("err-bad-skills", { op: "formatForPrompt", skills: "x" }));
+	c.push(sk("err-bad-skill-paths", { op: "load", options: { skillPaths: 5 } }));
+	c.push(sk("err-bad-files", { op: "load", files: [] }));
+
+	return c.filter(Boolean);
+})(),
 ];
 
 // config-value sub-case builder (hoisted; used by the cases above).

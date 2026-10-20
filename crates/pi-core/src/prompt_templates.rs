@@ -677,6 +677,13 @@ fn parse_yaml_subset(src: &str) -> Result<Vec<(String, FrontmatterValue)>, Strin
 			let trimmed_value = js_trim(no_comment);
 			if trimmed_value.is_empty() {
 				FrontmatterValue::Other // null
+			} else if trimmed_value.starts_with('[') || trimmed_value.starts_with('{') {
+				// eemeli/yaml parses flow collections ([a, b] / {k: v}) as
+				// arrays/maps — never strings (probed). They may legitimately
+				// contain ": " without triggering the compact-mapping error.
+				// Invalid flow syntax would throw in TS; approximated as a
+				// non-string value.
+				FrontmatterValue::Other
 			} else if trimmed_value.contains(": ") || trimmed_value.ends_with(':') {
 				return Err(yaml_error(
 					src,
