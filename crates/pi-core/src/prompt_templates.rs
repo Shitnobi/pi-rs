@@ -81,8 +81,23 @@ pub enum DiagnosticType {
 	Collision,
 }
 
+/// `ResourceCollision` from `core/diagnostics.ts` (minimal local port).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceCollision {
+	pub resource_type: String,
+	pub name: String,
+	pub winner_path: String,
+	pub loser_path: String,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub winner_source: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub loser_source: Option<String>,
+}
+
 /// `ResourceDiagnostic` from `core/diagnostics.ts` (minimal local port; this
-/// module only ever produces `warning` diagnostics with a path).
+/// module only ever produces `warning` diagnostics with a path, while the
+/// skills module also produces `collision` diagnostics).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResourceDiagnostic {
 	#[serde(rename = "type")]
@@ -90,14 +105,17 @@ pub struct ResourceDiagnostic {
 	pub message: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub path: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub collision: Option<ResourceCollision>,
 }
 
 impl ResourceDiagnostic {
-	fn warning(message: String, path: Option<String>) -> Self {
+	pub(crate) fn warning(message: String, path: Option<String>) -> Self {
 		Self {
 			r#type: DiagnosticType::Warning,
 			message,
 			path,
+			collision: None,
 		}
 	}
 }
@@ -379,15 +397,17 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
 // ---------------------------------------------------------------------------
 
 /// A parsed frontmatter value. `Other` covers everything the TS code treats
-/// as "not a string" (null, booleans, numbers, sequences, mappings).
+/// as "not a string" (null, numbers, sequences, mappings); `Bool` keeps the
+/// raw truth value for `disable-model-invocation === true` in skills.
 #[derive(Debug, Clone, PartialEq)]
-enum FrontmatterValue {
+pub(crate) enum FrontmatterValue {
 	Str(String),
+	Bool(bool),
 	Other,
 }
 
 /// JS `String.prototype.trim()` (JS whitespace, incl. U+00A0 / U+FEFF).
-fn js_trim(s: &str) -> &str {
+pub(crate) fn js_trim(s: &str) -> &str {
 	s.trim_matches(is_js_whitespace_or_terminator)
 }
 
@@ -400,7 +420,7 @@ fn normalize_newlines(s: &str) -> String {
 /// with a YAML-subset parser standing in for eemeli/yaml (see module docs).
 /// `Err` carries the yaml error message (reproduced byte-exactly for the
 /// shapes the subset parser detects).
-fn parse_frontmatter(content: &str) -> Result<(Vec<(String, FrontmatterValue)>, String), String> {
+pub(crate) fn parse_frontmatter(content: &str) -> Result<(Vec<(String, FrontmatterValue)>, String), String> {
 	let normalized = normalize_newlines(strip_bom(content));
 	if !normalized.starts_with("---") {
 		return Ok((Vec::new(), normalized));
@@ -665,7 +685,11 @@ fn parse_yaml_subset(src: &str) -> Result<Vec<(String, FrontmatterValue)>, Strin
 					value_start_col,
 				));
 			} else if is_yaml_non_string_scalar(trimmed_value) {
-				FrontmatterValue::Other
+				match trimmed_value {
+					"true" | "True" | "TRUE" => FrontmatterValue::Bool(true),
+					"false" | "False" | "FALSE" => FrontmatterValue::Bool(false),
+					_ => FrontmatterValue::Other,
+				}
 			} else {
 				FrontmatterValue::Str(trimmed_value.to_string())
 			}
@@ -680,7 +704,7 @@ fn parse_yaml_subset(src: &str) -> Result<Vec<(String, FrontmatterValue)>, Strin
 	Ok(entries)
 }
 
-fn frontmatter_get_str<'a>(
+pub(crate) fn frontmatter_get_str<'a>(
 	entries: &'a [(String, FrontmatterValue)],
 	key: &str,
 ) -> Option<&'a str> {
@@ -689,7 +713,7 @@ fn frontmatter_get_str<'a>(
 		.find(|(k, _)| k == key)
 		.and_then(|(_, v)| match v {
 			FrontmatterValue::Str(s) => Some(s.as_str()),
-			FrontmatterValue::Other => None,
+			FrontmatterValue::Bool(_) | FrontmatterValue::Other => None,
 		})
 }
 
@@ -714,7 +738,7 @@ fn utf16_prefix(s: &str, max_units: usize) -> String {
 // ---------------------------------------------------------------------------
 
 /// Node `path.posix.basename` (trailing separators ignored).
-fn basename(path: &str) -> &str {
+pub(crate) fn basename(path: &str) -> &str {
 	path.trim_end_matches('/').rsplit('/').next().unwrap_or("")
 }
 
@@ -724,7 +748,7 @@ fn template_name(file_path: &str) -> String {
 }
 
 /// Node `path.dirname` (posix).
-fn node_dirname(path: &str) -> String {
+pub(crate) fn node_dirname(path: &str) -> String {
 	let trimmed = path.trim_end_matches('/');
 	match trimmed.rfind('/') {
 		Some(0) => "/".to_string(),
@@ -735,7 +759,7 @@ fn node_dirname(path: &str) -> String {
 
 /// Node `path.join` for two unix segments (mirrors the private helper in
 /// `crate::paths`).
-fn node_path_join(a: &str, b: &str) -> String {
+pub(crate) fn node_path_join(a: &str, b: &str) -> String {
 	if a.is_empty() {
 		return b.to_string();
 	}
@@ -746,7 +770,7 @@ fn node_path_join(a: &str, b: &str) -> String {
 }
 
 /// Node error code for an io error (mirrors `pi_tools::node_fs::node_code`).
-fn node_code(err: &std::io::Error) -> &'static str {
+pub(crate) fn node_code(err: &std::io::Error) -> &'static str {
 	match err.kind() {
 		std::io::ErrorKind::NotFound => "ENOENT",
 		std::io::ErrorKind::PermissionDenied => "EACCES",
@@ -763,7 +787,7 @@ fn node_code(err: &std::io::Error) -> &'static str {
 /// Full Node-style error message, e.g.
 /// `ENOENT: no such file or directory, open '/tmp/x'` (mirrors
 /// `pi_tools::node_fs::node_error_message`).
-fn node_error_message(syscall: &str, path: &str, err: &std::io::Error) -> String {
+pub(crate) fn node_error_message(syscall: &str, path: &str, err: &std::io::Error) -> String {
 	let code = node_code(err);
 	let reason = match code {
 		"ENOENT" => "no such file or directory",
@@ -1030,7 +1054,7 @@ pub fn load_prompt_templates(options: &LoadPromptTemplatesOptions) -> LoadPrompt
 
 /// TS `isUnderPath(target, root)`: exact match or `target` starts with
 /// `root + sep` (root is already resolved).
-fn is_under_path(target: &str, root: &str) -> bool {
+pub(crate) fn is_under_path(target: &str, root: &str) -> bool {
 	if target == root {
 		return true;
 	}
@@ -1044,7 +1068,7 @@ fn is_under_path(target: &str, root: &str) -> bool {
 
 /// TS `createSyntheticSourceInfo(path, {source, scope?, baseDir?})` with the
 /// module-fixed `source: "local"` and default `origin: "top-level"`.
-fn create_synthetic_source_info(
+pub(crate) fn create_synthetic_source_info(
 	path: &str,
 	scope: Option<SourceScope>,
 	base_dir: Option<String>,

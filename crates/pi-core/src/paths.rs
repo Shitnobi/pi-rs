@@ -259,7 +259,7 @@ pub fn canonicalize_path(path: &str) -> String {
 }
 
 /// Node `path.relative(from, to)` for unix paths.
-fn node_relative(from: &str, to: &str) -> String {
+pub(crate) fn node_relative(from: &str, to: &str) -> String {
     let from = normalize_absolute(from);
     let to = normalize_absolute(to);
     if from == to {
