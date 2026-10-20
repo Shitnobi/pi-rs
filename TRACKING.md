@@ -49,6 +49,20 @@ Landed on main (wave-a merged as f4920d2, wave-b as b42e897+6ab79f4):
 Each wave parity-green via new harness entries, then batter targets +
 regressions.
 
+**Resume note (2026-10-19 23:24, wound down):** survey of the auth/composer
+wave just started, nothing written yet. Correct file names/sizes:
+`core/auth-storage.ts` (507 LOC), `core/provider-composer.ts` (732 LOC),
+`core/remote-catalog-provider.ts` (NOT remote-catalog.ts). Useful scratch
+assets on this machine (outside the repo): `/home/shinobi/wave2-spec.md`
+(wire-protocol template), `/home/shinobi/compat-probe.json` (probed
+typebox schema), `/home/shinobi/mr-diff.mjs` (per-tool differential runner;
+usage: `node /home/shinobi/mr-diff.mjs <tool>` — sends bare args JSON to
+the Rust side, wrapped {tool,args} to the TS side; RUST_BIN env overrides
+the binary). Workflow that worked for this wave: probe TS ground truth
+first → write spec → parallel delegates on git worktrees with pre-wired
+main.rs dispatch → per-tool differential vs ts-harness → merge → full
+parity → workspace tests + clippy → TRACKING checkpoint → push.
+
 ## Previous checkpoint (2026-10-19, later) — superseded
 
 **State: providers foundation wave COMPLETE and parity-green.** The 3 E0308s
