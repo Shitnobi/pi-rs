@@ -21,3 +21,7 @@ pub mod text;
 pub mod text_decoder;
 pub mod truncate;
 pub mod usage_totals;
+pub mod event_bus;
+pub mod timings;
+pub mod slash_commands;
+pub mod settings_defaults;
