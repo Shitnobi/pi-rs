@@ -97,6 +97,20 @@ Success criteria: all cases pass (the repo's README/TRACKING.md record the
 current case count; 239+ cases as of the last update). If markdown-lexer
 cases fail, re-check step 3 (missing seam) and step 1 (Node < 24).
 
+## Step 7 — Resume work from the last checkpoint
+
+**NOTE: as of the last checkpoint the workspace does NOT fully compile** —
+`cargo check -p pi-providers` fails with 3 errors (expected; mid-tranche WIP).
+Expect step 5's `cargo build`/`cargo test` to fail on `pi-providers` only;
+all other crates should build and test green.
+
+Read `TRACKING.md`, section **"⚠️ Current checkpoint — resume here"** (top of
+the file). It records the exact in-flight state, the immediate next steps
+(fix the 3 E0308s in `crates/pi-providers/src/models_store.rs` first), and
+the overall plan (`docs/plans/phase3-providers.md` and the Phase 3 roadmap
+at the bottom of TRACKING.md). Do not rely on the roadmap checkboxes alone —
+the checkpoint section at the top is authoritative and fresher.
+
 ## Troubleshooting / notes
 
 - **Env overrides**: if the original repo is NOT at `/tmp/pi-repo`, export

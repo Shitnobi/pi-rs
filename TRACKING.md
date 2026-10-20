@@ -1,5 +1,31 @@
 # pi-rs Port Tracking
 
+## ⚠️ Current checkpoint (2026-10-19) — resume here
+
+**State: mid-tranche, code does NOT compile.** The providers foundation wave
+(commit `8f8b0e4`, uncommitted agent work batch-committed as WIP) is partially
+landed in `crates/pi-providers/`: `auth_guidance.rs`, `auth_storage.rs`,
+`config_value.rs`, `http_config.rs`, `models_store.rs`, `runtime_credentials.rs`,
+`virtual_models.rs`, and the `pi_ai/` modules (`js`, `credential`, `macros`,
+`model`, `models`, `models_store`, `provider`), plus `error.rs` and
+`crates/pi-tools/src/node_fs.rs` changes.
+
+**Immediate next steps (in order):**
+1. Fix the 3 compile errors in `crates/pi-providers/src/models_store.rs`
+   (E0308 at lines ~182, ~218, ~243: the `with_lock` closures' return shape
+   doesn't match `auth_storage::LockResult` — likely needs `LockResult`
+   wrapping or `mut` closure signature adjustment per the compiler hints).
+2. `cargo check --workspace` green, then `cargo test --workspace` green
+   (all other crates were green at 1262/1262 parity + 1228 tests before
+   this tranche).
+3. Resume the providers plan in `docs/plans/phase3-providers.md`:
+   finish the foundation wave, then config/resolution (model_config,
+   model_resolver, provider_attribution), auth/composer, facades — each
+   wave parity-green via new module-level harness entries.
+
+Note: `pi-tui` has ~58 pre-existing warnings (known, see T5 notes); only
+`pi-providers` errors block the build.
+
 Progress tracker for the Rust port of
 [pi's coding-agent package](https://github.com/earendil-works/pi/tree/main/packages/coding-agent).
 See [PARITY.md](PARITY.md) for the parity-test methodology.
@@ -927,17 +953,21 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
   logic + sync traits with scripted fakes). Rationale and layer scoping in
   `docs/decisions/G8-async-runtime.md`.
 - [x] `crates/pi-providers` scaffolded (Cargo.toml, module stubs, workspace member).
-- [ ] Providers tranche: foundation (pi-ai type surface, config_value, http_config,
-      auth_guidance, runtime_credentials, models_store, virtual_models) →
-      config/resolution (model_config, model_resolver, provider_attribution) →
-      auth/composer (auth_storage, provider_composer, remote_catalog) → facades
-      (model_runtime, model_registry) — each wave parity-green via new module-level
-      harness entries, then batter targets + regressions.
+- [~] Providers tranche: **IN PROGRESS — see "Current checkpoint" at top.**
+      Foundation wave partially committed (`8f8b0e4`: pi-ai type surface,
+      config_value, http_config, auth_guidance, auth_storage,
+      runtime_credentials, models_store, virtual_models — not yet compiling,
+      3 E0308s in models_store.rs). Remaining after foundation:
+      config/resolution (model_config, model_resolver, provider_attribution)
+      → auth/composer (provider_composer, remote_catalog) → facades
+      (model_runtime, model_registry) — each wave parity-green via new
+      module-level harness entries, then batter targets + regressions.
 - [x] MCP pure-logic tranche: `pi-core/src/mcp_servers.rs`, `mcp_tools.rs`,
       `tool_search.rs`. All pi-core tests green, clippy clean, parity green
       (21 `mcp-*` + 5 `tool-search` cases + V8-vs-libm log divergence vectors
       in `math/basic`). Implementation notes: `docs/plans/impl-notes-mcp-pure.md`
       (fdlibm `js_math_log` port, protocol-violation V8 error parity, WHATWG
       URL subset deviations, fake-saver harness design).
-- [ ] CLI Stage A: `pi-cli/src/config.rs`, `migrations.rs`, `cli/args.rs`.
+- [x] CLI Stage A: `pi-cli/src/config.rs`, `migrations.rs`, `cli/args.rs`
+      (commit `626e091`).
 - [ ] Agent-session tranches (tokio, per plan §5.5).
