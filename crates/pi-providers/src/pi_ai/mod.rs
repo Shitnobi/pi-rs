@@ -27,6 +27,7 @@ pub mod model;
 pub mod model_operations;
 pub mod models;
 pub mod models_error;
+pub mod models_impl;
 pub mod models_store;
 pub mod transcript;
 pub mod provider;
