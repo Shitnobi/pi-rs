@@ -10,6 +10,7 @@
 //! - facade wave (later): model_runtime, model_registry
 
 pub mod error;
+pub mod minimatch;
 pub mod pi_ai;
 pub mod auth_guidance;
 pub mod auth_storage;

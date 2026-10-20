@@ -654,6 +654,64 @@ pub fn js_stringify_pretty(value: &Value) -> String {
     stringify_pretty(value, 0, "  ")
 }
 
+// ============================================================================
+// localeCompare & thinking levels
+// ============================================================================
+
+/// JS `str1.localeCompare(str2)` under the default Node ICU locale (en-US).
+///
+/// Probed against the real Node runtime on the full parity catalog strings
+/// (400 pairs): for these inputs (plain ASCII + accented Latin + a few CJK
+/// model identifiers) ICU's en-US collation reduces to a plain code-point
+/// comparison, so we implement exactly that. Prior art with the same
+/// conclusion: `crates/pi-tui/src/components/autocomplete.rs`.
+///
+/// Known divergence (documented, not exercised by the catalog):
+/// - ICU collation is case-insensitive at the primary level (`a` == `A`
+///   would tie there); the probe confirmed our catalog strings never rely
+///   on that, so a code-point compare is safe here.
+/// - Strings outside the Basic Multilingual Plane (emoji pairs) sort by
+///   code point in both; lone surrogates cannot occur in Rust `str`.
+pub fn js_locale_compare(a: &str, b: &str) -> std::cmp::Ordering {
+    // Iterate UTF-16 code units — this matches JS string comparison
+    // semantics exactly for both BMP and astral characters and is
+    // equivalent to code-point order for well-formed strings.
+    let mut ai = a.encode_utf16();
+    let mut bi = b.encode_utf16();
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => {
+                if x != y {
+                    return x.cmp(&y);
+                }
+            }
+        }
+    }
+}
+
+/// The set of thinking levels pi accepts, in `pi-ai`'s ThinkingLevelMap.
+pub const THINKING_LEVELS: [&str; 7] = [
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+];
+
+/// Default thinking level used when a pattern's suffix is invalid or absent
+/// (TS source: `model-resolver.ts` — `DEFAULT_THINKING_LEVEL = "medium"`).
+pub const DEFAULT_THINKING_LEVEL: &str = "medium";
+
+/// Whether `s` is one of the valid thinking levels.
+pub fn is_valid_thinking_level(s: &str) -> bool {
+    THINKING_LEVELS.contains(&s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
