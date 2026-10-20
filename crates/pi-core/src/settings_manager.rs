@@ -275,8 +275,18 @@ fn parse_json_like(input: &str) -> Result<Value, String> {
 			format!("{} at position {} (line {} column {})", msg, pos, line, col)
 		}
 		fn unexpected_token(&self, c: char) -> String {
-			let quoted = serde_json::to_string(&Value::String(self.input.to_string())).unwrap();
-			format!("Unexpected token '{}', {} is not valid JSON", c, quoted)
+			// V8 embeds the (possibly truncated) input RAW between double
+			// quotes — no escaping — and truncates inputs longer than 20
+			// UTF-16 code units to the first 10 code units followed by
+			// `"...` (probed under Node 24). Lone surrogates at the cut
+			// become U+FFFD (Rust strings cannot hold them; documented gap).
+			let units: Vec<u16> = self.input.encode_utf16().collect();
+			if units.len() > 20 {
+				let snippet = String::from_utf16_lossy(&units[..10]);
+				format!("Unexpected token '{}', \"{}\"... is not valid JSON", c, snippet)
+			} else {
+				format!("Unexpected token '{}', \"{}\" is not valid JSON", c, self.input)
+			}
 		}
 
 		fn parse(&mut self) -> Result<Value, String> {
@@ -1610,14 +1620,6 @@ impl SettingsManager {
 		self.save();
 	}
 
-	/// Set a field to `undefined` (TS keeps the key with an undefined value,
-	/// which JSON.stringify omits — removal is observably equivalent).
-	fn clear_global_field(&mut self, field: &str) {
-		self.global_settings.shift_remove(field);
-		self.mark_modified(field, None);
-		self.save();
-	}
-
 	// ------------------------------------------------------------------
 	// Getters / setters
 	// ------------------------------------------------------------------
@@ -1953,9 +1955,11 @@ impl SettingsManager {
 	}
 
 	pub fn set_shell_path(&mut self, path: Option<&str>) {
+		// TS assigns the raw value; JSON null persists as `"shellPath": null`
+		// (undefined is not expressible through JSON, so None maps to null).
 		match path {
 			Some(p) => self.set_global_field("shellPath", Value::String(p.to_string())),
-			None => self.clear_global_field("shellPath"),
+			None => self.set_global_field("shellPath", Value::Null),
 		}
 	}
 
@@ -1987,9 +1991,10 @@ impl SettingsManager {
 	}
 
 	pub fn set_shell_command_prefix(&mut self, prefix: Option<&str>) {
+		// TS assigns the raw value; see set_shell_path re None → null.
 		match prefix {
 			Some(p) => self.set_global_field("shellCommandPrefix", Value::String(p.to_string())),
-			None => self.clear_global_field("shellCommandPrefix"),
+			None => self.set_global_field("shellCommandPrefix", Value::Null),
 		}
 	}
 
@@ -2000,9 +2005,15 @@ impl SettingsManager {
 	}
 
 	pub fn set_npm_command(&mut self, command: Option<&[String]>) {
+		// TS: `command ? [...command] : undefined` — null/undefined both
+		// collapse to undefined (JSON.stringify omits the key).
 		match command {
 			Some(c) => self.set_global_field("npmCommand", Value::Array(c.iter().map(|s| Value::String(s.clone())).collect())),
-			None => self.clear_global_field("npmCommand"),
+			None => {
+				self.global_settings.shift_remove("npmCommand");
+				self.mark_modified("npmCommand", None);
+				self.save();
+			}
 		}
 	}
 
@@ -2305,12 +2316,13 @@ impl SettingsManager {
 	}
 
 	pub fn set_enabled_models(&mut self, patterns: Option<&[String]>) {
+		// TS assigns the raw value; see set_shell_path re None → null.
 		match patterns {
 			Some(p) => self.set_global_field(
 				"enabledModels",
 				Value::Array(p.iter().map(|s| Value::String(s.clone())).collect()),
 			),
-			None => self.clear_global_field("enabledModels"),
+			None => self.set_global_field("enabledModels", Value::Null),
 		}
 	}
 
@@ -2365,7 +2377,9 @@ impl SettingsManager {
 	}
 
 	pub fn set_output_pad(&mut self, padding: f64) {
-		self.set_global_field("outputPad", Value::from(padding as i64));
+		// TS stores the raw value (no floor); `js_stringify_pretty` renders
+		// whole f64s without a trailing ".0", so persisted bytes match.
+		self.set_global_field("outputPad", Value::from(padding));
 	}
 
 	pub fn get_autocomplete_max_visible(&self) -> f64 {
@@ -2396,13 +2410,39 @@ impl SettingsManager {
 	}
 
 	pub fn get_warnings(&self) -> Value {
-		Value::Object(self.field("warnings").and_then(Value::as_object).cloned().unwrap_or_default())
+		Value::Object(self.field("warnings").map(js_object_spread).unwrap_or_default())
 	}
 
 	pub fn set_warnings(&mut self, warnings: &Value) {
-		let copy = warnings.as_object().cloned().unwrap_or_default();
+		let copy = js_object_spread(warnings);
 		self.set_global_field("warnings", Value::Object(copy));
 	}
+}
+
+/// JS object-spread `{ ...value }` semantics for the raw (unvalidated)
+/// settings values: strings and arrays spread to index keys (UTF-16 code
+/// units for strings), null/numbers/booleans spread to `{}`, and objects
+/// shallow-copy. Mirrors TS `{ ...x }` on unvalidated input.
+fn js_object_spread(value: &Value) -> serde_json::Map<String, Value> {
+	let mut out = serde_json::Map::new();
+	match value {
+		Value::Object(o) => out = o.clone(),
+		Value::Array(a) => {
+			for (i, v) in a.iter().enumerate() {
+				out.insert(i.to_string(), v.clone());
+			}
+		}
+		Value::String(s) => {
+			for (i, unit) in s.encode_utf16().enumerate() {
+				out.insert(
+					i.to_string(),
+					Value::String(String::from_utf16_lossy(&[unit])),
+				);
+			}
+		}
+		_ => {}
+	}
+	out
 }
 
 /// JS `String(number)` for the `Invalid ... setting: ${String(value)}` message
@@ -3491,7 +3531,9 @@ mod tests {
 		for (input, expected) in [
 			("{bad}", "Expected property name or '}' in JSON at position 1 (line 1 column 2)"),
 			("{ invalid json", "Expected property name or '}' in JSON at position 2 (line 1 column 3)"),
-			("{\"a\":}", "Unexpected token '}', \"{\\\"a\\\":}\" is not valid JSON"),
+			("{\"a\":}", "Unexpected token '}', \"{\"a\":}\" is not valid JSON"),
+			(&(String::from_utf8(vec![b'x'; 20]).unwrap() + "}"), "Unexpected token 'x', \"xxxxxxxxxx\"... is not valid JSON"),
+			(&(String::from_utf8(vec![b'x'; 19]).unwrap() + "}"), "Unexpected token 'x', \"xxxxxxxxxxxxxxxxxxx}\" is not valid JSON"),
 			("{\"a\":1,}", "Expected double-quoted property name in JSON at position 7 (line 1 column 8)"),
 			("[1,2", "Expected ',' or ']' after array element in JSON at position 4 (line 1 column 5)"),
 			("{\"a\":1} garbage", "Unexpected non-whitespace character after JSON at position 8 (line 1 column 9)"),

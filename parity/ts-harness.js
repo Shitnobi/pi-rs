@@ -47,6 +47,17 @@
 const path = require("path");
 const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
 const distDir = path.dirname(DIST);
+// The `crypto` ESM namespace snapshots named exports at creation (probed:
+// patching require("crypto").randomUUID AFTER any ESM `import ... from
+// "crypto"` is invisible to the importer). Install a pass-through dispatcher
+// BEFORE the dist graph is loaded so the settings-manager entry can swap in
+// a deterministic generator per case via globalThis.__piParityUuidOverride.
+const __realRandomUUID = require("crypto").randomUUID;
+require("crypto").randomUUID = function randomUUID(...args) {
+	const override = globalThis.__piParityUuidOverride;
+	if (override) return override();
+	return __realRandomUUID.apply(this, args);
+};
 const m = require(DIST);
 const FACTORIES = {
 	read: m.createReadTool,
@@ -3077,6 +3088,381 @@ async function runModule(tool, args, cwd) {
 			message: error.message,
 		}));
 		return { result: { errors } };
+	}
+
+	if (tool === "settings-manager") {
+		// Script-driven core/settings-manager.js (fresh cache-busted instance
+		// per case). crypto.randomUUID is overridden via the startup dispatcher
+		// (see top of file) and env /
+		// process.platform are scrubbed+injected so both sides see the same
+		// ambient state; everything is restored in the finally block.
+		const { pathToFileURL } = require("url");
+		const fs = require("fs");
+		const os = require("os");
+		const mode = args.mode;
+		if (typeof mode !== "string") throw new Error("missing mode");
+		if (mode !== "memory" && mode !== "files" && mode !== "inMemory") {
+			throw new Error("unknown settings-manager mode: " + mode);
+		}
+		const storageIn = args.storage ?? {};
+		for (const key of ["global", "project"]) {
+			const v = storageIn[key];
+			if (v !== undefined && v !== null && typeof v !== "string") {
+				throw new Error(`storage.${key} must be a string or null`);
+			}
+		}
+		const optionsIn = args.options ?? {};
+		if (optionsIn.projectTrusted !== undefined && typeof optionsIn.projectTrusted !== "boolean") {
+			throw new Error("options.projectTrusted must be a boolean");
+		}
+		if (optionsIn.env !== undefined) {
+			if (optionsIn.env === null || typeof optionsIn.env !== "object" || Array.isArray(optionsIn.env)) {
+				throw new Error("options.env must be an object");
+			}
+			for (const v of Object.values(optionsIn.env)) {
+				if (typeof v !== "string") throw new Error("options.env values must be strings");
+			}
+		}
+		if (optionsIn.platform !== undefined && typeof optionsIn.platform !== "string") {
+			throw new Error("options.platform must be a string");
+		}
+		if (optionsIn.uuids !== undefined) {
+			if (!Array.isArray(optionsIn.uuids) || optionsIn.uuids.some((v) => typeof v !== "string")) {
+				throw new Error("options.uuids must be an array of strings");
+			}
+		}
+		const ops = args.ops;
+		if (!Array.isArray(ops)) throw new Error("missing ops");
+
+		const uuids = optionsIn.uuids ?? [];
+		let uuidI = 0;
+		const nextUuid = () => {
+			const i = uuidI++;
+			return uuids.length === 0 ? "uuid-" + (i + 1) : uuids[Math.min(i, uuids.length - 1)];
+		};
+		globalThis.__piParityUuidOverride = nextUuid;
+		const savedEnv = { ...process.env };
+		for (const key of Object.keys(process.env)) delete process.env[key];
+		Object.assign(process.env, optionsIn.env ?? {});
+		const platDesc = Object.getOwnPropertyDescriptor(process, "platform");
+		Object.defineProperty(process, "platform", {
+			value: optionsIn.platform ?? "linux",
+			configurable: true,
+			writable: true,
+		});
+		globalThis.__piParitySmSeq = (globalThis.__piParitySmSeq || 0) + 1;
+		const sm = await import(
+			pathToFileURL(path.join(distDir, "core", "settings-manager.js")).href +
+				"?parity=" + globalThis.__piParitySmSeq
+		);
+		let cwdDir;
+		let agentDir;
+		try {
+			const options =
+				optionsIn.projectTrusted !== undefined ? { projectTrusted: optionsIn.projectTrusted } : {};
+			let manager;
+			let memStorage;
+			if (mode === "memory") {
+				memStorage = new sm.InMemorySettingsStorage();
+				if (typeof storageIn.global === "string") memStorage.withLock("global", () => storageIn.global);
+				if (typeof storageIn.project === "string") memStorage.withLock("project", () => storageIn.project);
+				manager = sm.SettingsManager.fromStorage(memStorage, options);
+			} else if (mode === "inMemory") {
+				manager = sm.SettingsManager.inMemory(args.settings === undefined ? {} : args.settings, options);
+			} else {
+				cwdDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parity-sm-cwd-"));
+				agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parity-sm-agent-"));
+				if (typeof storageIn.global === "string") {
+					fs.writeFileSync(path.join(agentDir, "settings.json"), storageIn.global);
+				}
+				if (typeof storageIn.project === "string") {
+					fs.mkdirSync(path.join(cwdDir, ".pi"), { recursive: true });
+					fs.writeFileSync(path.join(cwdDir, ".pi", "settings.json"), storageIn.project);
+				}
+				manager = sm.SettingsManager.create(cwdDir, agentDir, options);
+			}
+			const normPath = (p) =>
+				typeof p === "string" ? p.split(agentDir).join("<agentDir>").split(cwdDir).join("<cwd>") : p;
+			const globalPath = () => path.join(agentDir, "settings.json");
+			const projectPath = () => path.join(cwdDir, ".pi", "settings.json");
+
+			// Argument validation with Rust-identical messages.
+			const ck = (method, list, tags) => {
+				if (list.length !== tags.length) {
+					throw new Error(`settings-manager: ${method} expects ${tags.length} argument(s), got ${list.length}`);
+				}
+				tags.forEach((tag, i) => {
+					const a = list[i];
+					const bad = (what) => {
+						throw new Error(`settings-manager: ${method} argument ${i} must be ${what}`);
+					};
+					if (tag === "s" && typeof a !== "string") bad("a string");
+					if (tag === "b" && typeof a !== "boolean") bad("a boolean");
+					if (tag === "n" && typeof a !== "number") bad("a number");
+					if (tag === "s?" && a !== null && typeof a !== "string") bad("a string or null");
+					if (tag === "sa" && !(Array.isArray(a) && a.every((x) => typeof x === "string"))) bad("an array of strings");
+					if (
+						tag === "sa?" &&
+						a !== null &&
+						!(Array.isArray(a) && a.every((x) => typeof x === "string"))
+					)
+						bad("an array of strings or null");
+					if (tag === "va" && !Array.isArray(a)) bad("an array");
+					if (
+						tag === "m?" &&
+						a !== null &&
+						!(typeof a === "object" && !Array.isArray(a) && typeof a.provider === "string" && typeof a.id === "string")
+					)
+						bad("a model or null");
+					if (tag === "w" && a !== "auto" && typeof a !== "number") bad('"auto" or a number');
+				});
+			};
+			const METHODS = {
+				getSettings: { t: [], r: (m) => m.getSettings() },
+				getGlobalSettings: { t: [], r: (m) => m.getGlobalSettings() },
+				getProjectSettings: { t: [], r: (m) => m.getProjectSettings() },
+				isProjectTrusted: { t: [], r: (m) => m.isProjectTrusted() },
+				getLastChangelogVersion: { t: [], r: (m) => m.getLastChangelogVersion() },
+				setLastChangelogVersion: { t: ["s"], r: (m, a) => m.setLastChangelogVersion(a[0]) },
+				getSessionDir: { t: [], r: (m) => m.getSessionDir() },
+				getDefaultProvider: { t: [], r: (m) => m.getDefaultProvider() },
+				getDefaultModel: { t: [], r: (m) => m.getDefaultModel() },
+				setDefaultProvider: { t: ["s"], r: (m, a) => m.setDefaultProvider(a[0]) },
+				setDefaultModel: { t: ["s"], r: (m, a) => m.setDefaultModel(a[0]) },
+				setDefaultModelAndProvider: { t: ["s", "s"], r: (m, a) => m.setDefaultModelAndProvider(a[0], a[1]) },
+				getSteeringMode: { t: [], r: (m) => m.getSteeringMode() },
+				setSteeringMode: { t: ["s"], r: (m, a) => m.setSteeringMode(a[0]) },
+				getFollowUpMode: { t: [], r: (m) => m.getFollowUpMode() },
+				setFollowUpMode: { t: ["s"], r: (m, a) => m.setFollowUpMode(a[0]) },
+				getThemeSetting: { t: [], r: (m) => m.getThemeSetting() },
+				getTheme: { t: [], r: (m) => m.getTheme() },
+				setTheme: { t: ["s"], r: (m, a) => m.setTheme(a[0]) },
+				getDefaultThinkingLevel: { t: [], r: (m) => m.getDefaultThinkingLevel() },
+				setDefaultThinkingLevel: { t: ["s"], r: (m, a) => m.setDefaultThinkingLevel(a[0]) },
+				getModelThinkingLevel: { t: ["s", "s"], r: (m, a) => m.getModelThinkingLevel(a[0], a[1]) },
+				getAllModelThinkingLevels: { t: [], r: (m) => m.getAllModelThinkingLevels() },
+				setModelThinkingLevel: { t: ["s", "s", "s"], r: (m, a) => m.setModelThinkingLevel(a[0], a[1], a[2]) },
+				removeModelThinkingLevel: { t: ["s", "s"], r: (m, a) => m.removeModelThinkingLevel(a[0], a[1]) },
+				getTransport: { t: [], r: (m) => m.getTransport() },
+				setTransport: { t: ["s"], r: (m, a) => m.setTransport(a[0]) },
+				getSessionShareDestination: { t: [], r: (m) => m.getSessionShareDestination() },
+				setSessionShareDestination: { t: ["s"], r: (m, a) => m.setSessionShareDestination(a[0]) },
+				getCompactionEnabled: { t: [], r: (m) => m.getCompactionEnabled() },
+				setCompactionEnabled: { t: ["b"], r: (m, a) => m.setCompactionEnabled(a[0]) },
+				getCompactionReserveTokens: { t: ["m?"], r: (m, a) => m.getCompactionReserveTokens(a[0]) },
+				getCompactionKeepRecentTokens: { t: ["m?"], r: (m, a) => m.getCompactionKeepRecentTokens(a[0]) },
+				getCompactionSettings: { t: ["m?"], r: (m, a) => m.getCompactionSettings(a[0]) },
+				getBranchSummarySettings: { t: [], r: (m) => m.getBranchSummarySettings() },
+				getBranchSummarySkipPrompt: { t: [], r: (m) => m.getBranchSummarySkipPrompt() },
+				getRetryEnabled: { t: [], r: (m) => m.getRetryEnabled() },
+				setRetryEnabled: { t: ["b"], r: (m, a) => m.setRetryEnabled(a[0]) },
+				getRetrySettings: { t: [], r: (m) => m.getRetrySettings() },
+				getHttpIdleTimeoutMs: { t: [], r: (m) => m.getHttpIdleTimeoutMs() },
+				setHttpIdleTimeoutMs: { t: ["n"], r: (m, a) => m.setHttpIdleTimeoutMs(a[0]) },
+				getCacheWarmingMode: { t: [], r: (m) => m.getCacheWarmingMode() },
+				setCacheWarmingMode: { t: ["s"], r: (m, a) => m.setCacheWarmingMode(a[0]) },
+				getProviderRetrySettings: { t: [], r: (m) => m.getProviderRetrySettings() },
+				getWebSocketConnectTimeoutMs: { t: [], r: (m) => m.getWebSocketConnectTimeoutMs() },
+				getHideThinkingBlock: { t: [], r: (m) => m.getHideThinkingBlock() },
+				setHideThinkingBlock: { t: ["b"], r: (m, a) => m.setHideThinkingBlock(a[0]) },
+				getShowCacheMissNotices: { t: [], r: (m) => m.getShowCacheMissNotices() },
+				setShowCacheMissNotices: { t: ["b"], r: (m, a) => m.setShowCacheMissNotices(a[0]) },
+				getExternalEditorCommand: { t: [], r: (m) => m.getExternalEditorCommand() },
+				getShellPath: { t: [], r: (m) => m.getShellPath() },
+				setShellPath: { t: ["s?"], r: (m, a) => m.setShellPath(a[0]) },
+				getQuietStartup: { t: [], r: (m) => m.getQuietStartup() },
+				setQuietStartup: { t: ["v"], r: (m, a) => m.setQuietStartup(a[0]) },
+				getDefaultProjectTrust: { t: [], r: (m) => m.getDefaultProjectTrust() },
+				setDefaultProjectTrust: { t: ["s"], r: (m, a) => m.setDefaultProjectTrust(a[0]) },
+				getShellCommandPrefix: { t: [], r: (m) => m.getShellCommandPrefix() },
+				setShellCommandPrefix: { t: ["s?"], r: (m, a) => m.setShellCommandPrefix(a[0]) },
+				getNpmCommand: { t: [], r: (m) => m.getNpmCommand() },
+				setNpmCommand: { t: ["sa?"], r: (m, a) => m.setNpmCommand(a[0]) },
+				getCollapseChangelog: { t: [], r: (m) => m.getCollapseChangelog() },
+				setCollapseChangelog: { t: ["b"], r: (m, a) => m.setCollapseChangelog(a[0]) },
+				getEnableInstallTelemetry: { t: [], r: (m) => m.getEnableInstallTelemetry() },
+				setEnableInstallTelemetry: { t: ["b"], r: (m, a) => m.setEnableInstallTelemetry(a[0]) },
+				getEnableAnalytics: { t: [], r: (m) => m.getEnableAnalytics() },
+				getTrackingId: { t: [], r: (m) => m.getTrackingId() },
+				setEnableAnalytics: { t: ["b"], r: (m, a) => m.setEnableAnalytics(a[0]) },
+				getOrCreateDeviceId: { t: [], r: (m) => m.getOrCreateDeviceId() },
+				getPackages: { t: [], r: (m) => m.getPackages() },
+				setPackages: { t: ["va"], r: (m, a) => m.setPackages(a[0]) },
+				setProjectPackages: { t: ["va"], r: (m, a) => m.setProjectPackages(a[0]) },
+				getExtensionPaths: { t: [], r: (m) => m.getExtensionPaths() },
+				setExtensionPaths: { t: ["va"], r: (m, a) => m.setExtensionPaths(a[0]) },
+				setProjectExtensionPaths: { t: ["va"], r: (m, a) => m.setProjectExtensionPaths(a[0]) },
+				getSkillPaths: { t: [], r: (m) => m.getSkillPaths() },
+				setSkillPaths: { t: ["va"], r: (m, a) => m.setSkillPaths(a[0]) },
+				setProjectSkillPaths: { t: ["va"], r: (m, a) => m.setProjectSkillPaths(a[0]) },
+				getPromptTemplatePaths: { t: [], r: (m) => m.getPromptTemplatePaths() },
+				setPromptTemplatePaths: { t: ["va"], r: (m, a) => m.setPromptTemplatePaths(a[0]) },
+				setProjectPromptTemplatePaths: { t: ["va"], r: (m, a) => m.setProjectPromptTemplatePaths(a[0]) },
+				getThemePaths: { t: [], r: (m) => m.getThemePaths() },
+				setThemePaths: { t: ["va"], r: (m, a) => m.setThemePaths(a[0]) },
+				setProjectThemePaths: { t: ["va"], r: (m, a) => m.setProjectThemePaths(a[0]) },
+				getEnableSkillCommands: { t: [], r: (m) => m.getEnableSkillCommands() },
+				setEnableSkillCommands: { t: ["b"], r: (m, a) => m.setEnableSkillCommands(a[0]) },
+				getThinkingBudgets: { t: [], r: (m) => m.getThinkingBudgets() },
+				getTerminalCapabilityOverrides: { t: [], r: (m) => m.getTerminalCapabilityOverrides() },
+				getShowImages: { t: [], r: (m) => m.getShowImages() },
+				setShowImages: { t: ["b"], r: (m, a) => m.setShowImages(a[0]) },
+				getImageWidthCells: { t: [], r: (m) => m.getImageWidthCells() },
+				setImageWidthCells: { t: ["n"], r: (m, a) => m.setImageWidthCells(a[0]) },
+				getClearOnShrink: { t: [], r: (m) => m.getClearOnShrink() },
+				setClearOnShrink: { t: ["b"], r: (m, a) => m.setClearOnShrink(a[0]) },
+				getShowTerminalProgress: { t: [], r: (m) => m.getShowTerminalProgress() },
+				setShowTerminalProgress: { t: ["b"], r: (m, a) => m.setShowTerminalProgress(a[0]) },
+				getTuiMode: { t: [], r: (m) => m.getTuiMode() },
+				setTuiMode: { t: ["s"], r: (m, a) => m.setTuiMode(a[0]) },
+				getFullscreenExitOutput: { t: [], r: (m) => m.getFullscreenExitOutput() },
+				setFullscreenExitOutput: { t: ["s"], r: (m, a) => m.setFullscreenExitOutput(a[0]) },
+				getFullscreenScrollbar: { t: [], r: (m) => m.getFullscreenScrollbar() },
+				setFullscreenScrollbar: { t: ["s"], r: (m, a) => m.setFullscreenScrollbar(a[0]) },
+				getFullscreenCopyOnSelect: { t: [], r: (m) => m.getFullscreenCopyOnSelect() },
+				setFullscreenCopyOnSelect: { t: ["b"], r: (m, a) => m.setFullscreenCopyOnSelect(a[0]) },
+				getFullscreenWheelScrollLines: { t: [], r: (m) => m.getFullscreenWheelScrollLines() },
+				setFullscreenWheelScrollLines: { t: ["w"], r: (m, a) => m.setFullscreenWheelScrollLines(a[0]) },
+				getImageAutoResize: { t: [], r: (m) => m.getImageAutoResize() },
+				setImageAutoResize: { t: ["b"], r: (m, a) => m.setImageAutoResize(a[0]) },
+				getBlockImages: { t: [], r: (m) => m.getBlockImages() },
+				setBlockImages: { t: ["b"], r: (m, a) => m.setBlockImages(a[0]) },
+				getEnabledModels: { t: [], r: (m) => m.getEnabledModels() },
+				setEnabledModels: { t: ["sa?"], r: (m, a) => m.setEnabledModels(a[0]) },
+				getDefaultTools: { t: [], r: (m) => m.getDefaultTools() },
+				getDoubleEscapeAction: { t: [], r: (m) => m.getDoubleEscapeAction() },
+				setDoubleEscapeAction: { t: ["s"], r: (m, a) => m.setDoubleEscapeAction(a[0]) },
+				getTreeFilterMode: { t: [], r: (m) => m.getTreeFilterMode() },
+				setTreeFilterMode: { t: ["s"], r: (m, a) => m.setTreeFilterMode(a[0]) },
+				getShowHardwareCursor: { t: [], r: (m) => m.getShowHardwareCursor() },
+				setShowHardwareCursor: { t: ["b"], r: (m, a) => m.setShowHardwareCursor(a[0]) },
+				getEditorPaddingX: { t: [], r: (m) => m.getEditorPaddingX() },
+				setEditorPaddingX: { t: ["n"], r: (m, a) => m.setEditorPaddingX(a[0]) },
+				getOutputPad: { t: [], r: (m) => m.getOutputPad() },
+				setOutputPad: { t: ["n"], r: (m, a) => m.setOutputPad(a[0]) },
+				getAutocompleteMaxVisible: { t: [], r: (m) => m.getAutocompleteMaxVisible() },
+				setAutocompleteMaxVisible: { t: ["n"], r: (m, a) => m.setAutocompleteMaxVisible(a[0]) },
+				getCodeBlockIndent: { t: [], r: (m) => m.getCodeBlockIndent() },
+				getMermaidRenderingMode: { t: [], r: (m) => m.getMermaidRenderingMode() },
+				setMermaidRenderingMode: { t: ["s"], r: (m, a) => m.setMermaidRenderingMode(a[0]) },
+				getWarnings: { t: [], r: (m) => m.getWarnings() },
+				setWarnings: { t: ["v"], r: (m, a) => m.setWarnings(a[0]) },
+			};
+
+			const out = [];
+			// The op loop must not await between ops: the writeQueue only
+			// advances at the explicit flush/reload ops (Rust drains its
+			// pending-write deque only there too).
+			for (const op of ops) {
+				try {
+					if (op.op === "get" || op.op === "set") {
+						const method = op.method;
+						if (typeof method !== "string") throw new Error("missing method");
+						const list = Array.isArray(op.args) ? op.args : [];
+						if (method === "flush" || method === "reload") {
+							ck(method, list, []);
+							await manager[method]();
+							out.push(null);
+						} else {
+							const spec = METHODS[method];
+							if (!spec) throw new Error("unknown settings-manager method: " + method);
+							ck(method, list, spec.t);
+							const value = spec.r(manager, list);
+							out.push(value === undefined ? null : value);
+						}
+					} else if (op.op === "flush") {
+						await manager.flush();
+						out.push(null);
+					} else if (op.op === "reload") {
+						await manager.reload();
+						out.push(null);
+					} else if (op.op === "drainErrors") {
+						out.push(
+							manager.drainErrors().map((e) => {
+								const entry = { scope: e.scope };
+								if (e.path) entry.path = normPath(e.path);
+								entry.message = e.error && e.error.message !== undefined ? e.error.message : String(e.error);
+								return entry;
+							}),
+						);
+					} else if (op.op === "setProjectTrusted") {
+						const list = Array.isArray(op.args) ? op.args : [];
+						ck("setProjectTrusted", list, ["b"]);
+						manager.setProjectTrusted(list[0]);
+						out.push(null);
+					} else if (op.op === "applyOverrides") {
+						const list = Array.isArray(op.args) ? op.args : [];
+						ck("applyOverrides", list, ["v"]);
+						manager.applyOverrides(list[0]);
+						out.push(null);
+					} else if (op.op === "storage") {
+						if (mode === "inMemory") throw new Error("storage op is unavailable in inMemory mode");
+						if (mode === "memory") {
+							out.push({ global: memStorage.global ?? null, project: memStorage.project ?? null });
+						} else {
+							const read = (p) => (fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null);
+							out.push({ global: read(globalPath()), project: read(projectPath()) });
+						}
+					} else if (op.op === "external") {
+						if (mode === "inMemory") throw new Error("external op is unavailable in inMemory mode");
+						const list = Array.isArray(op.args) ? op.args : [];
+						ck("external", list, ["v"]);
+						const spec = list[0];
+						if (spec === null || typeof spec !== "object") throw new Error("missing external spec");
+						if (typeof spec.scope !== "string") throw new Error("missing scope");
+						if (spec.scope !== "global" && spec.scope !== "project") {
+							throw new Error("settings-manager: external op scope must be global or project, got " + spec.scope);
+						}
+						if (spec.content !== undefined && spec.content !== null && typeof spec.content !== "string") {
+							throw new Error("settings-manager: external content must be a string or null");
+						}
+						if (mode === "memory") {
+							memStorage[spec.scope] = spec.content ?? null;
+						} else {
+							const p = spec.scope === "global" ? globalPath() : projectPath();
+							if (spec.content === null || spec.content === undefined) {
+								fs.rmSync(p, { force: true });
+							} else {
+								fs.mkdirSync(path.dirname(p), { recursive: true });
+								fs.writeFileSync(p, spec.content);
+							}
+						}
+						out.push(null);
+					} else if (op.op === "pure") {
+						const fname = op.fn;
+						if (typeof fname !== "string") throw new Error("missing fn");
+						const list = Array.isArray(op.args) ? op.args : [];
+						if (fname === "applyToolModifiers") {
+							ck(fname, list, ["sa", "sa"]);
+							out.push(sm.applyToolModifiers(list[0], list[1]));
+						} else if (fname === "getToolListError") {
+							ck(fname, list, ["sa"]);
+							out.push(sm.getToolListError(list[0]) ?? null);
+						} else if (fname === "isToolModifier") {
+							ck(fname, list, ["v"]);
+							out.push(sm.isToolModifier(list[0]));
+						} else if (fname === "DEFAULT_TOOL_NAMES") {
+							ck(fname, list, []);
+							out.push([...sm.DEFAULT_TOOL_NAMES]);
+						} else {
+							throw new Error("unknown settings-manager pure fn: " + fname);
+						}
+					} else {
+						throw new Error("unknown settings-manager op: " + op.op);
+					}
+				} catch (e) {
+					out.push({ thrown: e && e.message !== undefined ? e.message : String(e) });
+				}
+			}
+			return { result: { out } };
+		} finally {
+			globalThis.__piParityUuidOverride = null;
+			for (const key of Object.keys(process.env)) delete process.env[key];
+			Object.assign(process.env, savedEnv);
+			if (platDesc) Object.defineProperty(process, "platform", platDesc);
+			if (cwdDir) fs.rmSync(cwdDir, { recursive: true, force: true });
+			if (agentDir) fs.rmSync(agentDir, { recursive: true, force: true });
+		}
 	}
 
 	return undefined;

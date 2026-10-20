@@ -217,7 +217,7 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
             return runtime_harness::run(name, &input)
         }
         "event-bus" | "timings" | "slash-commands" | "settings-defaults"
-        | "settings-schema" => {
+        | "settings-schema" | "settings-manager" => {
             return core_harness::run(name, &input)
         }
         _ => {}

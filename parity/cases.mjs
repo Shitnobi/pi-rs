@@ -6939,6 +6939,208 @@ export const cases = [
 
 	return __cases;
 })(),
+
+// settings-manager: script-driven SettingsManager parity (memory / files /
+// inMemory modes; migrated loads, persisted bytes, trust, errors, uuids).
+...(() => {
+	const smc = (name, args) => ({ tool: "settings-manager", name: "sm-" + name, args });
+	const J = JSON.stringify;
+	const mem = (name, o) => smc(name, {
+		mode: "memory",
+		storage: { global: o.g === undefined ? null : o.g, project: o.p === undefined ? null : o.p },
+		options: o.opt ?? {},
+		ops: o.ops,
+	});
+	const files = (name, o) => smc(name, {
+		mode: "files",
+		storage: { global: o.g === undefined ? null : o.g, project: o.p === undefined ? null : o.p },
+		options: o.opt ?? {},
+		ops: o.ops,
+	});
+	const get = (m) => ({ op: "get", method: m });
+	const set = (m, ...a) => ({ op: "set", method: m, args: a });
+	const c = [];
+
+	// --- defaults / basic getters ---
+	c.push(mem("empty", { ops: [get("getSettings"), get("getGlobalSettings"), get("getProjectSettings"), get("isProjectTrusted"), { op: "storage" }] }));
+	c.push(mem("defaults", { ops: [
+		get("getSteeringMode"), get("getFollowUpMode"), get("getTransport"), get("getTheme"),
+		get("getThemeSetting"), get("getDefaultProvider"), get("getDefaultModel"), get("getSessionDir"),
+		get("getDefaultThinkingLevel"), get("getAllModelThinkingLevels"), get("getQuietStartup"),
+		get("getDefaultProjectTrust"), get("getShellCommandPrefix"), get("getNpmCommand"),
+		get("getEditorPaddingX"), get("getOutputPad"), get("getAutocompleteMaxVisible"),
+		get("getCodeBlockIndent"), get("getMermaidRenderingMode"), get("getWarnings"),
+		get("getDoubleEscapeAction"), get("getTreeFilterMode"), get("getTuiMode"),
+		get("getFullscreenExitOutput"), get("getFullscreenScrollbar"), get("getFullscreenCopyOnSelect"),
+		get("getFullscreenWheelScrollLines"), get("getCompactionEnabled"), get("getRetrySettings"),
+		get("getProviderRetrySettings"), get("getHttpIdleTimeoutMs"), get("getWebSocketConnectTimeoutMs"),
+		get("getBranchSummarySettings"), get("getCacheWarmingMode"), get("getDefaultTools"),
+		get("getTerminalCapabilityOverrides"), get("getThinkingBudgets"), get("getEnabledModels"),
+	]}));
+
+	// --- deep merge ---
+	c.push(mem("merge-basic", { g: J({ a: 1, theme: "dark", nested: { x: 1, y: 2 } }), p: J({ b: 2, theme: "light", nested: { y: 3 } }),
+		ops: [get("getSettings"), get("getGlobalSettings"), get("getProjectSettings")] }));
+	c.push(mem("merge-arrays-replace", { g: J({ packages: ["a", "b"], terminal: { images: "kitty" } }), p: J({ packages: ["c"] }),
+		ops: [get("getPackages"), get("getTerminalCapabilityOverrides")] }));
+	c.push(mem("merge-null-override", { g: J({ theme: "dark" }), p: J({ theme: null }), ops: [get("getThemeSetting")] }));
+	c.push(mem("merge-default-tools", {
+		g: J({ defaultTools: ["read", "bash"] }), p: J({ defaultTools: ["+edit", "-bash"] }),
+		ops: [get("getDefaultTools"), get("getSettings")] }));
+	c.push(mem("default-tools-plain-replace", { g: J({ defaultTools: ["read"] }), p: J({ defaultTools: ["grep", "find"] }), ops: [get("getDefaultTools")] }));
+	c.push(mem("default-tools-modifiers-only", { g: J({ defaultTools: ["+web", "-edit"] }), ops: [get("getDefaultTools")] }));
+	c.push(mem("default-tools-empty", { g: J({ defaultTools: [] }), ops: [get("getDefaultTools")] }));
+	c.push(mem("default-tools-nonstring-filtered", { g: J({ defaultTools: [5, "grep"] }), ops: [get("getDefaultTools")] }));
+	c.push(mem("default-tools-dedupe", { g: J({ defaultTools: ["+read", "+read", "-bash", "-bash"] }), ops: [get("getDefaultTools")] }));
+
+	// --- migrations ---
+	c.push(mem("migrate-queue-mode", { g: J({ queueMode: "all", keep: 1 }), ops: [get("getSettings"), get("getSteeringMode")] }));
+	c.push(mem("migrate-queue-mode-both", { g: J({ queueMode: "all", steeringMode: "top" }), ops: [get("getSettings")] }));
+	c.push(mem("migrate-websockets-true", { g: J({ websockets: true }), ops: [get("getTransport")] }));
+	c.push(mem("migrate-websockets-false", { g: J({ websockets: false, x: 1 }), ops: [get("getTransport"), get("getSettings")] }));
+	c.push(mem("migrate-websockets-transport-set", { g: J({ websockets: true, transport: "sse" }), ops: [get("getSettings")] }));
+	c.push(mem("migrate-websockets-nonbool", { g: J({ websockets: "yes" }), ops: [get("getSettings")] }));
+	c.push(mem("migrate-skills-hoist", { g: J({ skills: { enableSkillCommands: true } }), ops: [get("getSettings"), get("getEnableSkillCommands"), get("getSkillPaths")] }));
+	c.push(mem("migrate-skills-custom-dirs", { g: J({ skills: { enableSkillCommands: false, customDirectories: ["/a", "/b"] } }), ops: [get("getSkillPaths"), get("getSettings")] }));
+	c.push(mem("migrate-skills-empty-dirs", { g: J({ skills: { customDirectories: [] }, enableSkillCommands: true }), ops: [get("getSettings")] }));
+	c.push(mem("migrate-retry-max-delay", { g: J({ retry: { maxDelayMs: 9000, enabled: false } }), ops: [get("getProviderRetrySettings"), get("getSettings")] }));
+	c.push(mem("migrate-retry-provider-exists", { g: J({ retry: { maxDelayMs: 9000, provider: { timeoutMs: 5, maxRetryDelayMs: 7 } } }), ops: [get("getProviderRetrySettings")] }));
+	c.push(mem("migrate-retry-non-number", { g: J({ retry: { maxDelayMs: "x" } }), ops: [get("getSettings")] }));
+
+	// --- load errors (V8 JSON.parse messages; avoid the two port gaps) ---
+	for (const [n, content] of [["truncated", "{"], ["trailing", "[1]x"], ["bad-token", "nope"], ["whitespace", " "], ["empty-string", ""], ["missing-colon", '{"a" 1}'], ["array-comma", "[1,"], ["non-object-number", "42"], ["non-object-null", "null"], ["non-object-bool", "true"], ["non-object-string", '"hello"']]) {
+		c.push(mem("load-error-global-" + n, { g: content, ops: [{ op: "drainErrors" }, get("getSettings"), get("getGlobalSettings")] }));
+	}
+	c.push(mem("load-error-project", { g: J({ a: 1 }), p: "{oops", ops: [{ op: "drainErrors" }, get("getSettings")] }));
+	c.push(mem("load-error-both", { g: "{", p: "[", ops: [{ op: "drainErrors" }] }));
+	c.push(mem("load-error-then-drain-empty", { g: "{", ops: [{ op: "drainErrors" }, { op: "drainErrors" }] }));
+	c.push(mem("load-error-save-short-circuit", { g: "{", ops: [set("setTheme", "red"), { op: "flush" }, { op: "storage" }, { op: "drainErrors" }] }));
+	c.push(files("load-error-paths", { g: "{", p: "{", ops: [{ op: "drainErrors" }] }));
+	c.push(mem("bom-content", { g: "﻿" + J({ theme: "dark" }), ops: [get("getThemeSetting")] }));
+
+	// --- persist semantics (byte-level strings) ---
+	c.push(mem("persist-key-order", { g: J({ b: 1, a: 2 }), ops: [set("setTheme", "x"), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("persist-set-existing-keeps-position", { g: J({ theme: "a", first: 1 }), ops: [set("setTheme", "b"), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("persist-no-flush-unchanged", { g: J({ theme: "a" }), ops: [set("setTheme", "b"), { op: "storage" }] }));
+	c.push(mem("persist-batched-sets", { ops: [set("setTheme", "a"), set("setTransport", "websocket"), set("setSteeringMode", "top"), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("persist-nested-partial-merge", { g: J({ terminal: { showImages: false, imageWidthCells: 80 } }), ops: [set("setShowImages", true), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("persist-migrates-current-file", { g: J({ queueMode: "all", keep: 1 }), ops: [set("setTheme", "x"), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("persist-clear-field", { g: J({ shellPath: "/bin/zsh", theme: "a" }), ops: [set("setShellPath", null), { op: "flush" }, { op: "storage" }, get("getShellPath")] }));
+	c.push(mem("flush-empty-queue", { g: J({ a: 1 }), ops: [{ op: "flush" }, { op: "storage" }] }));
+	c.push(mem("reload-pending-write-first", { ops: [set("setTheme", "z"), { op: "reload" }, get("getThemeSetting"), { op: "storage" }] }));
+	c.push(mem("reload-external-edit", { g: J({ theme: "a" }), ops: [get("getThemeSetting"), { op: "external", args: [{ scope: "global", content: J({ theme: "b", extra: 2 }) }] }, { op: "reload" }, get("getThemeSetting"), get("getSettings")] }));
+	c.push(mem("reload-external-invalid", { g: J({ theme: "a" }), ops: [{ op: "external", args: [{ scope: "global", content: "{" }] }, { op: "reload" }, get("getThemeSetting"), { op: "drainErrors" }] }));
+	c.push(mem("reload-external-delete", { g: J({ theme: "a" }), ops: [{ op: "external", args: [{ scope: "global", content: null }] }, { op: "reload" }, get("getThemeSetting"), { op: "storage" }] }));
+	c.push(mem("external-edit-then-set", { g: J({ theme: "dark" }), ops: [
+		{ op: "external", args: [{ scope: "global", content: J({ theme: "blue", extra: 1 }) }] },
+		set("setTheme", "red"), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("external-invalid-then-flush", { g: J({ theme: "a" }), ops: [
+		{ op: "external", args: [{ scope: "global", content: '{"a":}' }] },
+		set("setTheme", "b"), { op: "flush" }, { op: "storage" }, { op: "drainErrors" }] }));
+
+	// --- files mode: FileSettingsStorage ---
+	c.push(files("create-dirs-on-write", { ops: [set("setTheme", "x"), { op: "flush" }, { op: "storage" }] }));
+	c.push(files("project-write", { ops: [set("setProjectPackages", ["pkg-a"]), { op: "flush" }, { op: "storage" }, get("getPackages")] }));
+	c.push(files("project-load", { g: J({ theme: "g" }), p: J({ theme: "p" }), ops: [get("getSettings"), get("getProjectSettings")] }));
+	c.push(files("project-partial-merge", { p: J({ packages: ["one"], theme: "p" }), ops: [set("setProjectPackages", ["two"]), { op: "flush" }, { op: "storage" }] }));
+	c.push(files("bom-file", { g: "﻿" + J({ theme: "bom" }), ops: [get("getThemeSetting")] }));
+
+	// --- project trust ---
+	c.push(mem("untrusted-skip-load", { p: J({ theme: "p" }), opt: { projectTrusted: false }, ops: [get("isProjectTrusted"), get("getSettings"), { op: "drainErrors" }] }));
+	c.push(mem("untrusted-write-throws", { opt: { projectTrusted: false }, ops: [set("setProjectPackages", ["x"]), { op: "drainErrors" }] }));
+	c.push(mem("untrusted-queued-write-error", { p: J({ theme: "p" }), ops: [
+		set("setProjectPackages", ["x"]), { op: "setProjectTrusted", args: [false] }, { op: "flush" },
+		{ op: "storage" }, { op: "drainErrors" }] }));
+	c.push(mem("trust-transitions", { p: J({ theme: "p" }), opt: { projectTrusted: false }, ops: [
+		get("getSettings"), { op: "setProjectTrusted", args: [true] }, get("getSettings"),
+		{ op: "setProjectTrusted", args: [true] }, { op: "setProjectTrusted", args: [false] }, get("getSettings")] }));
+	c.push(mem("trust-load-error-surface", { p: "{", opt: { projectTrusted: false }, ops: [
+		{ op: "drainErrors" }, { op: "setProjectTrusted", args: [true] }, { op: "drainErrors" }] }));
+
+	// --- clamps / env / editor ---
+	c.push(mem("clamp-editor-padding", { ops: [set("setEditorPaddingX", 2.9), get("getEditorPaddingX"), set("setEditorPaddingX", -5), get("getEditorPaddingX")] }));
+	c.push(mem("clamp-autocomplete", { ops: [set("setAutocompleteMaxVisible", 25), get("getAutocompleteMaxVisible"), set("setAutocompleteMaxVisible", 1), get("getAutocompleteMaxVisible")] }));
+	c.push(mem("output-pad-values", { ops: [set("setOutputPad", 0), get("getOutputPad"), set("setOutputPad", 5), get("getOutputPad"), set("setOutputPad", 0.5), get("getOutputPad"), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("image-width-clamp", { g: J({ terminal: { imageWidthCells: 0.9 } }), ops: [get("getImageWidthCells"), set("setImageWidthCells", 12.7), get("getImageWidthCells")] }));
+	c.push(mem("wheel-scroll-lines", { ops: [set("setFullscreenWheelScrollLines", "auto"), get("getFullscreenWheelScrollLines"), set("setFullscreenWheelScrollLines", 500), get("getFullscreenWheelScrollLines"), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("editor-env-visual", { opt: { env: { VISUAL: "emacs", EDITOR: "vi" } }, ops: [get("getExternalEditorCommand")] }));
+	c.push(mem("editor-env-editor", { opt: { env: { EDITOR: "vi" } }, ops: [get("getExternalEditorCommand")] }));
+	c.push(mem("editor-env-none", { opt: { env: {} }, ops: [get("getExternalEditorCommand")] }));
+	c.push(mem("editor-configured", { g: J({ externalEditor: "  " }), opt: { env: { EDITOR: "vi" } }, ops: [get("getExternalEditorCommand")] }));
+	c.push(mem("editor-win32", { opt: { platform: "win32", env: {} }, ops: [get("getExternalEditorCommand")] }));
+	c.push(mem("env-clear-on-shrink", { opt: { env: { PI_CLEAR_ON_SHRINK: "1" } }, ops: [get("getClearOnShrink")] }));
+	c.push(mem("env-hardware-cursor", { opt: { env: { PI_HARDWARE_CURSOR: "1" } }, ops: [get("getShowHardwareCursor")] }));
+	c.push(mem("session-dir-tilde", { g: J({ sessionDir: "~/sessions" }), opt: { env: { HOME: "/home/parity" } }, ops: [get("getSessionDir")] }));
+
+	// --- httpIdleTimeoutMs ---
+	for (const [n, v] of [["object", {}], ["string", "abc"], ["bool", true], ["array", [1, 2]], ["negative", -1]]) {
+		c.push(mem("http-idle-invalid-" + n, { g: J({ httpIdleTimeoutMs: v }), ops: [get("getHttpIdleTimeoutMs")] }));
+	}
+	c.push(mem("http-idle-disabled", { g: J({ httpIdleTimeoutMs: "disabled" }), ops: [get("getHttpIdleTimeoutMs")] }));
+	c.push(mem("http-idle-float", { g: J({ httpIdleTimeoutMs: 5000.7 }), ops: [get("getHttpIdleTimeoutMs")] }));
+	c.push(mem("http-idle-set-invalid", { ops: [set("setHttpIdleTimeoutMs", -1), { op: "storage" }] }));
+	c.push(mem("http-idle-set-float", { ops: [set("setHttpIdleTimeoutMs", 100.9), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("ws-connect-timeout", { g: J({ websocketConnectTimeoutMs: 2500 }), ops: [get("getWebSocketConnectTimeoutMs")] }));
+
+	// --- analytics uuids ---
+	c.push(mem("analytics-uuids", { opt: { uuids: ["uuid-a", "uuid-b"] }, ops: [
+		set("setEnableAnalytics", true), get("getTrackingId"), set("setEnableAnalytics", false),
+		get("getTrackingId"), set("setEnableAnalytics", true), get("getTrackingId"),
+		get("getOrCreateDeviceId"), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("uuid-exhaustion", { opt: { uuids: ["only"] }, ops: [get("getOrCreateDeviceId"), set("setEnableAnalytics", true), get("getTrackingId")] }));
+	c.push(mem("device-id-persists", { opt: { uuids: ["dev-1"] }, ops: [get("getOrCreateDeviceId"), get("getOrCreateDeviceId"), { op: "flush" }, { op: "storage" }] }));
+
+	// --- compaction ---
+	c.push(mem("compaction-overrides", { g: J({ compaction: { reserveTokens: 100, modelOverrides: { "a/b": { reserveTokens: 50 } } } }), ops: [
+		get("getCompactionReserveTokens"), get("getCompactionReserveTokens", { provider: "a", id: "b" }),
+		get("getCompactionKeepRecentTokens", { provider: "a", id: "b" }),
+		get("getCompactionSettings", { provider: "a", id: "b" })] }));
+	for (const [n, v] of [["negative", -1], ["fraction", 1.5], ["string", "x"]]) {
+		c.push(mem("compaction-invalid-" + n, { g: J({ compaction: { reserveTokens: v } }), ops: [get("getCompactionReserveTokens")] }));
+	}
+	c.push(mem("compaction-invalid-override-entry", { g: J({ compaction: { modelOverrides: { "a/b": 5 } } }), ops: [get("getCompactionReserveTokens", { provider: "a", id: "b" })] }));
+	c.push(mem("compaction-invalid-override-field", { g: J({ compaction: { modelOverrides: { "a/b": { keepRecentTokens: -3 } } } }), ops: [get("getCompactionKeepRecentTokens", { provider: "a", id: "b" })] }));
+
+	// --- misc setters/getters ---
+	c.push(mem("thinking-levels", { ops: [
+		set("setModelThinkingLevel", "anthropic", "m1", "high"), get("getModelThinkingLevel", "anthropic", "m1"),
+		get("getAllModelThinkingLevels"), set("removeModelThinkingLevel", "anthropic", "m1"),
+		get("getAllModelThinkingLevels"), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("quiet-startup-values", { g: J({ quietStartup: "header" }), ops: [get("getQuietStartup"), set("setQuietStartup", true), get("getQuietStartup"), set("setQuietStartup", "loud"), get("getQuietStartup")] }));
+	c.push(mem("npm-command", { ops: [set("setNpmCommand", ["mise", "exec"]), get("getNpmCommand"), set("setNpmCommand", null), get("getNpmCommand"), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("enabled-models", { ops: [set("setEnabledModels", ["a/*"]), get("getEnabledModels"), set("setEnabledModels", null), get("getEnabledModels"), { op: "flush" }, { op: "storage" }] }));
+	c.push(mem("warnings-copy", { g: J({ warnings: { a: true } }), ops: [get("getWarnings"), set("setWarnings", { b: false }), get("getWarnings"), get("getWarnings"), set("setWarnings", "not-an-object"), get("getWarnings")] }));
+	c.push(mem("cache-warming-global-only", { g: J({ cacheWarming: "idle" }), p: J({ cacheWarming: "streaming" }), ops: [get("getCacheWarmingMode")] }));
+	c.push(mem("theme-slash-filtered", { g: J({ theme: "custom/dark" }), ops: [get("getThemeSetting"), get("getTheme")] }));
+	c.push(mem("terminal-capabilities", { g: J({ terminal: { images: false, trueColor: true, hyperlinks: "x" } }), ops: [get("getTerminalCapabilityOverrides")] }));
+
+	// --- inMemory factory + overrides ---
+	c.push(smc("in-memory-factory", { mode: "inMemory", settings: { queueMode: "all", theme: "x" }, ops: [get("getSettings"), get("getSteeringMode"), { op: "storage" }] }));
+	c.push(smc("in-memory-empty", { mode: "inMemory", settings: {}, ops: [get("getSettings"), set("setTheme", "y"), { op: "flush" }, get("getThemeSetting")] }));
+	c.push(mem("apply-overrides", { g: J({ theme: "a", nested: { x: 1 } }), ops: [
+		{ op: "applyOverrides", args: [{ theme: "b", nested: { y: 2 }, defaultTools: ["+edit"] }] },
+		get("getSettings"), get("getDefaultTools")] }));
+
+	// --- pure functions ---
+	c.push(smc("pure-apply-modifiers", { mode: "memory", ops: [{ op: "pure", fn: "applyToolModifiers", args: [["read", "bash"], ["+edit", "-bash", "+read"]] }] }));
+	c.push(smc("pure-tool-list-error-mixed", { mode: "memory", ops: [{ op: "pure", fn: "getToolListError", args: [["read", "+edit"]] }] }));
+	c.push(smc("pure-tool-list-error-pattern", { mode: "memory", ops: [{ op: "pure", fn: "getToolListError", args: [["+rea*", "-bash"]] }] }));
+	c.push(smc("pure-tool-list-error-ok", { mode: "memory", ops: [{ op: "pure", fn: "getToolListError", args: [["read", "bash"]] }] }));
+	c.push(smc("pure-is-modifier", { mode: "memory", ops: [{ op: "pure", fn: "isToolModifier", args: ["+x"] }, { op: "pure", fn: "isToolModifier", args: ["x"] }, { op: "pure", fn: "isToolModifier", args: [5] }] }));
+	c.push(smc("pure-default-tool-names", { mode: "memory", ops: [{ op: "pure", fn: "DEFAULT_TOOL_NAMES" }] }));
+
+	// --- protocol misuse (identical in-band errors) ---
+	c.push(mem("unknown-method", { ops: [{ op: "get", method: "bogus" }] }));
+	c.push(mem("unknown-op", { ops: [{ op: "bogus" }] }));
+	c.push(mem("unknown-pure-fn", { ops: [{ op: "pure", fn: "bogus" }] }));
+	c.push(mem("arg-type-error", { ops: [{ op: "set", method: "setTheme", args: [5] }] }));
+	c.push(mem("arg-count-error", { ops: [{ op: "get", method: "getTheme", args: ["a"] }] }));
+	c.push(smc("missing-mode", { ops: [] }));
+	c.push(smc("unknown-mode", { mode: "bogus", ops: [] }));
+	c.push(smc("missing-ops", { mode: "memory" }));
+
+	return c.filter(Boolean);
+})(),
 ];
 
 // config-value sub-case builder (hoisted; used by the cases above).
