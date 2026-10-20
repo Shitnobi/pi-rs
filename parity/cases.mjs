@@ -933,7 +933,6 @@ export const cases = [
 	{
 		name: "session-manager/migrate-v1",
 		tool: "session-manager",
-		normalizeSessionIds: true,
 		args: {
 			fn: "migrateSessionEntries",
 			entries: [
@@ -948,7 +947,6 @@ export const cases = [
 	{
 		name: "session-manager/migrate-v1-compaction-index-out-of-range",
 		tool: "session-manager",
-		normalizeSessionIds: true,
 		args: {
 			fn: "migrateSessionEntries",
 			entries: [
@@ -987,7 +985,6 @@ export const cases = [
 	{
 		name: "session-manager/migrate-no-header",
 		tool: "session-manager",
-		normalizeSessionIds: true,
 		args: {
 			fn: "migrateSessionEntries",
 			entries: [
@@ -7445,6 +7442,773 @@ export const cases = [
 	c.push(sk("err-bad-files", { op: "load", files: [] }));
 
 	return c.filter(Boolean);
+})(),
+
+...(() => {
+	// ========================================================================
+	// sess-manager / nested-tool-calls / pi-manifest / output-guard /
+	// defaults — the session-manager + small-modules wave. Protocol mirrors
+	// crates/pi-cli/src/core_harness.rs and the matching ts-harness.js
+	// entries: {op, ...} for sess-manager/pi-manifest/defaults, {ops: [...]}
+	// scripts for nested-tool-calls/output-guard. Fixture ids avoid the
+	// 8-hex / uuid shapes the normalizers rewrite; both sides rewrite
+	// uuids, ISO timestamps and epoch-ms `timestamp` fields.
+	// ========================================================================
+
+	// --- defaults (core/defaults.js constants) ---
+	const def = (name, args) => ({ tool: "defaults", name: "def-" + name, args });
+	const defCases = [
+		def("constants", { op: "constants" }),
+		def("err-missing-op", {}),
+		def("err-unknown-op", { op: "bogus" }),
+	];
+
+	// --- pi-manifest (core/pi-manifest.js readPiManifest) ---
+	const pm = (name, args) => ({ tool: "pi-manifest", name: "pm-" + name, args });
+	const pmJson = (o) => JSON.stringify(o);
+	const pmCases = [
+		pm("all-fields", { op: "read", content: pmJson({ name: "pkg", pi: { extensions: ["a"], skills: ["s1", "s2"], prompts: [], themes: ["t"] } }) }),
+		pm("subset", { op: "read", content: pmJson({ pi: { skills: ["only"] } }) }),
+		pm("empty-pi", { op: "read", content: pmJson({ pi: {} }) }),
+		pm("missing-pi", { op: "read", content: pmJson({ name: "pkg" }) }),
+		pm("pi-null", { op: "read", content: pmJson({ pi: null }) }),
+		pm("pi-array", { op: "read", content: pmJson({ pi: [] }) }),
+		pm("pi-string", { op: "read", content: pmJson({ pi: "x" }) }),
+		pm("root-array", { op: "read", content: "[1,2]" }),
+		pm("root-string", { op: "read", content: '"str"' }),
+		pm("root-number", { op: "read", content: "42" }),
+		pm("invalid-json", { op: "read", content: "{oops" }),
+		pm("empty-content", { op: "read", content: "" }),
+		pm("whitespace", { op: "read", content: "   \n\t " }),
+		pm("bom", { op: "read", content: "\uFEFF" + pmJson({ pi: { skills: ["a"] } }) }),
+		pm("non-string-entries", { op: "read", content: pmJson({ pi: { skills: ["a", 1], prompts: ["p"], themes: "x" } }) }),
+		pm("nested-objects", { op: "read", content: pmJson({ pi: { skills: [{ a: 1 }] } }) }),
+		pm("extra-pi-fields", { op: "read", content: pmJson({ pi: { other: true, skills: ["s"] } }) }),
+		pm("unicode-entries", { op: "read", content: pmJson({ pi: { skills: ["café", "日本語"] } }) }),
+		pm("duplicate-entries", { op: "read", content: pmJson({ pi: { extensions: ["a", "a"] } }) }),
+		pm("err-missing-op", {}),
+		pm("err-unknown-op", { op: "bogus" }),
+		pm("err-missing-content", { op: "read" }),
+	];
+
+	// --- nested-tool-calls (core/nested-tool-calls.js recorder) ---
+	const ntc = (name, args) => ({ tool: "nested-tool-calls", name: "ntc-" + name, args });
+	const usage = (o = {}) => ({
+		input: o.input ?? 10,
+		output: o.output ?? 20,
+		cacheRead: o.cacheRead ?? 0,
+		cacheWrite: o.cacheWrite ?? 0,
+		...(o.cacheWrite1h !== undefined ? { cacheWrite1h: o.cacheWrite1h } : {}),
+		...(o.reasoning !== undefined ? { reasoning: o.reasoning } : {}),
+		totalTokens: o.totalTokens ?? 30,
+		cost: o.cost ?? { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
+	});
+	const ntcCases = [
+		ntc("limits", { ops: [{ op: "limits" }] }),
+		ntc("start-finish-ok", { ops: [
+			{ op: "start", id: "call-1", name: "read", arguments: { path: "/x" } },
+			{ op: "finish", record: 0, isError: false },
+			{ op: "snapshot" },
+		] }),
+		ntc("start-finish-error", { ops: [
+			{ op: "start", id: "call-1", name: "bash", arguments: {} },
+			{ op: "finish", record: 0, isError: true, errorText: "boom" },
+			{ op: "snapshot" },
+		] }),
+		ntc("error-empty-text", { ops: [
+			{ op: "start", id: "c", name: "t", arguments: {} },
+			{ op: "finish", record: 0, isError: true, errorText: "" },
+			{ op: "snapshot" },
+		] }),
+		ntc("error-truncated", { ops: [
+			{ op: "start", id: "c", name: "t", arguments: {} },
+			{ op: "finish", record: 0, isError: true, errorText: "x".repeat(600) },
+			{ op: "snapshot" },
+		] }),
+		ntc("error-truncated-multibyte", { ops: [
+			{ op: "start", id: "c", name: "t", arguments: {} },
+			{ op: "finish", record: 0, isError: true, errorText: "é".repeat(600) },
+			{ op: "snapshot" },
+		] }),
+		ntc("unfinished-snapshot", { ops: [
+			{ op: "start", id: "c1", name: "t", arguments: { a: 1 } },
+			{ op: "start", id: "c2", name: "t", arguments: { a: 2 } },
+			{ op: "finish", record: 0, isError: false },
+			{ op: "snapshot" },
+		] }),
+		ntc("empty-snapshot-null", { ops: [{ op: "snapshot" }] }),
+		ntc("null-arguments", { ops: [
+			{ op: "start", id: "c", name: "t", arguments: null },
+			{ op: "snapshot" },
+		] }),
+		ntc("missing-arguments", { ops: [
+			{ op: "start", id: "c", name: "t" },
+			{ op: "snapshot" },
+		] }),
+		ntc("scalar-arguments", { ops: [
+			{ op: "start", id: "c1", name: "t", arguments: "text" },
+			{ op: "start", id: "c2", name: "t", arguments: 42 },
+			{ op: "start", id: "c3", name: "t", arguments: 0.5 },
+			{ op: "snapshot" },
+		] }),
+		ntc("float-arguments-roundtrip", { ops: [
+			{ op: "start", id: "c", name: "t", arguments: { a: 0.1, b: 1e21, c: 1.5e-7, d: 123456789012345678901 } },
+			{ op: "snapshot" },
+		] }),
+		ntc("unicode-arguments", { ops: [
+			{ op: "start", id: "c", name: "t", arguments: { text: "café ✓ 日本語", nested: { arr: [1, "two", null, true] } } },
+			{ op: "snapshot" },
+		] }),
+		ntc("arguments-over-per-call", { ops: [
+			{ op: "start", id: "c", name: "t", arguments: { big: "y".repeat(9000) } },
+			{ op: "snapshot" },
+		] }),
+		ntc("arguments-over-total", { ops: [
+			{ op: "start", id: "c1", name: "t", arguments: { big: "y".repeat(16000) } },
+			{ op: "start", id: "c2", name: "t", arguments: { big: "y".repeat(16000) } },
+			{ op: "start", id: "c3", name: "t", arguments: { small: "ok" } },
+			{ op: "snapshot" },
+		] }),
+		ntc("max-calls-drop", { ops: [
+			...Array.from({ length: 257 }, (_, i) => ({ op: "start", id: "c" + i, name: "t", arguments: { i } })),
+			{ op: "snapshot" },
+		] }),
+		ntc("finish-null-record", { ops: [
+			{ op: "start", id: "c", name: "t", arguments: {} },
+			{ op: "finish", record: null, isError: true, errorText: "x" },
+			{ op: "snapshot" },
+		] }),
+		ntc("finish-twice", { ops: [
+			{ op: "start", id: "c", name: "t", arguments: {} },
+			{ op: "finish", record: 0, isError: false },
+			{ op: "finish", record: 0, isError: true, errorText: "second" },
+			{ op: "snapshot" },
+		] }),
+		ntc("total-usage-null", { ops: [{ op: "totalUsage" }] }),
+		ntc("add-usage-single", { ops: [
+			{ op: "addUsage", usage: usage() },
+			{ op: "totalUsage" },
+		] }),
+		ntc("add-usage-combine", { ops: [
+			{ op: "addUsage", usage: usage({ input: 1, output: 2, totalTokens: 3 }) },
+			{ op: "addUsage", usage: usage({ input: 10, output: 20, totalTokens: 30, cacheRead: 5 }) },
+			{ op: "totalUsage" },
+		] }),
+		ntc("add-usage-optional-splits", { ops: [
+			{ op: "addUsage", usage: usage({ cacheWrite1h: 7 }) },
+			{ op: "addUsage", usage: usage({ reasoning: 4 }) },
+			{ op: "totalUsage" },
+		] }),
+		ntc("add-usage-then-snapshot", { ops: [
+			{ op: "start", id: "c", name: "t", arguments: {} },
+			{ op: "addUsage", usage: usage() },
+			{ op: "snapshot" },
+			{ op: "totalUsage" },
+		] }),
+		ntc("err-missing-ops", {}),
+		ntc("err-unknown-op", { ops: [{ op: "bogus" }] }),
+		ntc("err-start-missing-id", { ops: [{ op: "start", name: "t" }] }),
+		ntc("err-start-missing-name", { ops: [{ op: "start", id: "c" }] }),
+		ntc("err-addusage-missing", { ops: [{ op: "addUsage" }] }),
+	];
+
+	// --- output-guard (core/output-guard.js, scripted stream writers) ---
+	const og = (name, args) => ({ tool: "output-guard", name: "og-" + name, args });
+	const ogCases = [
+		og("write-stdout", { ops: [
+			{ op: "writeStdout", text: "hello" },
+			{ op: "isStdoutTakenOver" },
+		] }),
+		og("write-raw-and-flush", { ops: [
+			{ op: "writeRawStdout", text: "raw" },
+			{ op: "flushRawStdout" },
+		] }),
+		og("raw-empty-skipped", { ops: [
+			{ op: "writeRawStdout", text: "" },
+			{ op: "flushRawStdout" },
+		] }),
+		og("takeover-redirects", { ops: [
+			{ op: "writeStdout", text: "before" },
+			{ op: "takeOverStdout" },
+			{ op: "isStdoutTakenOver" },
+			{ op: "writeStdout", text: "during" },
+			{ op: "writeRawStdout", text: "raw-during" },
+			{ op: "restoreStdout" },
+			{ op: "isStdoutTakenOver" },
+			{ op: "writeStdout", text: "after" },
+		] }),
+		og("takeover-idempotent", { ops: [
+			{ op: "takeOverStdout" },
+			{ op: "takeOverStdout" },
+			{ op: "writeStdout", text: "x" },
+			{ op: "restoreStdout" },
+			{ op: "writeStdout", text: "y" },
+		] }),
+		og("restore-without-takeover", { ops: [
+			{ op: "restoreStdout" },
+			{ op: "isStdoutTakenOver" },
+			{ op: "writeStdout", text: "ok" },
+		] }),
+		og("write-stdout-error", { ops: [
+			{ op: "writeStdout", text: "a" },
+			{ op: "writeStdout", text: "b" },
+		], stdoutScript: [null, { code: "EPIPE", message: "broken pipe" }] }),
+		og("raw-failure-sticky", { ops: [
+			{ op: "writeRawStdout", text: "a" },
+			{ op: "writeRawStdout", text: "b" },
+			{ op: "waitForRawStdoutBackpressure" },
+			{ op: "waitForRawStdoutBackpressure" },
+			{ op: "flushRawStdout" },
+		], stdoutScript: [{ code: "EPIPE", message: "gone" }] }),
+		og("raw-failure-at-flush", { ops: [
+			{ op: "writeRawStdout", text: "a" },
+			{ op: "flushRawStdout" },
+		], stdoutScript: [{ code: "EBADF", message: "bad descriptor" }] }),
+		og("raw-retry-enobufs", { ops: [
+			{ op: "writeRawStdout", text: "a" },
+			{ op: "flushRawStdout" },
+		], stdoutScript: [{ code: "ENOBUFS", message: "backpressure" }] }),
+		og("stderr-error-while-taken-over", { ops: [
+			{ op: "takeOverStdout" },
+			{ op: "writeStdout", text: "redirected" },
+		], stderrScript: [{ code: "EPIPE", message: "stderr broke" }] }),
+		og("flush-while-taken-over", { ops: [
+			{ op: "takeOverStdout" },
+			{ op: "flushRawStdout" },
+			{ op: "writeRawStdout", text: "raw" },
+		] }),
+		og("wait-no-writes", { ops: [{ op: "waitForRawStdoutBackpressure" }] }),
+		og("err-missing-ops", {}),
+		og("err-unknown-op", { ops: [{ op: "bogus" }] }),
+		og("err-write-missing-text", { ops: [{ op: "writeStdout" }] }),
+		og("err-raw-missing-text", { ops: [{ op: "writeRawStdout" }] }),
+	];
+
+	// --- sess-manager (core/session-manager.js) ---
+	const se = (name, args) => ({ tool: "sess-manager", name: "sess-" + name, args });
+	// Fixture builders: stable ISO timestamps, ids that never look like the
+	// 8-hex / uuid shapes the normalizers rewrite.
+	const seHeader = (version, cwd = "/home/user/proj", extra = {}) => ({
+		type: "session", version, id: "sess-header-id", timestamp: smTs(0), cwd, ...extra,
+	});
+	const seEntry = (type, id, parentId, n, extra = {}) => ({
+		type, id, parentId, timestamp: smTs(n), ...extra,
+	});
+	const seMsgEntry = (id, parentId, message, n) => seEntry("message", id, parentId, n, { message });
+	const seUserE = (id, parentId, text, n) =>
+		seMsgEntry(id, parentId, { role: "user", content: [{ type: "text", text }], timestamp: smTs(n) }, n);
+	const seAssistantE = (id, parentId, text, n, extra = {}) =>
+		seMsgEntry(id, parentId, { role: "assistant", content: [{ type: "text", text }], provider: "anthropic", model: "claude-sonnet-4", timestamp: smTs(n), ...extra }, n);
+	const seJsonl = (...entries) => entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+	const seM = (role, content, extra = {}) => ({ role, content, ...extra });
+	const mOps = (factory, extra, ops) => ({ op: "manager", factory, ...extra, ops });
+
+	const sessCases = [];
+	const addSess = (name, args) => sessCases.push(se(name, args));
+
+	// ---- pure ops ----
+	const hdr3 = seHeader(3);
+	const chain = [
+		hdr3,
+		seUserE("e1", null, "hello", 1),
+		seAssistantE("e2", "e1", "hi", 2),
+		seUserE("e3", "e2", "again", 3),
+	];
+	addSess("parse-basic", { op: "parseSessionEntries", content: seJsonl(...chain) });
+	addSess("parse-crlf", { op: "parseSessionEntries", content: chain.map((e) => JSON.stringify(e)).join("\r\n") + "\r\n" });
+	addSess("parse-lone-cr", { op: "parseSessionEntries", content: JSON.stringify(hdr3) + "\r" + JSON.stringify(seUserE("e1", null, "x", 1)) });
+	addSess("parse-no-trailing-newline", { op: "parseSessionEntries", content: seJsonl(...chain).trimEnd() });
+	addSess("parse-blank-lines", { op: "parseSessionEntries", content: "\n" + seJsonl(hdr3) + "\n\n" + seJsonl(seUserE("e1", null, "x", 1)) + "\n\n" });
+	addSess("parse-invalid-lines", { op: "parseSessionEntries", content: "{oops\n" + seJsonl(hdr3) + "not json\n" + seJsonl(seUserE("e1", null, "x", 1)) });
+	addSess("parse-empty", { op: "parseSessionEntries", content: "" });
+	addSess("parse-whitespace-only", { op: "parseSessionEntries", content: "  \n\t\n " });
+	addSess("parse-bom-first-line", { op: "parseSessionEntries", content: "\uFEFF" + seJsonl(hdr3, seUserE("e1", null, "x", 1)) });
+	addSess("parse-leading-space-line", { op: "parseSessionEntries", content: "  " + seJsonl(hdr3) + "\t" + seJsonl(seUserE("e1", null, "x", 1)) });
+
+	addSess("migrate-v1", { op: "migrateSessionEntries", entries: [
+		seHeader(1),
+		{ type: "message", timestamp: smTs(1), message: { role: "user", content: "hi", timestamp: smTs(1) } },
+		{ type: "message", timestamp: smTs(2), message: { role: "assistant", content: "yo", timestamp: smTs(2) } },
+	] });
+	addSess("migrate-v1-compaction", { op: "migrateSessionEntries", entries: [
+		seHeader(1),
+		{ type: "message", timestamp: smTs(1), message: { role: "user", content: "a", timestamp: smTs(1) } },
+		{ type: "message", timestamp: smTs(2), message: { role: "user", content: "b", timestamp: smTs(2) } },
+		{ type: "compaction", timestamp: smTs(3), summary: "s", tokensBefore: 9, firstKeptEntryIndex: 2 },
+	] });
+	addSess("migrate-v1-compaction-header-index", { op: "migrateSessionEntries", entries: [
+		seHeader(1),
+		{ type: "message", timestamp: smTs(1), message: { role: "user", content: "a", timestamp: smTs(1) } },
+		{ type: "compaction", timestamp: smTs(2), summary: "s", tokensBefore: 9, firstKeptEntryIndex: 0 },
+	] });
+	addSess("migrate-v2-hook", { op: "migrateSessionEntries", entries: [
+		seHeader(2),
+		seMsgEntry("e1", null, { role: "hookMessage", content: "hm", timestamp: smTs(1) }, 1),
+		seUserE("e2", "e1", "u", 2),
+	] });
+	addSess("migrate-v3-noop", { op: "migrateSessionEntries", entries: chain });
+	addSess("migrate-no-header", { op: "migrateSessionEntries", entries: [
+		{ type: "message", timestamp: smTs(1), message: { role: "user", content: "a", timestamp: smTs(1) } },
+	] });
+	addSess("migrate-version-missing", { op: "migrateSessionEntries", entries: [
+		{ type: "session", id: "sess-header-id", timestamp: smTs(0), cwd: "/home/user/proj" },
+		{ type: "message", timestamp: smTs(1), message: { role: "user", content: "a", timestamp: smTs(1) } },
+	] });
+
+	addSess("latest-compaction-none", { op: "getLatestCompactionEntry", entries: chain });
+	addSess("latest-compaction-one", { op: "getLatestCompactionEntry", entries: [
+		hdr3, seUserE("e1", null, "a", 1),
+		seEntry("compaction", "c1", "e1", 2, { summary: "s", tokensBefore: 5, firstKeptEntryId: "e1" }),
+	] });
+	addSess("latest-compaction-last", { op: "getLatestCompactionEntry", entries: [
+		hdr3, seUserE("e1", null, "a", 1),
+		seEntry("compaction", "c1", "e1", 2, { summary: "s1", tokensBefore: 5, firstKeptEntryId: "e1" }),
+		seUserE("e2", "c1", "b", 3),
+		seEntry("compaction", "c2", "e2", 4, { summary: "s2", tokensBefore: 6, firstKeptEntryId: "e2" }),
+	] });
+
+	addSess("entry-to-messages-user", { op: "sessionEntryToContextMessages", entry: seUserE("e1", null, "hello", 1) });
+	addSess("entry-to-messages-system-null-content", { op: "sessionEntryToContextMessages", entry: seMsgEntry("e1", null, { role: "system", content: null, timestamp: smTs(1) }, 1) });
+	addSess("entry-to-messages-user-null-content", { op: "sessionEntryToContextMessages", entry: seMsgEntry("e1", null, { role: "user", content: null, timestamp: smTs(1) }, 1) });
+	addSess("entry-to-messages-assistant-null-content", { op: "sessionEntryToContextMessages", entry: seMsgEntry("e1", null, { role: "assistant", content: null, timestamp: smTs(1) }, 1) });
+	addSess("entry-to-messages-toolresult-null-content", { op: "sessionEntryToContextMessages", entry: seMsgEntry("e1", null, { role: "toolResult", content: null, timestamp: smTs(1) }, 1) });
+	addSess("entry-to-messages-custom", { op: "sessionEntryToContextMessages", entry: seEntry("custom_message", "e1", null, 1, { customType: "ext", content: [{ type: "text", text: "c" }], display: true, details: { x: 1 } }) });
+	addSess("entry-to-messages-custom-null-content", { op: "sessionEntryToContextMessages", entry: seEntry("custom_message", "e1", null, 1, { customType: "ext", content: null, display: false }) });
+	addSess("entry-to-messages-branch-summary", { op: "sessionEntryToContextMessages", entry: seEntry("branch_summary", "e1", null, 1, { fromId: "e0", summary: "abandoned" }) });
+	addSess("entry-to-messages-branch-summary-empty", { op: "sessionEntryToContextMessages", entry: seEntry("branch_summary", "e1", null, 1, { fromId: "e0" }) });
+	addSess("entry-to-messages-compaction", { op: "sessionEntryToContextMessages", entry: seEntry("compaction", "c1", null, 1, { summary: "s", tokensBefore: 7, firstKeptEntryId: "c1" }) });
+	addSess("entry-to-messages-compaction-system", { op: "sessionEntryToContextMessages", entry: seEntry("compaction", "c1", null, 1, { summary: "s", tokensBefore: 7, firstKeptEntryId: "c1", systemMessage: { role: "system", content: "sys", timestamp: smTs(0) } }) });
+	addSess("entry-to-messages-unknown-type", { op: "sessionEntryToContextMessages", entry: seEntry("custom", "e1", null, 1, { customType: "x" }) });
+	addSess("entry-to-messages-thinking", { op: "sessionEntryToContextMessages", entry: seEntry("thinking_level_change", "e1", null, 1, { thinkingLevel: "high" }) });
+
+	// build* over a branched tree with compaction, edits and settings
+	const branched = [
+		hdr3,
+		seMsgEntry("s1", null, seM("system", "sys prompt"), 1),
+		seUserE("e1", "s1", "hello", 2),
+		seEntry("thinking_level_change", "t1", "e1", 3, { thinkingLevel: "high" }),
+		seEntry("model_change", "m1", "t1", 4, { provider: "anthropic", modelId: "claude-op-4" }),
+		seAssistantE("e2", "m1", "hi", 5),
+		seEntry("compaction", "c1", "e2", 6, { summary: "compacted", tokensBefore: 100, firstKeptEntryId: "e2" }),
+		seUserE("e3", "c1", "after compaction", 7),
+		seUserE("b1", "e2", "branched from e2", 8),
+		seAssistantE("b2", "b1", "branch reply", 9),
+	];
+	addSess("build-context-last", { op: "buildContextEntries", entries: branched });
+	addSess("build-context-root", { op: "buildContextEntries", entries: branched, leafId: null });
+	addSess("build-context-explicit-leaf", { op: "buildContextEntries", entries: branched, leafId: "e2" });
+	addSess("build-context-branch-leaf", { op: "buildContextEntries", entries: branched, leafId: "b1" });
+	addSess("build-context-missing-leaf", { op: "buildContextEntries", entries: branched, leafId: "nope" });
+	addSess("build-context-empty", { op: "buildContextEntries", entries: [] });
+	addSess("build-context-orphan", { op: "buildContextEntries", entries: [
+		hdr3, seUserE("e1", "missing-parent", "orphan", 1), seUserE("e2", null, "root", 2),
+	] });
+	addSess("build-projection-last", { op: "buildSessionProjection", entries: branched });
+	addSess("build-projection-branch", { op: "buildSessionProjection", entries: branched, leafId: "b2" });
+	addSess("build-context-settings", { op: "buildSessionContext", entries: [
+		hdr3,
+		seUserE("e1", null, "a", 1),
+		seEntry("thinking_level_change", "t1", "e1", 2, { thinkingLevel: "low" }),
+		seEntry("model_change", "m1", "t1", 3, { provider: "openai", modelId: "gpt-x" }),
+		seAssistantE("e2", "m1", "b", 4, { provider: "other", model: "m-2" }),
+	] });
+	addSess("build-context-defaults", { op: "buildSessionContext", entries: [hdr3, seUserE("e1", null, "a", 1)] });
+	const edited = [
+		hdr3,
+		seUserE("e1", null, "original", 1),
+		seEntry("context_edit", "x1", "e1", 2, { targetId: "e1", replacement: { content: "edited text" } }),
+	];
+	addSess("build-projection-edit", { op: "buildSessionProjection", entries: edited });
+	addSess("build-projection-edit-null", { op: "buildSessionProjection", entries: [
+		hdr3,
+		seUserE("e1", null, "original", 1),
+		seEntry("context_edit", "x1", "e1", 2, { targetId: "e1", replacement: null }),
+	] });
+	addSess("build-projection-edit-assistant", { op: "buildSessionProjection", entries: [
+		hdr3,
+		seAssistantE("e1", null, "orig", 1),
+		seEntry("context_edit", "x1", "e1", 2, { targetId: "e1", replacement: { content: "replaced" } }),
+	] });
+	const twoCompactions = [
+		hdr3,
+		seUserE("e1", null, "a", 1),
+		seEntry("compaction", "c1", "e1", 2, { summary: "first", tokensBefore: 10, firstKeptEntryId: "e1" }),
+		seUserE("e2", "c1", "b", 3),
+		seEntry("compaction", "c2", "e2", 4, { summary: "second", tokensBefore: 20, firstKeptEntryId: "e2" }),
+		seUserE("e3", "c2", "c", 5),
+	];
+	addSess("build-projection-two-compactions", { op: "buildSessionProjection", entries: twoCompactions });
+	addSess("build-context-compaction-keepsystem", { op: "buildSessionProjection", entries: [
+		hdr3,
+		seMsgEntry("s1", null, seM("system", "keep me"), 1),
+		seUserE("e1", "s1", "a", 2),
+		seEntry("compaction", "c1", "e1", 3, { summary: "s", tokensBefore: 1, firstKeptEntryId: "s1" }),
+		seUserE("e2", "c1", "b", 4),
+	] });
+
+	addSess("assert-id-valid", { op: "assertValidSessionId", id: "abc-DEF_123.456" });
+	addSess("assert-id-single-char", { op: "assertValidSessionId", id: "a" });
+	addSess("assert-id-space", { op: "assertValidSessionId", id: "has space" });
+	addSess("assert-id-empty", { op: "assertValidSessionId", id: "" });
+
+	addSess("default-session-dir", { op: "getDefaultSessionDir", cwd: "proj", agentDir: "agent" });
+	addSess("default-session-dir-nested", { op: "getDefaultSessionDir", cwd: "a/b/c", agentDir: "x/y" });
+	addSess("default-session-dir-dot", { op: "getDefaultSessionDir", cwd: ".", agentDir: "." });
+
+	// ---- fs ops ----
+	addSess("load-entries-file", { op: "loadEntriesFromFile", files: { "s.jsonl": seJsonl(...chain) }, filePath: "s.jsonl" });
+	addSess("load-entries-missing", { op: "loadEntriesFromFile", filePath: "nope.jsonl" });
+	addSess("load-entries-crlf", { op: "loadEntriesFromFile", files: { "s.jsonl": chain.map((e) => JSON.stringify(e)).join("\r\n") + "\r\n" }, filePath: "s.jsonl" });
+	addSess("load-entries-no-final-newline", { op: "loadEntriesFromFile", files: { "s.jsonl": seJsonl(...chain).trimEnd() }, filePath: "s.jsonl" });
+	addSess("load-entries-bom", { op: "loadEntriesFromFile", files: { "s.jsonl": "\uFEFF" + seJsonl(...chain) }, filePath: "s.jsonl" });
+	addSess("load-entries-garbage", { op: "loadEntriesFromFile", files: { "s.jsonl": "not a session\nat all\n" }, filePath: "s.jsonl" });
+	addSess("load-entries-empty", { op: "loadEntriesFromFile", files: { "s.jsonl": "" }, filePath: "s.jsonl" });
+	addSess("load-entries-header-no-id", { op: "loadEntriesFromFile", files: { "s.jsonl": seJsonl({ type: "session", version: 3, timestamp: smTs(0) }, seUserE("e1", null, "x", 1)) }, filePath: "s.jsonl" });
+	addSess("load-entries-first-not-header", { op: "loadEntriesFromFile", files: { "s.jsonl": seJsonl(seUserE("e1", null, "x", 1), hdr3) }, filePath: "s.jsonl" });
+	addSess("load-entries-blank-and-invalid", { op: "loadEntriesFromFile", files: { "s.jsonl": "\n{bad\n" + seJsonl(hdr3) + "\n\n" + seJsonl(seUserE("e1", null, "x", 1)) + "nope\n" }, filePath: "s.jsonl" });
+
+	const hdrCwd = (cwd) => seHeader(3, cwd);
+	const fmrFile = (name, cwd, n) => ({ [name + ".jsonl"]: seJsonl(hdrCwd(cwd), seUserE("e1", null, "m" + n, n)) });
+	addSess("find-recent-newest", {
+		op: "findMostRecentSession",
+		files: { ...fmrFile("a", "/home/user/proj", 1), ...fmrFile("b", "/home/user/proj", 2) },
+		mtimes: { "a.jsonl": 1700000000000, "b.jsonl": 1700000001000 },
+		sessionDir: ".",
+	});
+	addSess("find-recent-cwd-match", {
+		op: "findMostRecentSession",
+		files: { ...fmrFile("a", "/home/user/proj", 1), ...fmrFile("b", "/elsewhere", 2) },
+		mtimes: { "a.jsonl": 1700000000000, "b.jsonl": 1700000001000 },
+		sessionDir: ".", cwd: "/home/user/proj",
+	});
+	addSess("find-recent-no-cwd", {
+		op: "findMostRecentSession",
+		files: { ...fmrFile("a", "/home/user/proj", 1), ...fmrFile("b", "/elsewhere", 2) },
+		mtimes: { "a.jsonl": 1700000000000, "b.jsonl": 1700000001000 },
+		sessionDir: ".",
+	});
+	addSess("find-recent-skips-non-session", {
+		op: "findMostRecentSession",
+		files: { "new.jsonl": "garbage\n", ...fmrFile("old", "/home/user/proj", 1) },
+		mtimes: { "new.jsonl": 1700000002000, "old.jsonl": 1700000000000 },
+		sessionDir: ".", cwd: "/home/user/proj",
+	});
+	addSess("find-recent-ignores-non-jsonl", {
+		op: "findMostRecentSession",
+		files: { "a.txt": "x", ...fmrFile("b", "/home/user/proj", 1) },
+		mtimes: { "a.txt": 1700000009000, "b.jsonl": 1700000000000 },
+		sessionDir: ".",
+	});
+	addSess("find-recent-leading-blank", {
+		op: "findMostRecentSession",
+		files: { "a.jsonl": "\n" + seJsonl(hdrCwd("/home/user/proj"), seUserE("e1", null, "x", 1)) },
+		sessionDir: ".", cwd: "/home/user/proj",
+	});
+	addSess("find-recent-header-no-cwd", {
+		op: "findMostRecentSession",
+		files: { "a.jsonl": seJsonl({ type: "session", version: 3, id: "sess-header-id", timestamp: smTs(0) }, seUserE("e1", null, "x", 1)) },
+		sessionDir: ".", cwd: "/home/user/proj",
+	});
+	addSess("find-recent-empty-dir", { op: "findMostRecentSession", files: { "keep/keep.txt": "x" }, sessionDir: "keep" });
+	addSess("find-recent-missing-dir", { op: "findMostRecentSession", sessionDir: "nope" });
+
+	// ---- manager flows ----
+	addSess("mgr-create-basic", mOps("create", {}, [
+		{ op: "getCwd" }, { op: "getSessionDir" }, { op: "getSessionId" }, { op: "getSessionFile" },
+		{ op: "isPersisted" }, { op: "getEntryCount" }, { op: "getLeafId" }, { op: "getHeader" },
+		{ op: "getEntries" }, { op: "listDir" }, { op: "buildSessionContext" },
+	]));
+	addSess("mgr-create-explicit-id", mOps("create", { id: "my-session" }, [
+		{ op: "getSessionId" }, { op: "getHeader" }, { op: "newSession" }, { op: "getSessionId" },
+	]));
+	addSess("mgr-create-parent-session", mOps("create", { parentSession: "/old/session.jsonl" }, [
+		{ op: "getHeader" },
+	]));
+	addSess("mgr-create-invalid-id", mOps("create", { id: "has space" }, []));
+	addSess("mgr-append-user-writes-file", mOps("create", {}, [
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "hello" }]) },
+		{ op: "getSessionFile" }, { op: "readFile" }, { op: "listDir" }, { op: "getEntryCount" },
+		{ op: "getLeafId" }, { op: "getEntries" },
+	]));
+	addSess("mgr-setup-only-no-file", mOps("create", {}, [
+		{ op: "appendThinkingLevelChange", thinkingLevel: "high" },
+		{ op: "appendModelChange", provider: "anthropic", modelId: "claude-sonnet-4" },
+		{ op: "appendSessionInfo", name: "my session" },
+		{ op: "appendCustomEntry", customType: "ext", data: { a: 1 } },
+		{ op: "getSessionFile" }, { op: "readFile" }, { op: "listDir" }, { op: "getEntryCount" },
+	]));
+	addSess("mgr-append-order", mOps("create", {}, [
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "one" }]) },
+		{ op: "appendMessage", message: seM("assistant", [{ type: "text", text: "two" }]) },
+		{ op: "appendThinkingLevelChange", thinkingLevel: "low" },
+		{ op: "appendModelChange", provider: "p", modelId: "m" },
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "three" }]) },
+		{ op: "readFile" }, { op: "getEntryCount" }, { op: "buildSessionContext" },
+	]));
+	addSess("mgr-append-usage", mOps("create", {}, [
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "u" }]) },
+		{ op: "appendUsage", kind: "turn", provider: "anthropic", model: "claude-sonnet-4", usage: usage() },
+		{ op: "appendUsage", kind: "turn", provider: "anthropic", model: "claude-sonnet-4", usage: usage({ input: 1 }), note: "cached turn" },
+		{ op: "getEntries" }, { op: "readFile" },
+	]));
+	addSess("mgr-append-compaction", mOps("create", {}, [
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "u" }]) },
+		{ op: "appendMessage", message: seM("assistant", [{ type: "text", text: "a" }]) },
+		{ op: "appendCompaction", summary: "summarized", tokensBefore: 500 },
+		{ op: "getEntries" }, { op: "buildContextEntries" },
+	]));
+	addSess("mgr-append-compaction-system", mOps("create", {}, [
+		{ op: "appendMessage", message: seM("system", "be helpful") },
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "u" }]) },
+		{ op: "appendCompaction", summary: "summarized", tokensBefore: 500, details: { reason: "auto" }, fromHook: true, usage: usage() },
+		{ op: "getEntries" }, { op: "buildSessionProjection" },
+	]));
+	addSess("mgr-append-compaction-firstkept", mOps("create", {}, [
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "one" }]) },
+		{ op: "appendMessage", message: seM("assistant", [{ type: "text", text: "two" }]) },
+		{ op: "appendCompaction", summary: "s", firstKeptEntryId: "FIRST", tokensBefore: 5 },
+		{ op: "getEntries" },
+	]));
+	addSess("mgr-session-info", mOps("create", {}, [
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "u" }]) },
+		{ op: "appendSessionInfo", name: "  spaced\r\nname  " },
+		{ op: "getSessionName" }, { op: "getEntries" },
+		{ op: "appendSessionInfo", name: "  " },
+		{ op: "getSessionName" },
+	]));
+	addSess("mgr-custom-message", mOps("create", {}, [
+		{ op: "appendCustomMessageEntry", customType: "ext", content: [{ type: "text", text: "custom" }], display: true, details: { k: 1 } },
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "u" }]) },
+		{ op: "getEntries" }, { op: "buildSessionContext" }, { op: "readFile" },
+	]));
+	// Entry ids are generated at runtime (8-hex, normalized to <id8>), so
+	// context-edit cases target fixed fixture ids via in-memory sessions.
+	addSess("mgr-context-edit", mOps("inMemory", { entries: [seHeader(3), seUserE("e1", null, "original", 1)] }, [
+		{ op: "appendContextEdit", targetId: "e1", replacement: { content: "edited" } },
+		{ op: "getEntries" }, { op: "buildSessionContext" },
+	]));
+	addSess("mgr-context-edit-null", mOps("inMemory", { entries: [seHeader(3), seUserE("e1", null, "original", 1)] }, [
+		{ op: "appendContextEdit", targetId: "e1", replacement: null },
+		{ op: "buildSessionContext" },
+	]));
+	addSess("mgr-context-edit-assistant", mOps("inMemory", { entries: [seHeader(3), seAssistantE("e1", null, "orig", 1)] }, [
+		{ op: "appendContextEdit", targetId: "e1", replacement: { content: "replaced" } },
+		{ op: "buildSessionContext" },
+	]));
+	addSess("mgr-context-edit-errors", mOps("inMemory", { entries: [seHeader(3), seUserE("e1", null, "u", 1)] }, [
+		{ op: "appendContextEdit", targetId: "nope", replacement: { content: "x" } },
+		{ op: "appendContextEdit", targetId: "e1", replacement: { content: 5 } },
+		{ op: "appendContextEdit", targetId: "e1", replacement: "not an object" },
+	]));
+	addSess("mgr-context-edit-fixed-ids", mOps("inMemory", { entries: [
+		seHeader(3), seUserE("e1", null, "original", 1), seEntry("thinking_level_change", "t1", "e1", 2, { thinkingLevel: "high" }),
+	] }, [
+		{ op: "appendContextEdit", targetId: "e1", replacement: { content: "edited" } },
+		{ op: "buildSessionContext" },
+		{ op: "appendContextEdit", targetId: "t1", replacement: { content: "x" } },
+		{ op: "appendContextEdit", targetId: "nope", replacement: null },
+		{ op: "branch", id: "e1" },
+		{ op: "appendContextEdit", targetId: "e1", replacement: null },
+	]));
+	addSess("mgr-labels", mOps("inMemory", { entries: [seHeader(3), seUserE("e1", null, "u", 1)] }, [
+		{ op: "appendLabelChange", targetId: "e1", label: "bookmark" },
+		{ op: "getLabel", id: "e1" },
+		{ op: "getTree" },
+		{ op: "appendLabelChange", targetId: "e1" },
+		{ op: "getLabel", id: "e1" },
+		{ op: "appendLabelChange", targetId: "nope", label: "x" },
+	]));
+	addSess("mgr-tree", mOps("inMemory", { entries: [
+		seHeader(3),
+		seUserE("e1", null, "root", 1),
+		seUserE("e2", "e1", "left", 2),
+		seUserE("e3", "e1", "right", 3),
+		seUserE("e4", "e4", "self-parent", 4),
+		seUserE("e5", "ghost", "orphan", 5),
+	] }, [
+		{ op: "getTree" }, { op: "getChildren", id: "e1" }, { op: "getChildren", id: "e2" },
+		{ op: "getEntry", id: "e3" }, { op: "getEntry", id: "ghost" }, { op: "getBranch" },
+		{ op: "getBranch", fromId: "e2" }, { op: "getBranch", fromId: "nope" },
+	]));
+	addSess("mgr-branch", mOps("inMemory", { entries: [
+		seHeader(3), seUserE("e1", null, "one", 1), seUserE("e2", "e1", "two", 2), seUserE("e3", "e2", "three", 3),
+	] }, [
+		{ op: "getLeafId" },
+		{ op: "branch", id: "e1" },
+		{ op: "getLeafId" }, { op: "getBranch" },
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "new branch" }]) },
+		{ op: "getChildren", id: "e1" }, { op: "buildContextEntries" },
+		{ op: "branch", id: "nope" },
+	]));
+	addSess("mgr-reset-leaf", mOps("inMemory", { entries: [seHeader(3), seUserE("e1", null, "one", 1)] }, [
+		{ op: "resetLeaf" }, { op: "getLeafId" },
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "fresh root" }]) },
+		{ op: "getBranch" }, { op: "getTree" }, { op: "buildContextEntries" },
+	]));
+	addSess("mgr-branch-with-summary", mOps("inMemory", { entries: [
+		seHeader(3), seUserE("e1", null, "one", 1), seUserE("e2", "e1", "two", 2), seUserE("e3", "e2", "three", 3),
+	] }, [
+		{ op: "branchWithSummary", summary: "abandoned path", details: { why: "user" } },
+		{ op: "getEntries" }, { op: "buildSessionContext" }, { op: "getLeafId" },
+	]));
+	addSess("mgr-branch-with-summary-from", mOps("inMemory", { entries: [
+		seHeader(3), seUserE("e1", null, "one", 1), seUserE("e2", "e1", "two", 2),
+	] }, [
+		{ op: "branchWithSummary", branchFromId: "e1", summary: "s" },
+		{ op: "buildSessionContext" },
+		{ op: "branchWithSummary", branchFromId: "nope", summary: "s" },
+	]));
+	addSess("mgr-create-branched-session", mOps("inMemory", { entries: [
+		seHeader(3), seUserE("e1", null, "one", 1), seUserE("e2", "e1", "two", 2), seUserE("e3", "e2", "three", 3),
+	] }, [
+		{ op: "appendLabelChange", targetId: "e2", label: "mark" },
+		{ op: "createBranchedSession", leafId: "e2" },
+		{ op: "getSessionId" }, { op: "getEntries" }, { op: "getLabel", id: "e2" },
+		{ op: "createBranchedSession", leafId: "nope" },
+	]));
+	addSess("mgr-create-branched-persisted", {
+		op: "manager", factory: "open", path: "src.jsonl",
+		files: { "src.jsonl": seJsonl(...chain) },
+		ops: [
+			{ op: "createBranchedSession", leafId: "e2" },
+			{ op: "getSessionFile" }, { op: "listDir", dir: "." }, { op: "readFile" },
+		],
+	});
+	addSess("mgr-new-session", mOps("create", { id: "first-id" }, [
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "u" }]) },
+		{ op: "newSession", id: "second-id", parentSession: "PARENT_FILE" },
+		{ op: "getSessionId" }, { op: "getEntryCount" }, { op: "getHeader" }, { op: "listDir" },
+		{ op: "newSession", id: "bad id" },
+	]));
+	addSess("mgr-set-session-file", {
+		op: "manager", factory: "create",
+		files: {
+			"existing.jsonl": seJsonl(...chain),
+			"empty.jsonl": "",
+			"invalid.jsonl": "not a session\n",
+		},
+		ops: [
+			{ op: "setSessionFile", path: "existing.jsonl" },
+			{ op: "getSessionId" }, { op: "getEntryCount" }, { op: "getCwd" },
+			{ op: "setSessionFile", path: "empty.jsonl" },
+			{ op: "getEntryCount" }, { op: "readFile", path: "empty.jsonl" },
+			{ op: "setSessionFile", path: "invalid.jsonl" },
+		],
+	});
+	addSess("mgr-open-existing", {
+		op: "manager", factory: "open", path: "s.jsonl",
+		files: { "s.jsonl": seJsonl(...chain) },
+		ops: [
+			{ op: "getSessionId" }, { op: "getCwd" }, { op: "getEntryCount" }, { op: "getLeafId" },
+			{ op: "getEntries" }, { op: "buildSessionContext" },
+			{ op: "appendMessage", message: seM("user", [{ type: "text", text: "resumed" }]) },
+			{ op: "readFile" },
+		],
+	});
+	addSess("mgr-open-missing", {
+		op: "manager", factory: "open", path: "fresh.jsonl",
+		ops: [
+			{ op: "getSessionFile" }, { op: "readFile", path: "fresh.jsonl" },
+			{ op: "appendMessage", message: seM("user", [{ type: "text", text: "first" }]) },
+			{ op: "readFile", path: "fresh.jsonl" },
+		],
+	});
+	addSess("mgr-open-empty-file", {
+		op: "manager", factory: "open", path: "e.jsonl",
+		files: { "e.jsonl": "" },
+		ops: [{ op: "getEntryCount" }, { op: "readFile", path: "e.jsonl" }, { op: "getSessionId" }],
+	});
+	addSess("mgr-open-invalid", {
+		op: "manager", factory: "open", path: "bad.jsonl",
+		files: { "bad.jsonl": "not a session file\n" },
+		ops: [],
+	});
+	addSess("mgr-open-v1-migrates", {
+		op: "manager", factory: "open", path: "v1.jsonl",
+		files: { "v1.jsonl": seJsonl(
+			seHeader(1),
+			{ type: "message", timestamp: smTs(1), message: { role: "user", content: "hi", timestamp: smTs(1) } },
+			{ type: "message", timestamp: smTs(2), message: { role: "hookMessage", content: "hm", timestamp: smTs(2) } },
+		) },
+		ops: [{ op: "getEntries" }, { op: "readFile" }],
+	});
+	addSess("mgr-open-cwd-override", {
+		op: "manager", factory: "open", path: "s.jsonl", cwdOverride: "proj",
+		files: { "s.jsonl": seJsonl(...chain) },
+		ops: [{ op: "getCwd" }, { op: "getEntries" }],
+	});
+	addSess("mgr-open-no-trailing-newline", {
+		op: "manager", factory: "open", path: "s.jsonl",
+		files: { "s.jsonl": seJsonl(...chain).trimEnd() },
+		ops: [{ op: "getEntryCount" }, { op: "readFile" }],
+	});
+	addSess("mgr-continue-recent-empty", mOps("continueRecent", {}, [
+		{ op: "getSessionId" }, { op: "getEntryCount" }, { op: "getSessionFile" }, { op: "listDir" },
+	]));
+	addSess("mgr-continue-recent-match", {
+		op: "manager", factory: "continueRecent", cwd: "../proj",
+		files: { "recent.jsonl": seJsonl(seHeader(3, "/tmp/proj"), seUserE("e1", null, "recent", 1)) },
+		ops: [{ op: "getSessionId" }, { op: "getEntryCount" }, { op: "getEntries" }, { op: "getCwd" }],
+	});
+	addSess("mgr-continue-recent-cwd-mismatch", {
+		op: "manager", factory: "continueRecent", cwd: "proj",
+		files: { "recent.jsonl": seJsonl(seHeader(3, "/elsewhere"), seUserE("e1", null, "recent", 1)) },
+		ops: [{ op: "getSessionId" }, { op: "getEntryCount" }, { op: "listDir" }],
+	});
+	addSess("mgr-in-memory-header", mOps("inMemory", { entries: chain }, [
+		{ op: "isPersisted" }, { op: "getSessionId" }, { op: "getSessionFile" }, { op: "getEntryCount" },
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "more" }]) },
+		{ op: "getEntries" }, { op: "listDir" },
+	]));
+	addSess("mgr-in-memory-no-header", mOps("inMemory", { entries: [seUserE("e1", null, "orphan entry", 1)] }, [
+		{ op: "getSessionId" }, { op: "getEntryCount" }, { op: "getEntries" }, { op: "getHeader" },
+	]));
+	addSess("mgr-in-memory-empty", mOps("inMemory", {}, [
+		{ op: "getEntryCount" }, { op: "getEntries" }, { op: "getHeader" }, { op: "buildSessionContext" },
+	]));
+	addSess("mgr-fork-from", {
+		op: "manager", factory: "forkFrom", sourcePath: "src.jsonl", sessionDir: "sess",
+		files: { "src.jsonl": seJsonl(...chain) },
+		ops: [
+			{ op: "getSessionId" }, { op: "getEntryCount" }, { op: "getCwd" },
+			{ op: "readFile" }, { op: "listDir", dir: "sess" }, { op: "getHeader" },
+		],
+	});
+	addSess("mgr-fork-from-explicit-id", {
+		op: "manager", factory: "forkFrom", sourcePath: "src.jsonl", sessionDir: "sess", id: "forked-id",
+		files: { "src.jsonl": seJsonl(...chain) },
+		ops: [{ op: "getSessionId" }, { op: "readFile" }],
+	});
+	addSess("mgr-fork-from-empty", {
+		op: "manager", factory: "forkFrom", sourcePath: "src.jsonl", sessionDir: "sess",
+		files: { "src.jsonl": "" },
+		ops: [],
+	});
+	addSess("mgr-fork-from-no-header", {
+		op: "manager", factory: "forkFrom", sourcePath: "src.jsonl", sessionDir: "sess",
+		files: { "src.jsonl": seJsonl(seUserE("e1", null, "x", 1)) },
+		ops: [],
+	});
+	addSess("mgr-uses-default-dir", mOps("create", {}, [
+		{ op: "usesDefaultSessionDir", agentDir: "agent" },
+	]));
+	addSess("mgr-projection-after-compaction", mOps("create", {}, [
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "one" }]) },
+		{ op: "appendMessage", message: seM("assistant", [{ type: "text", text: "two" }]) },
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "three" }]) },
+		{ op: "appendCompaction", summary: "early stuff", tokensBefore: 100 },
+		{ op: "appendMessage", message: seM("user", [{ type: "text", text: "after" }]) },
+		{ op: "buildContextEntries" }, { op: "buildSessionProjection" }, { op: "readFile" },
+	]));
+	addSess("mgr-unknown-op", mOps("create", {}, [{ op: "bogus" }]));
+	addSess("mgr-unknown-factory", mOps("bogus", {}, []));
+	addSess("mgr-missing-ops", { op: "manager", factory: "create" });
+	addSess("err-missing-op", {});
+	addSess("err-unknown-op", { op: "bogus" });
+	addSess("err-bad-files", { op: "loadEntriesFromFile", filePath: "x", files: [] });
+	addSess("mtimes-invalid-ignored", { op: "findMostRecentSession", sessionDir: ".", mtimes: { "a.jsonl": "soon" } });
+
+	return [...defCases, ...pmCases, ...ntcCases, ...ogCases, ...sessCases];
 })(),
 ];
 

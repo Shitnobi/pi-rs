@@ -26,6 +26,11 @@ pub fn run(tool: &str, input: &Value) -> Result<Value, String> {
         "settings-manager" => run_settings_manager_harness(input),
         "prompt-templates" => run_prompt_templates_harness(input),
         "skills" => run_skills_harness(input),
+        "sess-manager" => run_sess_manager_harness(input),
+        "nested-tool-calls" => run_nested_tool_calls_harness(input),
+        "pi-manifest" => run_pi_manifest_harness(input),
+        "defaults" => run_defaults_harness(input),
+        "output-guard" => run_output_guard_harness(input),
         other => Err(format!("core_harness: unknown tool {other:?}")),
     }
 }
@@ -1973,4 +1978,796 @@ fn run_skills_harness(input: &Value) -> Result<Value, String> {
         }
         other => Err(format!("unknown skills op: {other}")),
     }
+}
+
+// ============================================================================
+// sess-manager
+// ============================================================================
+
+/// Rewrite dynamically generated substrings so results from the two sides
+/// (real `uuidv7` / `randomUUID` / `new Date` on TS, real OS randomness /
+/// clock on Rust — neither side's generators are injectable through the
+/// public API) compare equal: full UUIDs → `<uuid>`, ISO timestamps →
+/// `<ts>`, filename-form timestamps → `<tsf>`, strings that are exactly
+/// 8 lowercase hex chars (the `generateId` shape) → `<id8>`, and quoted
+/// 8-hex tokens embedded in raw JSONL strings (readFile) → `"<id8>"`.
+fn sess_rewrite_string(s: &str) -> String {
+    let b = s.as_bytes();
+    if b.len() == 8 && b.iter().all(|&c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+        return "<id8>".to_string();
+    }
+    let is_d = |c: u8| c.is_ascii_digit();
+    let is_h = |c: u8| c.is_ascii_digit() || (b'a'..=b'f').contains(&c);
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let rest = &b[i..];
+        // uuid: 8-4-4-4-12 hex groups
+        if rest.len() >= 36
+            && rest[..8].iter().all(|&c| is_h(c))
+            && rest[8] == b'-'
+            && rest[9..13].iter().all(|&c| is_h(c))
+            && rest[13] == b'-'
+            && rest[14..18].iter().all(|&c| is_h(c))
+            && rest[18] == b'-'
+            && rest[19..23].iter().all(|&c| is_h(c))
+            && rest[23] == b'-'
+            && rest[24..36].iter().all(|&c| is_h(c))
+        {
+            out.push_str("<uuid>");
+            i += 36;
+            continue;
+        }
+        // ISO timestamp: YYYY-MM-DDTHH:MM:SS.mmmZ
+        if rest.len() >= 24
+            && rest[..4].iter().all(|&c| is_d(c))
+            && rest[4] == b'-'
+            && rest[5..7].iter().all(|&c| is_d(c))
+            && rest[7] == b'-'
+            && rest[8..10].iter().all(|&c| is_d(c))
+            && rest[10] == b'T'
+            && rest[11..13].iter().all(|&c| is_d(c))
+            && rest[13] == b':'
+            && rest[14..16].iter().all(|&c| is_d(c))
+            && rest[16] == b':'
+            && rest[17..19].iter().all(|&c| is_d(c))
+            && rest[19] == b'.'
+            && rest[20..23].iter().all(|&c| is_d(c))
+            && rest[23] == b'Z'
+        {
+            out.push_str("<ts>");
+            i += 24;
+            continue;
+        }
+        // filename timestamp: YYYY-MM-DDTHH-MM-SS-mmmZ
+        if rest.len() >= 24
+            && rest[..4].iter().all(|&c| is_d(c))
+            && rest[4] == b'-'
+            && rest[5..7].iter().all(|&c| is_d(c))
+            && rest[7] == b'-'
+            && rest[8..10].iter().all(|&c| is_d(c))
+            && rest[10] == b'T'
+            && rest[11..13].iter().all(|&c| is_d(c))
+            && rest[13] == b'-'
+            && rest[14..16].iter().all(|&c| is_d(c))
+            && rest[16] == b'-'
+            && rest[17..19].iter().all(|&c| is_d(c))
+            && rest[19] == b'-'
+            && rest[20..23].iter().all(|&c| is_d(c))
+            && rest[23] == b'Z'
+        {
+            out.push_str("<tsf>");
+            i += 24;
+            continue;
+        }
+        // quoted 8-hex id: "deadbeef" (generated entry ids embedded in raw
+        // JSONL strings returned by readFile). Quote delimiters cannot occur
+        // inside JSON string content (escaped there), so this only matches
+        // structural values.
+        if rest.len() >= 10
+            && rest[0] == b'"'
+            && rest[1..9].iter().all(|&c| is_h(c))
+            && rest[9] == b'"'
+        {
+            out.push_str("\"<id8>\"");
+            i += 10;
+            continue;
+        }
+        let ch_len = s[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        out.push_str(&s[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Deep-normalize a result: `<base>` for the per-case fixture dir, the
+/// dynamic-id/timestamp rewrites, and epoch-ms numbers under a `timestamp`
+/// key (`new Date(ts).getTime()` in compaction `systemMessage`) → `<ms>`.
+fn sess_normalize(value: &mut Value, base: &str) {
+    match value {
+        Value::String(s) => {
+            let replaced = s.replace(base, "<base>");
+            // getDefaultSessionDir encodes the cwd into a safe directory name
+            // (slashes → dashes), which escapes the plain <base> rewrite.
+            let mangled_base = base.trim_start_matches('/').replace(['/', '\\', ':'], "-");
+            let replaced = replaced.replace(&mangled_base, "<base>");
+            // Ambient cwd: `open` without cwdOverride falls back to
+            // AMBIENT_CWD ("/") here and process.cwd() on the TS side; each
+            // side normalizes its own ambient value to <cwd>. The substring
+            // form covers the raw JSONL string returned by readFile.
+            let replaced = if replaced == "/" {
+                "<cwd>".to_string()
+            } else {
+                replaced.replace("\"cwd\":\"/\"", "\"cwd\":\"<cwd>\"")
+            };
+            *s = sess_rewrite_string(&replaced);
+        }
+        Value::Array(items) => {
+            for item in items {
+                sess_normalize(item, base);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if k == "timestamp" {
+                    if let Some(n) = v.as_f64() {
+                        if (1e12..1e13).contains(&n) {
+                            *v = Value::String("<ms>".to_string());
+                            continue;
+                        }
+                    }
+                }
+                sess_normalize(v, base);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `sess-manager` harness: `pi_core::session_manager` (TS
+/// `core/session-manager.js`). args `{ op, files?, mtimes?, ... }`; `files`
+/// is materialized under a per-case temp base and `mtimes` sets explicit
+/// file mtimes (epoch ms) so `findMostRecentSession` ordering is
+/// deterministic — readdir order is never asserted. All results are
+/// `<base>`-normalized and dynamic ids/timestamps rewritten (see
+/// [`sess_normalize`]): neither side can inject `uuidv7` / `randomUUID` /
+/// `new Date`, so ambient values are normalized on BOTH sides.
+///
+/// Ops:
+/// - pure: `parseSessionEntries` {content}, `migrateSessionEntries`
+///   {entries} (mutated in place), `getLatestCompactionEntry` {entries},
+///   `sessionEntryToContextMessages` {entry}, `buildContextEntries` /
+///   `buildSessionProjection` / `buildSessionContext` {entries, leafId?}
+///   (`leafId` absent → last entry, `null` → root), `assertValidSessionId`
+///   {id} (throws in-band), `getDefaultSessionDir` {cwd, agentDir}.
+/// - fs: `loadEntriesFromFile` {files, filePath}, `findMostRecentSession`
+///   {files, mtimes, sessionDir, cwd?}.
+/// - `manager` {factory, ..., ops}: construct a SessionManager (`create` /
+///   `open` / `continueRecent` / `inMemory` / `forkFrom`, all paths relative
+///   to the base) and run method sub-ops; per-op errors are in-band
+///   `{thrown}`. `readFile`/`listDir` observe the persisted bytes (byte-level
+///   JSONL compare after normalization), `usesDefaultSessionDir` compares
+///   against `getDefaultSessionDir(cwd, agentDir)` with an explicit
+///   `agentDir` (the TS ambient default is not observable).
+fn run_sess_manager_harness(input: &Value) -> Result<Value, String> {
+    use pi_core::session_manager as sm;
+    use pi_core::session_manager::{Generators, LeafId};
+
+    let op = input["op"].as_str().ok_or("missing op")?;
+    validate_files(input.get("files"))?;
+    // TS does `fs.utimesSync(rel(p), new Date(ms), new Date(ms))`; for
+    // non-integer values `new Date(ms)` is an Invalid Date and utimesSync is
+    // a silent no-op, so non-integer entries are skipped rather than errored.
+    let mtimes: Vec<(String, i64)> = match input.get("mtimes") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Object(map)) => map
+            .iter()
+            .filter_map(|(k, v)| v.as_i64().map(|ms| (k.clone(), ms)))
+            .collect(),
+        Some(_) => return Err("mtimes must be an object".to_string()),
+    };
+    let base = create_fixture(input.get("files"), "sess")?;
+    let base_s = base.to_string_lossy().into_owned();
+    for (rel, ms) in &mtimes {
+        let path = join_rel(&base_s, rel);
+        let f = std::fs::OpenOptions::new().write(true).open(&path).map_err(|e| e.to_string())?;
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(*ms as u64)),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let gen = Generators::default();
+    let result: Result<Value, String> = (|| {
+        let rel = |p: &str| join_rel(&base_s, p);
+        fn leaf(v: Option<&Value>) -> LeafId<'static> {
+            match v {
+                None | Some(Value::Null) => LeafId::Root,
+                Some(Value::String(s)) => LeafId::Id(s.to_string().leak()),
+                Some(_) => panic!("leafId must be a string or null"),
+            }
+        }
+        fn leaf_unset() -> LeafId<'static> { LeafId::Unset }
+        let messages_value = |msgs: &[pi_core::messages::AgentMessage]| -> Value {
+            serde_json::to_value(msgs).map_err(|e| e.to_string()).unwrap()
+        };
+        let projection_value = |p: &sm::SessionProjection| -> Value {
+            json!({
+                "entries": p.entries.iter().map(|e| json!({
+                    "sourceEntry": e.source_entry,
+                    "messages": e.messages,
+                })).collect::<Vec<_>>(),
+                "messages": p.messages,
+                "thinkingLevel": p.thinking_level,
+                "model": p.model,
+            })
+        };
+        let context_value = |c: &sm::SessionContext| -> Value {
+            json!({
+                "messages": c.messages,
+                "thinkingLevel": c.thinking_level,
+                "model": c.model,
+            })
+        };
+        match op {
+            "parseSessionEntries" => {
+                let content = input["content"].as_str().ok_or("missing content")?;
+                Ok(json!({ "entries": sm::parse_session_entries(content) }))
+            }
+            "migrateSessionEntries" => {
+                let mut entries = sess_entries(input)?;
+                sm::migrate_session_entries(&mut entries);
+                Ok(json!({ "entries": entries }))
+            }
+            "getLatestCompactionEntry" => {
+                let entries = sess_entries(input)?;
+                Ok(json!({ "entry": sm::get_latest_compaction_entry(&entries) }))
+            }
+            "sessionEntryToContextMessages" => {
+                let entry = input.get("entry").filter(|v| !v.is_null()).cloned().ok_or("missing entry")?;
+                Ok(json!({ "messages": messages_value(&sm::session_entry_to_context_messages(&entry)) }))
+            }
+            "buildContextEntries" => {
+                let entries = sess_entries(input)?;
+                let l = if input.get("leafId").is_none() { leaf_unset() } else { leaf(input.get("leafId")) };
+                Ok(json!({ "entries": sm::build_context_entries(&entries, l, None) }))
+            }
+            "buildSessionProjection" => {
+                let entries = sess_entries(input)?;
+                let l = if input.get("leafId").is_none() { leaf_unset() } else { leaf(input.get("leafId")) };
+                Ok(projection_value(&sm::build_session_projection(&entries, l, None)))
+            }
+            "buildSessionContext" => {
+                let entries = sess_entries(input)?;
+                let l = if input.get("leafId").is_none() { leaf_unset() } else { leaf(input.get("leafId")) };
+                Ok(context_value(&sm::build_session_context(&entries, l, None)))
+            }
+            "assertValidSessionId" => {
+                let id = input["id"].as_str().ok_or("missing id")?;
+                sm::assert_valid_session_id(id)?;
+                Ok(json!({ "valid": true }))
+            }
+            "getDefaultSessionDir" => {
+                let cwd = rel(input["cwd"].as_str().ok_or("missing cwd")?);
+                let agent_dir = rel(input["agentDir"].as_str().ok_or("missing agentDir")?);
+                Ok(json!({ "dir": sm::get_default_session_dir(&cwd, &agent_dir) }))
+            }
+            "loadEntriesFromFile" => {
+                let file_path = input["filePath"].as_str().ok_or("missing filePath")?;
+                Ok(json!({ "entries": sm::load_entries_from_file(&rel(file_path)) }))
+            }
+            "findMostRecentSession" => {
+                let session_dir = input["sessionDir"].as_str().ok_or("missing sessionDir")?;
+                let cwd = input.get("cwd").and_then(Value::as_str);
+                Ok(json!({ "path": sm::find_most_recent_session(&rel(session_dir), cwd) }))
+            }
+            "manager" => sess_manager_flow(input, &base_s, &gen),
+            other => Err(format!("unknown sess-manager op: {other}")),
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&base);
+    // Factory-level errors (e.g. the "not a valid pi session" path) embed
+    // the per-case temp base; normalize them like results so both harnesses
+    // compare equal ({error: <normalized>} on both sides).
+    let mut value = match result {
+        Ok(v) => json!({ "result": v }),
+        Err(msg) => json!({ "error": msg }),
+    };
+    sess_normalize(&mut value, &base_s);
+    Ok(value)
+}
+
+fn sess_entries(input: &Value) -> Result<Vec<Value>, String> {
+    input["entries"].as_array().cloned().ok_or("missing entries".to_string())
+}
+
+/// The `manager` sub-harness: construction + scripted method calls.
+fn sess_manager_flow(input: &Value, base_s: &str, gen: &pi_core::session_manager::Generators) -> Result<Value, String> {
+    use pi_core::session_manager::{NewSessionOptions, SessionManager};
+
+    let rel = |p: &str| join_rel(base_s, p);
+    let new_options = |v: &Value| -> Option<NewSessionOptions> {
+        let id = v.get("id").and_then(Value::as_str).map(str::to_string);
+        let parent = v.get("parentSession").and_then(Value::as_str).map(str::to_string);
+        if id.is_none() && parent.is_none() {
+            None
+        } else {
+            Some(NewSessionOptions { id, parent_session: parent })
+        }
+    };
+    let factory = input["factory"].as_str().unwrap_or("create");
+    let mut mgr: SessionManager = match factory {
+        "create" => SessionManager::create(
+            &rel(input["cwd"].as_str().unwrap_or("proj")),
+            Some(&rel(input["sessionDir"].as_str().unwrap_or("sess"))),
+            new_options(input).as_ref(),
+            gen,
+        )?,
+        "open" => SessionManager::open(
+            &rel(input["path"].as_str().ok_or("missing path")?),
+            input["sessionDir"].as_str().map(rel).as_deref(),
+            input["cwdOverride"].as_str().map(rel).as_deref(),
+            gen,
+        )?,
+        "continueRecent" => SessionManager::continue_recent(
+            &rel(input["cwd"].as_str().unwrap_or("proj")),
+            Some(&rel(input["sessionDir"].as_str().unwrap_or("sess"))),
+            base_s,
+            gen,
+        )?,
+        "inMemory" => SessionManager::in_memory(
+            &rel(input["cwd"].as_str().unwrap_or("proj")),
+            new_options(input).as_ref(),
+            input.get("entries").and_then(Value::as_array).cloned().unwrap_or_default(),
+            gen,
+        )?,
+        "forkFrom" => SessionManager::fork_from(
+            &rel(input["sourcePath"].as_str().ok_or("missing sourcePath")?),
+            &rel(input["targetCwd"].as_str().unwrap_or("proj")),
+            Some(&rel(input["sessionDir"].as_str().unwrap_or("sess"))),
+            new_options(input).as_ref(),
+            gen,
+        )?,
+        other => return Err(format!("unknown sess-manager factory: {other}")),
+    };
+    let ops: Vec<Value> = input["ops"].as_array().cloned().ok_or("missing ops")?;
+    let mut out: Vec<Value> = Vec::new();
+    for sop in &ops {
+        let entry: Result<Value, String> = (|| {
+            let kind = sop["op"].as_str().ok_or("missing op")?;
+            let opt_str = |key: &str| sop[key].as_str();
+            match kind {
+                "getCwd" => Ok(json!(mgr.get_cwd())),
+                "getSessionDir" => Ok(json!(mgr.get_session_dir())),
+                "getSessionId" => Ok(json!(mgr.get_session_id())),
+                "getSessionFile" => Ok(mgr.get_session_file().map(|s| json!(s)).unwrap_or(Value::Null)),
+                "getLeafId" => Ok(mgr.get_leaf_id().map(|s| json!(s)).unwrap_or(Value::Null)),
+                "getLeafEntry" => Ok(mgr.get_leaf_entry().cloned().unwrap_or(Value::Null)),
+                "getEntry" => {
+                    let id = opt_str("id").ok_or("missing id")?;
+                    Ok(mgr.get_entry(id).cloned().unwrap_or(Value::Null))
+                }
+                "getChildren" => {
+                    let id = opt_str("id").ok_or("missing id")?;
+                    Ok(json!(mgr.get_children(id)))
+                }
+                "getLabel" => {
+                    let id = opt_str("id").ok_or("missing id")?;
+                    Ok(mgr.get_label(id).map(|s| json!(s)).unwrap_or(Value::Null))
+                }
+                "getEntryCount" => Ok(json!(mgr.get_entry_count())),
+                "isPersisted" => Ok(json!(mgr.is_persisted())),
+                "getSessionName" => Ok(mgr.get_session_name().map(|s| json!(s)).unwrap_or(Value::Null)),
+                "getHeader" => Ok(mgr.get_header().cloned().unwrap_or(Value::Null)),
+                "getEntries" => Ok(json!(mgr.get_entries())),
+                "getTree" => Ok(serde_json::to_value(mgr.get_tree()).map_err(|e| e.to_string())?),
+                "getBranch" => Ok(json!(mgr.get_branch(opt_str("fromId")))),
+                "buildContextEntries" => Ok(json!(mgr.build_context_entries())),
+                "buildSessionProjection" => {
+                    let p = mgr.build_session_projection();
+                    Ok(json!({
+                        "entries": p.entries.iter().map(|e| json!({
+                            "sourceEntry": e.source_entry,
+                            "messages": e.messages,
+                        })).collect::<Vec<_>>(),
+                        "messages": p.messages,
+                        "thinkingLevel": p.thinking_level,
+                        "model": p.model,
+                    }))
+                }
+                "buildSessionContext" => {
+                    let c = mgr.build_session_context();
+                    Ok(json!({
+                        "messages": c.messages,
+                        "thinkingLevel": c.thinking_level,
+                        "model": c.model,
+                    }))
+                }
+                "newSession" => {
+                    let opts = new_options(sop);
+                    Ok(mgr.new_session(opts.as_ref())?.map(|s| json!(s)).unwrap_or(Value::Null))
+                }
+                "setSessionFile" => {
+                    let path = opt_str("path").ok_or("missing path")?;
+                    mgr.set_session_file(&rel(path))?;
+                    Ok(Value::Null)
+                }
+                "appendMessage" => {
+                    let message = sop.get("message").filter(|v| !v.is_null()).cloned().ok_or("missing message")?;
+                    Ok(json!(mgr.append_message(message)))
+                }
+                "appendThinkingLevelChange" => {
+                    let level = opt_str("thinkingLevel").ok_or("missing thinkingLevel")?;
+                    Ok(json!(mgr.append_thinking_level_change(level)))
+                }
+                "appendModelChange" => {
+                    let provider = opt_str("provider").ok_or("missing provider")?;
+                    let model_id = opt_str("modelId").ok_or("missing modelId")?;
+                    Ok(json!(mgr.append_model_change(provider, model_id)))
+                }
+                "appendUsage" => {
+                    let kind = opt_str("kind").ok_or("missing kind")?;
+                    let provider = opt_str("provider").ok_or("missing provider")?;
+                    let model = opt_str("model").ok_or("missing model")?;
+                    let usage = sop.get("usage").filter(|v| !v.is_null()).cloned().ok_or("missing usage")?;
+                    let note = opt_str("note");
+                    Ok(mgr.append_usage(kind, provider, model, usage, note))
+                }
+                "appendCompaction" => {
+                    let summary = opt_str("summary").ok_or("missing summary")?;
+                    let first_kept = opt_str("firstKeptEntryId");
+                    let tokens = sop["tokensBefore"].as_i64().ok_or("missing tokensBefore")?;
+                    let details = sop.get("details").filter(|v| !v.is_null()).cloned();
+                    let from_hook = sop.get("fromHook").and_then(Value::as_bool);
+                    let usage = sop.get("usage").filter(|v| !v.is_null()).cloned();
+                    Ok(json!(mgr.append_compaction(summary, first_kept, tokens, details, from_hook, usage)))
+                }
+                "appendCustomEntry" => {
+                    let custom_type = opt_str("customType").ok_or("missing customType")?;
+                    let data = sop.get("data").filter(|v| !v.is_null()).cloned();
+                    Ok(json!(mgr.append_custom_entry(custom_type, data)))
+                }
+                "appendSessionInfo" => {
+                    let name = opt_str("name").ok_or("missing name")?;
+                    Ok(json!(mgr.append_session_info(name)))
+                }
+                "appendCustomMessageEntry" => {
+                    let custom_type = opt_str("customType").ok_or("missing customType")?;
+                    let content = sop.get("content").filter(|v| !v.is_null()).cloned().ok_or("missing content")?;
+                    let display = sop["display"].as_bool().unwrap_or(false);
+                    let details = sop.get("details").filter(|v| !v.is_null()).cloned();
+                    Ok(json!(mgr.append_custom_message_entry(custom_type, content, display, details)))
+                }
+                "appendContextEdit" => {
+                    let target = opt_str("targetId").ok_or("missing targetId")?;
+                    let replacement = sop.get("replacement").filter(|v| !v.is_null()).cloned();
+                    Ok(json!(mgr.append_context_edit(target, replacement)?))
+                }
+                "appendLabelChange" => {
+                    let target = opt_str("targetId").ok_or("missing targetId")?;
+                    let label = opt_str("label");
+                    Ok(json!(mgr.append_label_change(target, label)?))
+                }
+                "branch" => {
+                    let id = opt_str("id").ok_or("missing id")?;
+                    mgr.branch(id)?;
+                    Ok(Value::Null)
+                }
+                "resetLeaf" => {
+                    mgr.reset_leaf();
+                    Ok(Value::Null)
+                }
+                "branchWithSummary" => {
+                    let from = opt_str("branchFromId");
+                    let summary = opt_str("summary").ok_or("missing summary")?;
+                    let details = sop.get("details").filter(|v| !v.is_null()).cloned();
+                    let from_hook = sop.get("fromHook").and_then(Value::as_bool);
+                    let usage = sop.get("usage").filter(|v| !v.is_null()).cloned();
+                    Ok(json!(mgr.branch_with_summary(from, summary, details, from_hook, usage)?))
+                }
+                "createBranchedSession" => {
+                    let leaf = opt_str("leafId").ok_or("missing leafId")?;
+                    Ok(mgr.create_branched_session(leaf)?.map(|s| json!(s)).unwrap_or(Value::Null))
+                }
+                "readFile" => {
+                    let path = match opt_str("path") {
+                        Some(p) => rel(p),
+                        None => mgr.get_session_file().ok_or("no session file")?.to_string(),
+                    };
+                    Ok(std::fs::read_to_string(&path).ok().map(Value::String).unwrap_or(Value::Null))
+                }
+                "listDir" => {
+                    let dir = match opt_str("dir") {
+                        Some(d) => rel(d),
+                        None => mgr.get_session_dir().to_string(),
+                    };
+                    let read = std::fs::read_dir(&dir).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            // Node's fs.readdirSync throws this exact message.
+                            format!("ENOENT: no such file or directory, scandir '{}'", dir)
+                        } else {
+                            e.to_string()
+                        }
+                    })?;
+                    let mut names: Vec<String> = read
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    names.sort();
+                    Ok(json!(names))
+                }
+                "usesDefaultSessionDir" => {
+                    let agent_dir = rel(opt_str("agentDir").unwrap_or("agent"));
+                    Ok(json!(mgr.get_session_dir() == pi_core::session_manager::get_default_session_dir(mgr.get_cwd(), &agent_dir)))
+                }
+                other => Err(format!("unknown sess-manager op: {other}")),
+            }
+        })();
+        out.push(match entry {
+            Ok(v) => v,
+            Err(msg) => json!({ "thrown": msg }),
+        });
+    }
+    Ok(json!({ "out": out }))
+}
+
+// ============================================================================
+// nested-tool-calls / pi-manifest / output-guard / defaults
+// ============================================================================
+
+/// `nested-tool-calls` harness: script-driven
+/// `pi_core::nested_tool_calls::NestedCallRecorder` (TS
+/// `core/nested-tool-calls.js`). args `{ ops: [...] }` → `{ out: [...] }`.
+/// `start` returns a record handle (its index; `null` when dropped past
+/// `maxCalls`), `finish` takes it back. `durationMs` is zeroed on both
+/// sides (real `performance.now()` / `Instant` differ); `addUsage` inputs
+/// must be complete `Usage` objects (the TS arithmetic is NaN on missing
+/// fields).
+fn run_nested_tool_calls_harness(input: &Value) -> Result<Value, String> {
+    use pi_core::ai::Usage;
+    use pi_core::nested_tool_calls::{AgentToolCall, NestedCallRecorder, NESTED_CALL_LIMITS};
+
+    let ops: Vec<Value> = input["ops"].as_array().cloned().ok_or("missing ops")?;
+    let mut rec = NestedCallRecorder::new();
+    let mut out: Vec<Value> = Vec::new();
+    for op in &ops {
+        let entry: Result<Value, String> = (|| {
+            let kind = op["op"].as_str().ok_or("missing op")?;
+            match kind {
+                "start" => {
+                    let id = op["id"].as_str().ok_or("missing id")?;
+                    let name = op["name"].as_str().ok_or("missing name")?;
+                    let arguments = op.get("arguments").cloned().unwrap_or(Value::Null);
+                    let call = AgentToolCall::new(id, name, arguments);
+                    Ok(match rec.start(&call) {
+                        Some(h) => json!(h),
+                        None => Value::Null,
+                    })
+                }
+                "finish" => {
+                    let record = op.get("record").and_then(Value::as_u64).map(|h| h as usize);
+                    let is_error = op["isError"].as_bool().unwrap_or(false);
+                    let error_text = op["errorText"].as_str().unwrap_or("");
+                    rec.finish(record, is_error, error_text);
+                    Ok(Value::Null)
+                }
+                "addUsage" => {
+                    let usage = op.get("usage").filter(|v| !v.is_null()).ok_or("missing usage")?;
+                    rec.add_usage(Usage::from_value(usage));
+                    Ok(Value::Null)
+                }
+                "totalUsage" => Ok(rec.total_usage().map(|u| u.to_value()).unwrap_or(Value::Null)),
+                "snapshot" => {
+                    let mut snap = rec
+                        .snapshot()
+                        .map(|s| serde_json::to_value(s).map_err(|e| e.to_string()))
+                        .transpose()?
+                        .unwrap_or(Value::Null);
+                    ntc_zero_durations(&mut snap);
+                    Ok(snap)
+                }
+                "limits" => Ok(json!({
+                    "maxCalls": NESTED_CALL_LIMITS.max_calls,
+                    "maxArgumentBytesPerCall": NESTED_CALL_LIMITS.max_argument_bytes_per_call,
+                    "maxArgumentBytesTotal": NESTED_CALL_LIMITS.max_argument_bytes_total,
+                    "maxErrorChars": NESTED_CALL_LIMITS.max_error_chars,
+                })),
+                other => Err(format!("unknown nested-tool-calls op: {other}")),
+            }
+        })();
+        out.push(match entry {
+            Ok(v) => v,
+            Err(msg) => json!({ "thrown": msg }),
+        });
+    }
+    Ok(json!({ "result": { "out": out } }))
+}
+
+/// Zero every `durationMs` (timing-dependent) in a snapshot value.
+fn ntc_zero_durations(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if k == "durationMs" && !v.is_null() {
+                    *v = json!(0);
+                } else {
+                    ntc_zero_durations(v);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                ntc_zero_durations(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `pi-manifest` harness: `pi_core::pi_manifest::read_pi_manifest` (TS
+/// `core/pi-manifest.js`, which reads from a file path; the TS entry writes
+/// `content` to a temp `package.json` first, the Rust port takes content).
+fn run_pi_manifest_harness(input: &Value) -> Result<Value, String> {
+    use pi_core::pi_manifest::read_pi_manifest;
+    let op = input["op"].as_str().ok_or("missing op")?;
+    match op {
+        "read" => {
+            let content = input["content"].as_str().ok_or("missing content")?;
+            Ok(json!({ "result": read_pi_manifest(content) }))
+        }
+        other => Err(format!("unknown pi-manifest op: {other}")),
+    }
+}
+
+/// `defaults` harness: `pi_core::defaults` constants (TS
+/// `core/defaults.js` — `DEFAULT_THINKING_LEVEL` / `THINKING_LEVEL_OPTIONS`).
+fn run_defaults_harness(input: &Value) -> Result<Value, String> {
+    use pi_core::defaults::{DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS};
+    let op = input["op"].as_str().ok_or("missing op")?;
+    match op {
+        "constants" => Ok(json!({
+            "result": {
+                "defaultThinkingLevel": DEFAULT_THINKING_LEVEL.as_str(),
+                "options": THINKING_LEVEL_OPTIONS.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
+            }
+        })),
+        other => Err(format!("unknown defaults op: {other}")),
+    }
+}
+
+/// `output-guard` harness: script-driven `pi_core::output_guard::OutputGuard`
+/// (TS `core/output-guard.js`, which is process-global). The stdout write is
+/// a scripted recorder (`stdoutScript`: per-call `null` or
+/// `{code, message}` errors) shared by both entries; writes are recorded per
+/// attempt. `writeRawStdout` failures are stashed and surface at
+/// `waitForRawStdoutBackpressure` / `flushRawStdout`, mirroring the TS
+/// promise-tail error propagation (a non-retryable raw failure kills the
+/// Node process there; `process.exit` is neutralized on the TS side).
+fn run_output_guard_harness(input: &Value) -> Result<Value, String> {
+    use pi_core::output_guard::{raw_write, OutputGuard};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let ops: Vec<Value> = input["ops"].as_array().cloned().ok_or("missing ops")?;
+    let script_in = |key: &str| -> Result<Vec<Option<(String, String)>>, String> {
+        match input.get(key) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Null => Ok(None),
+                    Value::Object(o) => {
+                        let code = o.get("code").and_then(Value::as_str).ok_or("stdoutScript entries need a code")?;
+                        let message = o.get("message").and_then(Value::as_str).ok_or("stdoutScript entries need a message")?;
+                        Ok(Some((code.to_string(), message.to_string())))
+                    }
+                    _ => Err("stdoutScript entries must be null or {code, message}".to_string()),
+                })
+                .collect(),
+            Some(_) => Err("stdoutScript must be an array".to_string()),
+        }
+    };
+    let stdout_script = script_in("stdoutScript")?;
+    let stderr_script = script_in("stderrScript")?;
+
+    type Log = Rc<RefCell<Vec<String>>>;
+    type Script = Rc<RefCell<Vec<Option<(String, String)>>>>;
+    let mk_writer = |log: Log, script: Script| {
+        raw_write(move |text| {
+            log.borrow_mut().push(text.to_string());
+            let step = {
+                let mut s = script.borrow_mut();
+                if s.is_empty() {
+                    None
+                } else {
+                    s.remove(0)
+                }
+            };
+            match step {
+                Some((code, message)) => Err(pi_core::output_guard::RawWriteError::new(Some(&code), message)),
+                None => Ok(()),
+            }
+        })
+    };
+    let stdout_log: Log = Rc::new(RefCell::new(Vec::new()));
+    let stderr_log: Log = Rc::new(RefCell::new(Vec::new()));
+    let stdout_write = mk_writer(Rc::clone(&stdout_log), Rc::new(RefCell::new(stdout_script)));
+    let stderr_write = mk_writer(Rc::clone(&stderr_log), Rc::new(RefCell::new(stderr_script)));
+    let mut guard = OutputGuard::new(stdout_write, stderr_write);
+    let mut pending_error: Option<String> = None;
+    // The TS chains raw writes onto a promise tail: queued chunks flush on a
+    // microtask after the synchronous ops, or when waitFor/flush awaits the
+    // tail. Emulate with a queue drained at waitFor/flush and at the end
+    // (the TS entry's final `await waitForRawStdoutBackpressure()`).
+    let mut raw_queue: Vec<String> = Vec::new();
+    let drain_raw = |guard: &mut OutputGuard, queue: &mut Vec<String>, pending_error: &mut Option<String>| {
+        while pending_error.is_none() {
+            let Some(text) = queue.first().cloned() else { break };
+            queue.remove(0);
+            if let Err(e) = guard.write_raw_stdout(&text) {
+                *pending_error = Some(e.message);
+            }
+        }
+    };
+
+    let mut out: Vec<Value> = Vec::new();
+    for op in &ops {
+        let entry: Result<Value, String> = (|| {
+            let kind = op["op"].as_str().ok_or("missing op")?;
+            match kind {
+                "takeOverStdout" => {
+                    guard.take_over_stdout();
+                    Ok(Value::Null)
+                }
+                "restoreStdout" => {
+                    guard.restore_stdout();
+                    Ok(Value::Null)
+                }
+                "isStdoutTakenOver" => Ok(json!(guard.is_stdout_taken_over())),
+                "writeStdout" => {
+                    let text = op["text"].as_str().ok_or("missing text")?;
+                    guard.write_stdout(text).map_err(|e| e.message)?;
+                    Ok(Value::Null)
+                }
+                "writeRawStdout" => {
+                    let text = op["text"].as_str().ok_or("missing text")?;
+                    // Empty text returns before chaining; a dead (rejected)
+                    // tail swallows later chunks entirely.
+                    if pending_error.is_none() && !text.is_empty() {
+                        raw_queue.push(text.to_string());
+                    }
+                    Ok(Value::Null)
+                }
+                "flushRawStdout" => {
+                    drain_raw(&mut guard, &mut raw_queue, &mut pending_error);
+                    if let Some(msg) = &pending_error {
+                        return Err(msg.clone());
+                    }
+                    guard.flush_raw_stdout().map_err(|e| e.message)?;
+                    Ok(Value::Null)
+                }
+                "waitForRawStdoutBackpressure" => {
+                    drain_raw(&mut guard, &mut raw_queue, &mut pending_error);
+                    if let Some(msg) = &pending_error {
+                        return Err(msg.clone());
+                    }
+                    guard.wait_for_raw_stdout_backpressure();
+                    Ok(Value::Null)
+                }
+                other => Err(format!("unknown output-guard op: {other}")),
+            }
+        })();
+        out.push(match entry {
+            Ok(v) => v,
+            Err(msg) => json!({ "thrown": msg }),
+        });
+    }
+    drain_raw(&mut guard, &mut raw_queue, &mut pending_error);
+    Ok(json!({
+        "result": {
+            "out": out,
+            "stdoutWrites": *stdout_log.borrow(),
+            "stderrWrites": *stderr_log.borrow(),
+        }
+    }))
 }

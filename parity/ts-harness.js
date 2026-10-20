@@ -1386,6 +1386,20 @@ async function runModule(tool, args, cwd) {
 			case "migrateSessionEntries": {
 				const entries = args.entries;
 				sm.migrateSessionEntries(entries);
+				// The migration generates random 8-hex entry ids (randomUUID is
+				// imported as ESM, invisible to the harness crypto override), so
+				// rewrite exact-8-hex string values to <id8> — mirrored by the
+				// Rust harness's normalize_id8_strings.
+				const rewriteIds = (v) => {
+					if (typeof v === "string") return /^[0-9a-f]{8}$/.test(v) ? "<id8>" : v;
+					if (Array.isArray(v)) return v.map(rewriteIds);
+					if (v !== null && typeof v === "object") {
+						for (const k of Object.keys(v)) v[k] = rewriteIds(v[k]);
+						return v;
+					}
+					return v;
+				};
+				rewriteIds(entries);
 				return { entries };
 			}
 			case "parseSessionEntries":
@@ -3640,7 +3654,358 @@ async function runModule(tool, args, cwd) {
 		throw new Error("unknown skills op: " + op);
 	}
 
+	if (tool === "sess-manager") {
+		// core/session-manager.js (pi-core port). Per-case temp base with
+		// optional `files` + `mtimes` (epoch ms) fixtures; results are
+		// base-normalized and dynamic uuids/timestamps/8-hex ids rewritten on
+		// BOTH sides (neither side can inject uuidv7/randomUUID/new Date).
+		const fs = require("fs");
+		const os = require("os");
+		const sm = require(path.join(distDir, "core", "session-manager.js"));
+		const op = args.op;
+		if (typeof op !== "string") throw new Error("missing op");
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parity-sess-"));
+		const rel = (p) => path.resolve(base, p);
+		const zeroDur = null;
+		try {
+			parityMaterialize(parityValidateFiles(args.files), base);
+			if (args.mtimes) {
+				for (const [p, ms] of Object.entries(args.mtimes)) fs.utimesSync(rel(p), new Date(ms), new Date(ms));
+			}
+			const entriesOf = () => {
+				if (!Array.isArray(args.entries)) throw new Error("missing entries");
+				return args.entries;
+			};
+			const leaf = (v) => v;
+			let out;
+			if (op === "parseSessionEntries") {
+				if (typeof args.content !== "string") throw new Error("missing content");
+				out = { entries: sm.parseSessionEntries(args.content) };
+			} else if (op === "migrateSessionEntries") {
+				const entries = entriesOf();
+				sm.migrateSessionEntries(entries);
+				out = { entries };
+			} else if (op === "getLatestCompactionEntry") {
+				out = { entry: sm.getLatestCompactionEntry(entriesOf()) ?? null };
+			} else if (op === "sessionEntryToContextMessages") {
+				if (!args.entry) throw new Error("missing entry");
+				out = { messages: sm.sessionEntryToContextMessages(args.entry) };
+			} else if (op === "buildContextEntries") {
+				out = { entries: sm.buildContextEntries(entriesOf(), leaf(args.leafId)) };
+			} else if (op === "buildSessionProjection") {
+				out = sm.buildSessionProjection(entriesOf(), leaf(args.leafId));
+			} else if (op === "buildSessionContext") {
+				out = sm.buildSessionContext(entriesOf(), leaf(args.leafId));
+			} else if (op === "assertValidSessionId") {
+				if (typeof args.id !== "string") throw new Error("missing id");
+				sm.assertValidSessionId(args.id);
+				out = { valid: true };
+			} else if (op === "getDefaultSessionDir") {
+				if (typeof args.cwd !== "string") throw new Error("missing cwd");
+				if (typeof args.agentDir !== "string") throw new Error("missing agentDir");
+				out = { dir: sm.getDefaultSessionDir(rel(args.cwd), rel(args.agentDir)) };
+			} else if (op === "loadEntriesFromFile") {
+				if (typeof args.filePath !== "string") throw new Error("missing filePath");
+				out = { entries: sm.loadEntriesFromFile(rel(args.filePath)) };
+			} else if (op === "findMostRecentSession") {
+				if (typeof args.sessionDir !== "string") throw new Error("missing sessionDir");
+				out = { path: sm.findMostRecentSession(rel(args.sessionDir), args.cwd) ?? null };
+			} else if (op === "manager") {
+				const factory = args.factory ?? "create";
+				const opts = () =>
+					args.id !== undefined || args.parentSession !== undefined
+						? { id: args.id, parentSession: args.parentSession }
+						: undefined;
+				let mgr;
+				if (factory === "create") {
+					mgr = sm.SessionManager.create(rel(args.cwd ?? "proj"), rel(args.sessionDir ?? "sess"), opts());
+				} else if (factory === "open") {
+					if (typeof args.path !== "string") throw new Error("missing path");
+					mgr = sm.SessionManager.open(
+						rel(args.path),
+						args.sessionDir !== undefined ? rel(args.sessionDir) : undefined,
+						args.cwdOverride !== undefined ? rel(args.cwdOverride) : undefined,
+					);
+				} else if (factory === "continueRecent") {
+					mgr = sm.SessionManager.continueRecent(rel(args.cwd ?? "proj"), rel(args.sessionDir ?? "sess"));
+				} else if (factory === "inMemory") {
+					mgr = sm.SessionManager.inMemory(rel(args.cwd ?? "proj"), opts(), args.entries ?? []);
+				} else if (factory === "forkFrom") {
+					if (typeof args.sourcePath !== "string") throw new Error("missing sourcePath");
+					mgr = sm.SessionManager.forkFrom(rel(args.sourcePath), rel(args.targetCwd ?? "proj"), rel(args.sessionDir ?? "sess"), opts());
+				} else {
+					throw new Error("unknown sess-manager factory: " + factory);
+				}
+				if (!Array.isArray(args.ops)) throw new Error("missing ops");
+				const sopOpts = (sop) =>
+					sop.id !== undefined || sop.parentSession !== undefined
+						? { id: sop.id, parentSession: sop.parentSession }
+						: undefined;
+				const proj = (p) => ({
+					entries: p.entries.map((e) => ({ sourceEntry: e.sourceEntry, messages: e.messages })),
+					messages: p.messages,
+					thinkingLevel: p.thinkingLevel,
+					model: p.model,
+				});
+				const ctx = (c) => ({ messages: c.messages, thinkingLevel: c.thinkingLevel, model: c.model });
+				const out2 = [];
+				for (const sop of args.ops) {
+					try {
+						if (typeof sop.op !== "string") throw new Error("missing op");
+						let v;
+						switch (sop.op) {
+							case "getCwd": v = mgr.getCwd(); break;
+							case "getSessionDir": v = mgr.getSessionDir(); break;
+							case "getSessionId": v = mgr.getSessionId(); break;
+							case "getSessionFile": v = mgr.getSessionFile() ?? null; break;
+							case "getLeafId": v = mgr.getLeafId() ?? null; break;
+							case "getLeafEntry": v = mgr.getLeafEntry() ?? null; break;
+							case "getEntry": v = mgr.getEntry(sop.id) ?? null; break;
+							case "getChildren": v = mgr.getChildren(sop.id); break;
+							case "getLabel": v = mgr.getLabel(sop.id) ?? null; break;
+							case "getEntryCount": v = mgr.getEntryCount(); break;
+							case "isPersisted": v = mgr.isPersisted(); break;
+							case "getSessionName": v = mgr.getSessionName() ?? null; break;
+							case "getHeader": v = mgr.getHeader(); break;
+							case "getEntries": v = mgr.getEntries(); break;
+							case "getTree": v = mgr.getTree(); break;
+							case "getBranch": v = mgr.getBranch(sop.fromId); break;
+							case "buildContextEntries": v = mgr.buildContextEntries(); break;
+							case "buildSessionProjection": v = proj(mgr.buildSessionProjection()); break;
+							case "buildSessionContext": v = ctx(mgr.buildSessionContext()); break;
+							case "newSession": v = mgr.newSession(sopOpts(sop)) ?? null; break;
+							case "setSessionFile": mgr.setSessionFile(rel(sop.path)); v = null; break;
+							case "appendMessage": v = mgr.appendMessage(sop.message); break;
+							case "appendThinkingLevelChange": v = mgr.appendThinkingLevelChange(sop.thinkingLevel); break;
+							case "appendModelChange": v = mgr.appendModelChange(sop.provider, sop.modelId); break;
+							case "appendUsage": v = mgr.appendUsage(sop.kind, sop.provider, sop.model, sop.usage, sop.note); break;
+							case "appendCompaction": v = mgr.appendCompaction(sop.summary, sop.firstKeptEntryId ?? null, sop.tokensBefore, sop.details, sop.fromHook, sop.usage); break;
+							case "appendCustomEntry": v = mgr.appendCustomEntry(sop.customType, sop.data); break;
+							case "appendSessionInfo": v = mgr.appendSessionInfo(sop.name); break;
+							case "appendCustomMessageEntry": v = mgr.appendCustomMessageEntry(sop.customType, sop.content, sop.display, sop.details); break;
+							case "appendContextEdit": v = mgr.appendContextEdit(sop.targetId, sop.replacement === undefined ? undefined : sop.replacement); break;
+							case "appendLabelChange": v = mgr.appendLabelChange(sop.targetId, sop.label); break;
+							case "branch": mgr.branch(sop.id); v = null; break;
+							case "resetLeaf": mgr.resetLeaf(); v = null; break;
+							case "branchWithSummary": v = mgr.branchWithSummary(sop.branchFromId ?? null, sop.summary, sop.details, sop.fromHook, sop.usage); break;
+							case "createBranchedSession": v = mgr.createBranchedSession(sop.leafId) ?? null; break;
+							case "readFile": {
+								const p = sop.path !== undefined ? rel(sop.path) : mgr.getSessionFile();
+								v = p && fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null;
+								break;
+							}
+							case "listDir": {
+								const d = sop.dir !== undefined ? rel(sop.dir) : mgr.getSessionDir();
+								v = fs.readdirSync(d).sort();
+								break;
+							}
+							case "usesDefaultSessionDir":
+								v = mgr.getSessionDir() === sm.getDefaultSessionDir(mgr.getCwd(), rel(sop.agentDir ?? "agent"));
+								break;
+							default: throw new Error("unknown sess-manager op: " + sop.op);
+						}
+						out2.push(v === undefined ? null : v);
+					} catch (e) {
+						out2.push({ thrown: e && e.message !== undefined ? e.message : String(e) });
+					}
+				}
+				out = { out: out2 };
+			} else {
+				throw new Error("unknown sess-manager op: " + op);
+			}
+			return { result: sessNorm(out, base) };
+		} catch (e) {
+			// Factory-level errors embed the per-case temp base; normalize the
+			// message like results so both harnesses compare equal.
+			throw new Error(sessNorm(e && e.message !== undefined ? e.message : String(e), base));
+		} finally {
+			fs.rmSync(base, { recursive: true, force: true });
+		}
+	}
+
+	if (tool === "nested-tool-calls") {
+		const nc = require(path.join(distDir, "core", "nested-tool-calls.js"));
+		if (!Array.isArray(args.ops)) throw new Error("missing ops");
+		const rec = new nc.NestedCallRecorder();
+		const handles = [];
+		const out = [];
+		for (const op of args.ops) {
+			try {
+				if (typeof op.op !== "string") throw new Error("missing op");
+				let v;
+				switch (op.op) {
+					case "start": {
+						if (typeof op.id !== "string") throw new Error("missing id");
+						if (typeof op.name !== "string") throw new Error("missing name");
+						const record = rec.start({ type: "toolCall", id: op.id, name: op.name, arguments: op.arguments });
+						v = record === undefined ? null : handles.push(record) - 1;
+						break;
+					}
+					case "finish":
+						rec.finish(
+							op.record === null || op.record === undefined ? undefined : handles[op.record],
+							op.isError ?? false,
+							op.errorText ?? "",
+						);
+						v = null;
+						break;
+					case "addUsage":
+						if (!op.usage) throw new Error("missing usage");
+						rec.addUsage(op.usage);
+						v = null;
+						break;
+					case "totalUsage": v = rec.totalUsage ?? null; break;
+					case "snapshot": {
+						let s = rec.snapshot();
+						if (s) s = { ...s, calls: s.calls.map((c) => ({ ...c, durationMs: c.durationMs === undefined ? undefined : 0 })) };
+						v = s ?? null;
+						break;
+					}
+					case "limits": v = { ...nc.NESTED_CALL_LIMITS }; break;
+					default: throw new Error("unknown nested-tool-calls op: " + op.op);
+				}
+				out.push(v === undefined ? null : v);
+			} catch (e) {
+				out.push({ thrown: e && e.message !== undefined ? e.message : String(e) });
+			}
+		}
+		return { result: { out } };
+	}
+
+	if (tool === "pi-manifest") {
+		const fs = require("fs");
+		const os = require("os");
+		const pm = require(path.join(distDir, "core", "pi-manifest.js"));
+		const op = args.op;
+		if (typeof op !== "string") throw new Error("missing op");
+		if (op !== "read") throw new Error("unknown pi-manifest op: " + op);
+		if (typeof args.content !== "string") throw new Error("missing content");
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parity-pm-"));
+		try {
+			const file = path.join(base, "package.json");
+			fs.writeFileSync(file, args.content);
+			return { result: pm.readPiManifest(file) };
+		} finally {
+			fs.rmSync(base, { recursive: true, force: true });
+		}
+	}
+
+	if (tool === "defaults") {
+		const d = require(path.join(distDir, "core", "defaults.js"));
+		const op = args.op;
+		if (typeof op !== "string") throw new Error("missing op");
+		if (op !== "constants") throw new Error("unknown defaults op: " + op);
+		return { result: { defaultThinkingLevel: d.DEFAULT_THINKING_LEVEL, options: [...d.THINKING_LEVEL_OPTIONS] } };
+	}
+
+	if (tool === "output-guard") {
+		// core/output-guard.js is process-global: patch process.stdout.write /
+		// process.stderr.write with scripted recorders (per-call null or
+		// {code, message} errors), neutralize process.exit (the TS kills the
+		// process on unrecoverable raw-write failures), and restore in the
+		// finally block. Raw-write failures surface at waitFor/flush, matching
+		// the promise-tail error propagation the Rust entry emulates.
+		const og = require(path.join(distDir, "core", "output-guard.js"));
+		if (!Array.isArray(args.ops)) throw new Error("missing ops");
+		const mkScript = (v) => (Array.isArray(v) ? v.map((x) => (x && typeof x === "object" ? { ...x } : null)) : []);
+		const stdoutScript = mkScript(args.stdoutScript);
+		const stderrScript = mkScript(args.stderrScript);
+		const stdoutLog = [];
+		const stderrLog = [];
+		const mkWriter = (log, script) => (chunk, a, b) => {
+			const cb = typeof a === "function" ? a : b;
+			const text = String(chunk);
+			log.push(text);
+			const step = script.length > 0 ? script.shift() : null;
+			if (step) {
+				const err = new Error(step.message);
+				err.code = step.code;
+				if (cb) cb(err);
+				return false;
+			}
+			if (cb) cb(null);
+			return true;
+		};
+		const savedOut = process.stdout.write;
+		const savedErr = process.stderr.write;
+		const savedExit = process.exit;
+		process.stdout.write = mkWriter(stdoutLog, stdoutScript);
+		process.stderr.write = mkWriter(stderrLog, stderrScript);
+		process.exit = () => {};
+		const out = [];
+		try {
+			for (const op of args.ops) {
+				try {
+					if (typeof op.op !== "string") throw new Error("missing op");
+					let v;
+					switch (op.op) {
+						case "takeOverStdout": og.takeOverStdout(); v = null; break;
+						case "restoreStdout": og.restoreStdout(); v = null; break;
+						case "isStdoutTakenOver": v = og.isStdoutTakenOver(); break;
+						case "writeStdout":
+							if (typeof op.text !== "string") throw new Error("missing text");
+							await new Promise((resolve, reject) => {
+								process.stdout.write(op.text, (e) => (e ? reject(e) : resolve()));
+							});
+							v = null;
+							break;
+						case "writeRawStdout":
+							if (typeof op.text !== "string") throw new Error("missing text");
+							og.writeRawStdout(op.text);
+							v = null;
+							break;
+						case "flushRawStdout": await og.flushRawStdout(); v = null; break;
+						case "waitForRawStdoutBackpressure": await og.waitForRawStdoutBackpressure(); v = null; break;
+						default: throw new Error("unknown output-guard op: " + op.op);
+					}
+					out.push(v === undefined ? null : v);
+				} catch (e) {
+					out.push({ thrown: e && e.message !== undefined ? e.message : String(e) });
+				}
+			}
+			await og.waitForRawStdoutBackpressure().catch(() => {});
+			return { result: { out, stdoutWrites: stdoutLog, stderrWrites: stderrLog } };
+		} finally {
+			process.stdout.write = savedOut;
+			process.stderr.write = savedErr;
+			process.exit = savedExit;
+		}
+	}
+
 	return undefined;
+}
+
+/** sess-manager normalization: <base>, uuids, ISO timestamps (plain and
+ * filename form), exact-8-hex ids, and epoch-ms numbers under `timestamp`. */
+function sessNorm(value, base) {
+	if (typeof value === "string") {
+		// Ambient cwd: `open` without cwdOverride falls back to process.cwd()
+		// here and AMBIENT_CWD ("/") on the Rust side; each side normalizes
+		// its own ambient value to <cwd>.
+		let s = value.split(process.cwd()).join("<cwd>");
+		s = s.split(base).join("<base>");
+		// getDefaultSessionDir encodes the cwd into a safe directory name
+		// (slashes → dashes), which escapes the plain <base> rewrite.
+		s = s.split(base.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")).join("<base>");
+		s = s.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "<uuid>");
+		s = s.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g, "<ts>");
+		s = s.replace(/\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z/g, "<tsf>");
+		// Quoted 8-hex ids embedded in raw JSONL strings (readFile): quote
+		// delimiters cannot occur inside JSON string content, so this only
+		// matches structural values. Mirrors the Rust sess_rewrite_string arm.
+		s = s.replace(/"([0-9a-f]{8})"/g, '"<id8>"');
+		if (/^[0-9a-f]{8}$/.test(s)) s = "<id8>";
+		return s;
+	}
+	if (Array.isArray(value)) return value.map((v) => sessNorm(v, base));
+	if (value !== null && typeof value === "object") {
+		const out = {};
+		for (const [k, v] of Object.entries(value)) {
+			out[k] = k === "timestamp" && typeof v === "number" && v >= 1e12 && v < 1e13 ? "<ms>" : sessNorm(v, base);
+		}
+		return out;
+	}
+	return value;
 }
 
 /**

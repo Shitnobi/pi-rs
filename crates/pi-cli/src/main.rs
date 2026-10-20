@@ -223,6 +223,9 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "prompt-templates" | "skills" => {
             return core_harness::run(name, &input)
         }
+        "sess-manager" | "nested-tool-calls" | "pi-manifest" | "output-guard" | "defaults" => {
+            return core_harness::run(name, &input)
+        }
         _ => {}
     }
     let result: Result<pi_tools::ToolOutput, String> = match name {
@@ -1573,6 +1576,31 @@ fn run_messages_harness(input: &Value) -> Result<Value, String> {
 /// Drive pi-session `session_manager.rs` functions (mirrors
 /// dist/core/session-manager.js). Relative paths in args are resolved against
 /// the harness cwd, matching the TS harness's `path.resolve(cwd, ...)`.
+/// `normalize_id8_strings` deep-rewrites string values that are exactly 8
+/// lowercase hex chars (generated entry ids) to `<id8>`, mirroring the TS
+/// harness's post-migration rewrite in the `migrateSessionEntries` arm.
+fn normalize_id8_strings(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            let b = s.as_bytes();
+            if b.len() == 8 && b.iter().all(|&c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+                *s = "<id8>".to_string();
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_id8_strings(item);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                normalize_id8_strings(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn run_session_manager_harness(input: &Value, cwd: &str) -> Result<Value, String> {
     use pi_core::paths::{resolve_path, PathInputOptions};
     use pi_session::session_manager as sm;
@@ -1597,6 +1625,12 @@ fn run_session_manager_harness(input: &Value, cwd: &str) -> Result<Value, String
         "migrateSessionEntries" => {
             let mut entries = entries_arg()?;
             sm::migrate_session_entries(&mut entries);
+            // Both sides emit random 8-hex entry ids (the dist imports
+            // randomUUID as ESM, invisible to the harness crypto override),
+            // so normalize them on both sides.
+            for entry in &mut entries {
+                normalize_id8_strings(entry);
+            }
             Ok(serde_json::json!({ "entries": entries }))
         }
         "parseSessionEntries" => {

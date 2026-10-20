@@ -457,17 +457,18 @@ fn migrate_v2_to_v3(entries: &mut [Value]) {
 }
 
 fn migrate_to_current_version(entries: &mut [Value], uuid_v4: &UuidGen) -> bool {
+    // TS: `const version = header?.version ?? 1;` followed by relational
+    // compares. Missing header / absent or null version → 1. Numbers pass
+    // through. Strings coerce like JS Number(s): numeric strings parse,
+    // everything else → NaN. Other JSON types (objects, arrays, bools as
+    // handled here) → NaN. NaN fails every comparison on both sides, so no
+    // migration step runs and true is returned (matching TS).
     let header = entries.iter().find(|e| entry_type(e) == "session");
-    let version = match header.and_then(|h| h.get("version")) {
-        Some(Value::Number(n)) => n.as_f64(),
-        _ => None,
-    };
-    // A missing version is v1; a non-numeric version matches no comparison in
-    // TS (all comparisons are false) and triggers no migration.
-    let version = match version {
-        Some(v) => v,
-        None if header.is_some() && header.unwrap().get("version").is_none() => 1.0,
-        None => return false,
+    let version: f64 = match header.and_then(|h| h.get("version")) {
+        None | Some(Value::Null) => 1.0,
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN),
+        Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(f64::NAN),
+        Some(_) => f64::NAN,
     };
     if version >= CURRENT_SESSION_VERSION as f64 {
         return false;
@@ -520,8 +521,12 @@ pub fn get_latest_compaction_entry(entries: &[Value]) -> Option<&Value> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRef {
-    pub provider: String,
-    pub model_id: String,
+    /// `undefined` on the TS side serializes to omission; absent fields
+    /// (e.g. an assistant message without provider/model) stay `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
 }
 
 /// Tree node for `get_tree()` — defensive copy of the session structure.
@@ -613,24 +618,25 @@ fn get_session_context_settings(path: &[Value]) -> (String, Option<ModelRef>) {
             }
             "model_change" => {
                 model = Some(ModelRef {
-                    provider: entry.get("provider").and_then(Value::as_str).unwrap_or_default().to_string(),
-                    model_id: entry.get("modelId").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    provider: entry.get("provider").and_then(Value::as_str).map(str::to_string),
+                    model_id: entry.get("modelId").and_then(Value::as_str).map(str::to_string),
                 });
             }
             "message" => {
                 let message = entry.get("message");
                 if message.and_then(|m| m.get("role")).and_then(Value::as_str) == Some("assistant") {
+                    // TS reads `message.provider` / `message.model` directly;
+                    // missing fields are `undefined` and drop out of the
+                    // serialized shape (leaving `model: {}`).
                     model = Some(ModelRef {
                         provider: message
                             .and_then(|m| m.get("provider"))
                             .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
+                            .map(str::to_string),
                         model_id: message
                             .and_then(|m| m.get("model"))
                             .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
+                            .map(str::to_string),
                     });
                 }
             }
@@ -2884,6 +2890,48 @@ mod tests {
         assert_eq!(entries, before);
     }
 
+    #[test]
+    fn migrate_no_header_treated_as_v1() {
+        // TS: `header?.version ?? 1` — no session header means v1, so the
+        // v1→v2 step (id/parentId assignment) runs even without a header.
+        let mut entries = vec![
+            json!({ "type": "message", "message": { "role": "user", "content": "one" } }),
+        ];
+        migrate_session_entries(&mut entries);
+        assert!(entries[0].get("id").and_then(Value::as_str).is_some_and(|i| !i.is_empty()));
+        assert!(entries[0].get("parentId").is_some_and(Value::is_null));
+    }
+
+    #[test]
+    fn migrate_null_or_absent_version_is_v1() {
+        for header in [
+            json!({ "type": "session", "id": "h1", "cwd": "/test" }),
+            json!({ "type": "session", "version": null, "id": "h1", "cwd": "/test" }),
+        ] {
+            let mut entries = vec![
+                header,
+                json!({ "type": "message", "message": { "role": "user", "content": "one" } }),
+            ];
+            migrate_session_entries(&mut entries);
+            assert_eq!(entries[0].get("version").and_then(Value::as_i64), Some(3));
+            assert!(entries[1].get("id").and_then(Value::as_str).is_some_and(|i| !i.is_empty()));
+        }
+    }
+
+    #[test]
+    fn migrate_numeric_string_version_coerces() {
+        // JS relational ops coerce: "2" >= 3 is false, "2" < 2 is false,
+        // "2" < 3 is true — so only the v2→v3 step runs (no ids assigned).
+        let mut entries = vec![
+            json!({ "type": "session", "version": "2", "id": "h1", "cwd": "/test" }),
+            json!({ "type": "message", "message": { "role": "hookMessage", "content": "hm" } }),
+        ];
+        migrate_session_entries(&mut entries);
+        assert_eq!(entries[0].get("version").and_then(Value::as_i64), Some(3));
+        assert_eq!(entries[1]["message"]["role"].as_str(), Some("custom"));
+        assert!(entries[1].get("id").is_none(), "v1→v2 must be skipped for coerced version 2");
+    }
+
     // ---- append operations / projection (build-context.test.ts) -----------
 
     #[test]
@@ -2938,8 +2986,20 @@ mod tests {
         assert!(manager.build_session_context().model.is_none());
         manager.append_model_change("anthropic", "claude-3");
         let model = manager.build_session_context().model.unwrap();
-        assert_eq!(model.provider, "anthropic");
-        assert_eq!(model.model_id, "claude-3");
+        assert_eq!(model.provider.as_deref(), Some("anthropic"));
+        assert_eq!(model.model_id.as_deref(), Some("claude-3"));
+    }
+
+    #[test]
+    fn assistant_message_without_model_fields_yields_empty_model() {
+        // TS sets `model = { provider: message.provider, modelId: message.model }`
+        // for any assistant message; missing fields are undefined and drop out
+        // of JSON serialization, leaving `model: {}`.
+        let entries = vec![msg_entry("e1", None, "assistant", json!("hi"))];
+        let manager = SessionManager::in_memory("/test", None, entries, &det_gen()).unwrap();
+        let model = manager.build_session_context().model.unwrap();
+        let value = serde_json::to_value(&model).unwrap();
+        assert_eq!(value, json!({}));
     }
 
     #[test]
