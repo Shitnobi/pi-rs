@@ -83,6 +83,31 @@ pub fn node_stat_is_dir(path: &str) -> Result<bool, String> {
     }
 }
 
+/// TS `getFileRevision` (coding-agent `utils/paths.ts` l36):
+/// `` `${dev}:${ino}:${size}:${mtimeNs}:${ctimeNs}` `` with bigint stat
+/// values (mtimeNs/ctimeNs are total nanoseconds). Failure → `None`
+/// (not an error).
+#[cfg(unix)]
+pub fn file_revision(path: &str) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime_ns = meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128;
+    let ctime_ns = meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128;
+    Some(format!(
+        "{}:{}:{}:{}:{}",
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        mtime_ns,
+        ctime_ns
+    ))
+}
+
+#[cfg(not(unix))]
+pub fn file_revision(_path: &str) -> Option<String> {
+    None
+}
+
 /// Node's `fsPromises.readdir` (names only).
 pub fn node_readdir(path: &str) -> Result<Vec<String>, String> {
     match std::fs::read_dir(path) {

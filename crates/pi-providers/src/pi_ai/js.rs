@@ -18,6 +18,7 @@
 //!   `String` cannot represent them, so `js_json_parse` errors
 //! - numbers beyond f64 range (`1e400`): V8 yields `Infinity`, serde errors
 
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 // ============================================================================
@@ -49,6 +50,10 @@ fn parse_radix(digits: &str, radix: u32) -> f64 {
     // JS converts the mathematical value, rounded to nearest f64. Accumulating
     // in u128 is exact up to ~3.4e38; beyond that fall back to f64 accumulation
     // (may differ from correctly-rounded by 1 ulp for extreme inputs).
+    // Number("0x") / Number("0b") / Number("0o") are NaN (node-verified).
+    if digits.is_empty() {
+        return f64::NAN;
+    }
     let mut acc: u128 = 0;
     let mut overflow = false;
     for c in digits.chars() {
@@ -344,7 +349,12 @@ impl JsonScanner {
         self.scan_value(&mut i)?;
         self.skip_ws(&mut i);
         if i < self.len() {
-            return Err(self.err_at(i, "Unexpected non-whitespace character after JSON"));
+            // V8 wording has a single "JSON" here, not err_at's "<msg> in JSON".
+            let (line, col) = self.line_col(i);
+            return Err(format!(
+                "Unexpected non-whitespace character after JSON at position {} (line {} column {})",
+                self.utf16[i], line, col
+            ));
         }
         Ok(())
     }
@@ -393,10 +403,13 @@ impl JsonScanner {
                 };
                 return Err(self.err_at(*i, msg));
             }
-            if self.chars[*i] == '}' {
+            if self.chars[*i] == '}' && first {
                 *i += 1;
                 return Ok(());
             }
+            // After a comma, `}` is a trailing comma — V8 demands a property
+            // name (node: {"a":1,} → "Expected double-quoted property name
+            // ... at position 7").
             let name_msg = if first {
                 "Expected property name or '}'"
             } else {
@@ -648,7 +661,7 @@ mod tests {
 
     #[test]
     fn trim_matches_js() {
-        assert_eq!(js_trim("  x\u{00A0}"), "x\u{00A0}");
+        assert_eq!(js_trim("  x\u{00A0}"), "x"); // NBSP is JS WhiteSpace — node-verified
         assert_eq!(js_trim("\u{FEFF}x"), "x");
         assert_eq!(js_trim("x\u{2028}"), "x");
         assert_eq!(js_trim("  "), "");
@@ -682,9 +695,10 @@ mod tests {
         assert!(js_to_number("+.").is_nan());
         assert_eq!(js_to_number("1.5e2"), 150.0);
         assert!(js_to_number("０").is_nan()); // fullwidth digit
-        assert!(js_to_number("5.e3"), 5000.0);
+        assert_eq!(js_to_number("5.e3"), 5000.0);
         assert!(js_to_number("inf").is_nan());
-        assert!(js_to_number("Infinity ").is_nan());
+        // "Infinity " trims to "Infinity" — node-verified
+        assert!(js_to_number("Infinity ").is_infinite());
     }
 
     #[test]
@@ -697,7 +711,8 @@ mod tests {
         assert_eq!(js_number_to_string(300000.0), "300000");
         assert_eq!(js_number_to_string(1.0 / 1000.0), "0.001");
         assert_eq!(js_number_to_string(5e-7), "5e-7");
-        assert_eq!(js_number_to_string(0.0005 / 1000.0), "4.999999999999999e-10");
+        assert_eq!(js_number_to_string(0.0005 / 1000.0), "5e-7"); // node-verified
+        assert_eq!(js_number_to_string(5e-10), "5e-10");
         assert_eq!(js_number_to_string(1e19), "10000000000000000000");
         assert_eq!(js_number_to_string(1e21), "1e+21");
         assert_eq!(js_number_to_string(1e22 / 1000.0), "10000000000000000000");
@@ -712,7 +727,10 @@ mod tests {
 
     #[test]
     fn json_parse_valid() {
-        assert_eq!(js_json_parse(" {\"a\": [1, 2.5, null, true]} ").unwrap(), json!({"a": [1, 2.5, null, true]}));
+        // All numbers normalize to f64 (JS number semantics), so compare the
+        // re-serialized form, not serde_json Value equality (u64 vs f64).
+        let v = js_json_parse(" {\"a\": [1, 2.5, null, true]} ").unwrap();
+        assert_eq!(js_stringify_pretty(&v), "{\n  \"a\": [\n    1,\n    2.5,\n    null,\n    true\n  ]\n}");
         // JS number semantics: integers are doubles.
         let v = js_json_parse("[1, 1.0, 100000000000000000000]").unwrap();
         assert_eq!(js_stringify_pretty(&v), "[\n  1,\n  1,\n  100000000000000000000\n]");
@@ -729,7 +747,7 @@ mod tests {
             ("[", "Unexpected end of JSON input"),
             ("{\"a\"", "Expected ':' after property name in JSON at position 4 (line 1 column 5)"),
             ("{\"a\":1", "Expected ',' or '}' after property value in JSON at position 6 (line 1 column 7)"),
-            ("{\"a\":}", "Unexpected token '}', \"{a\":}\" is not valid JSON"),
+            ("{\"a\":}", "Unexpected token '}', \"{\"a\":}\" is not valid JSON"),
             ("{a:1}", "Expected property name or '}' in JSON at position 1 (line 1 column 2)"),
             ("{\"a\":1,}", "Expected double-quoted property name in JSON at position 7 (line 1 column 8)"),
             ("[1,]", "Unexpected token ']', \"[1,]\" is not valid JSON"),
@@ -764,7 +782,7 @@ mod tests {
             ("  \n  x", "Unexpected token 'x', \"  \n  x\" is not valid JSON"),
             ("[1,2,", "Unexpected end of JSON input"),
             ("\"\\u12\"", "Bad Unicode escape in JSON at position 5 (line 1 column 6)"),
-            ("{\"a\":undefined}", "Unexpected token 'u', \"{a\":undefined}\" is not valid JSON"),
+            ("{\"a\":undefined}", "Unexpected token 'u', \"{\"a\":undefined}\" is not valid JSON"),
             ("[undefined]", "Unexpected token 'u', \"[undefined]\" is not valid JSON"),
             ("-Infinity", "No number after minus sign in JSON at position 1 (line 1 column 2)"),
             ("1e+", "Exponent part is missing a number in JSON at position 3 (line 1 column 4)"),

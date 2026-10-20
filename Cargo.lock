@@ -482,7 +482,9 @@ dependencies = [
 name = "pi-providers"
 version = "0.1.0"
 dependencies = [
+ "indexmap",
  "pi-core",
+ "pi-tools",
  "serde",
  "serde_json",
 ]

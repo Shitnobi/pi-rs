@@ -5,5 +5,7 @@ edition = "2021"
 
 [dependencies]
 pi-core = { path = "../pi-core" }
+pi-tools = { path = "../pi-tools" }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "unbounded_depth"] }
+indexmap = { version = "2", features = ["serde"] }

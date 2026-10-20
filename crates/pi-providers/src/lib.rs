@@ -9,6 +9,7 @@
 //! - auth/composer wave: auth_storage, provider_composer, remote_catalog
 //! - facade wave (later): model_runtime, model_registry
 
+pub mod error;
 pub mod pi_ai;
 pub mod auth_guidance;
 pub mod auth_storage;
