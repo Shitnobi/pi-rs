@@ -29,8 +29,34 @@ Landed on main through 0f55321:
   Clippy at baseline (~349 warnings).
 
 **Next steps:** remaining core modules per roadmap (agent-session,
-session-manager, settings, extensions, tools/*), each wave parity-green
+session-manager, extensions, tools/*), each wave parity-green
 via new harness entries.
+
+**Checkpoint update (2026-10-20, core-modules waves):**
+- `pi-core` module wave (9aed24d): event_bus, timings, slash_commands,
+  settings_defaults. `settings_schema.rs` in pi-providers (adecf45),
+  `prompt_templates.rs` (4bf7b40), `skills.rs` (c11d060).
+- **settings-manager.ts ported** (e8724c9): `pi-core/src/settings_manager.rs`
+  (~3500 LOC, 69 tests). Settings = raw serde_json Values; StorageStorage
+  trait + File/InMemory backends (proper-lockfile semantics); async TS
+  writeQueue → sync VecDeque drained by flush()/reload(); env/platform/
+  uuid injected via SettingsManagerOptions; create() requires agent_dir.
+- **Core-module parity wave** (1bc7b9d): `core_harness.rs` + 155 cases
+  (event-bus 34, timings 21, slash-commands 18, settings-defaults 5,
+  settings-schema 77). Full parity 1915/1915 at that commit.
+- **settings-manager parity wave** (37a06cd): 121 sm-* cases; differential
+  found + fixed 4 genuine divergences (raw-null persistence in
+  setShellPath/setShellCommandPrefix/setEnabledModels, V8 snippet
+  raw-embed + >20-unit truncation in parse_json_like, JS object-spread
+  semantics in set/getWarnings, raw-f64 outputPad). ts-harness installs a
+  startup pass-through dispatcher on require('crypto').randomUUID — the
+  crypto ESM namespace snapshots named exports, per-case patches are
+  invisible (probed; see top of ts-harness.js).
+- Parity harness still pending for: prompt-templates, skills (delegate
+  notes: per-case temp dirs, don't assert multi-template directory order).
+- Remaining queue: agent-session (tokio per G8), session-manager,
+  extensions, tools/*, diagnostics; then the shared typebox-walker refactor
+  (model_config + settings_schema).
 
 **Resume note (2026-10-19 23:59 — partial provider_composer work in tree):**
 `crates/pi-providers/src/provider_composer.rs` + `pi_ai/compat.rs` (new) +
