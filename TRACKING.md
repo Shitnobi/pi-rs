@@ -49,6 +49,18 @@ Landed on main (wave-a merged as f4920d2, wave-b as b42e897+6ab79f4):
 Each wave parity-green via new harness entries, then batter targets +
 regressions.
 
+**Resume note (2026-10-19 23:59 — partial provider_composer work in tree):**
+`crates/pi-providers/src/provider_composer.rs` + `pi_ai/compat.rs` (new) +
+`pi_ai/{credential,mod,provider}.rs` edits are UNCOMMITTED and DO NOT BUILD
+(~26 errors: private ModelType import in pi_ai::models, fn-arg mismatches
+~line 655+). Finish the port vs
+/tmp/pi-repo/packages/coding-agent/src/core/provider-composer.ts, then
+composer_harness.rs, TS harness entries + ~120 parity cases for
+auth-storage/remote-catalog/provider-composer, then the facade wave
+(model-runtime, model-registry + harness + ~80 cases), full parity,
+workspace tests, clippy, checkpoint, push. Trap: serde_json preserve_order
+Map::remove is swap_remove — use shift_remove for JS-delete semantics.
+
 **Resume note (2026-10-19 23:24, wound down):** survey of the auth/composer
 wave just started, nothing written yet. Correct file names/sizes:
 `core/auth-storage.ts` (507 LOC), `core/provider-composer.ts` (732 LOC),
