@@ -411,14 +411,14 @@ pub fn refresh_with_remote_catalog(
 	let checked_at = now;
 	// 304: the overlay already holds the stored body.
 	if response.status == 304 && stored.is_some() {
-		let persist = stored.as_ref().unwrap().with_checked_at(checked_at);
+		let persist = stored.unwrap().with_checked_at(checked_at);
 		let accepted = accept();
 		publishes.push(PublishRecord { persist: Some(persist), update: false, accepted });
 		return Ok(());
 	}
 	if response.status == 404 || response.status == 501 {
 		let empty = StoredCatalog::from_value(&json!({ "models": [] }));
-		let persist = stored.as_ref().unwrap_or(&empty).cleared(checked_at);
+		let persist = stored.unwrap_or(&empty).cleared(checked_at);
 		let accepted = accept();
 		publishes.push(PublishRecord { persist: Some(persist), update: false, accepted });
 		return Ok(());
@@ -426,7 +426,7 @@ pub fn refresh_with_remote_catalog(
 	if !response.ok {
 		// Transient failure: keep the cached body and its validator.
 		let empty = StoredCatalog::from_value(&json!({ "models": [] }));
-		let persist = stored.as_ref().unwrap_or(&empty).with_checked_at(checked_at);
+		let persist = stored.unwrap_or(&empty).with_checked_at(checked_at);
 		let accepted = accept();
 		publishes.push(PublishRecord { persist: Some(persist), update: false, accepted });
 		return Err(JsError::new(format!(
