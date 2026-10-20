@@ -1,0 +1,109 @@
+# BOOTSTRAPME — automated machine setup for an agent
+
+You are an agent on a fresh machine. This repo (pi-rs) has just been cloned.
+Your job: make the project fully operational, including the differential
+parity suite. Work through the steps below **in order**. Each step tells you
+how to check whether it is already done — skip completed steps (idempotent).
+
+Repo layout note: the patch file referenced in step 3 lives in this repo at
+`parity/ts-repo/lexmarkdown-seam.patch` (relative to the pi-rs repo root —
+your current working directory should be that root).
+
+## Step 0 — Verify this repo
+
+- Confirm `Cargo.toml`, `crates/`, `parity/`, `parity/ts-repo/lexmarkdown-seam.patch`
+  all exist. If not, you are not in the pi-rs repo root; `cd` there first.
+
+## Step 1 — Toolchain
+
+Check, and install if missing:
+
+- **Rust**: `rustc --version` (developed on 1.97.x). If missing or older than
+  that, install via <https://rustup.rs> (stable toolchain is fine).
+- **Node.js 24**: `node --version` must report v24.x — the parity TS harness
+  imports the original repo's TUI `.ts` source directly via Node 24
+  type-stripping. If missing/wrong major version, install Node 24
+  (e.g. via nvm: `nvm install 24`, or nodesource, or your package manager).
+
+## Step 2 — Clone the original pi (TypeScript) repo
+
+The parity harness expects it at `/tmp/pi-repo` (the defaults for `PI_DIST`,
+`PI_TUI_SRC` assume this path). Only clone if absent:
+
+```bash
+test -d /tmp/pi-repo/.git || git clone https://github.com/earendil-works/pi /tmp/pi-repo
+cd /tmp/pi-repo
+git fetch origin
+git checkout --detach 698a2d2   # the commit the parity suite was developed against
+```
+
+If `/tmp/pi-repo` exists but is on a different commit, `git checkout --detach
+698a2d2` anyway. Do NOT `git pull`/update past this commit — parity results
+are only guaranteed against it.
+
+## Step 3 — Apply the lexMarkdown test-seam patch
+
+`parity/ts-repo/lexmarkdown-seam.patch` adds a `lexMarkdown()` export to the
+original repo's `packages/tui/src/components/markdown.ts`. It is a test seam
+(required by the Rust port's marked-lexer differential tests) that exists
+nowhere upstream — this patch file is the only durable copy.
+
+```bash
+cd /tmp/pi-repo
+git apply /ABSOLUTE/PATH/TO/pi-rs/parity/ts-repo/lexmarkdown-seam.patch
+```
+
+Idempotency: first run `git status --short -- packages/tui/src/components/markdown.ts`.
+If it already shows the file as modified, the patch is applied — skip.
+If `git apply` fails, check `git diff` — the seam may already be present
+(look for `export function lexMarkdown`); only apply if it is missing.
+
+Leave the change uncommitted in `/tmp/pi-repo` (a pristine checkout is what
+the patch targets; committing it locally is also acceptable but unnecessary).
+
+## Step 4 — Install deps and build the original repo
+
+The TS harness runs the **built dist** at
+`/tmp/pi-repo/packages/coding-agent/dist/index.js`, which is not in git:
+
+```bash
+cd /tmp/pi-repo
+npm install
+npm run build
+```
+
+(`npm run build` compiles all workspaces in dependency order.) Idempotency:
+skip `npm run build` if `packages/coding-agent/dist/index.js` already exists
+and `packages/tui/src/components/markdown.ts`'s mtime predates the dist —
+when in doubt, rebuild; it is safe to rerun.
+
+## Step 5 — Build and test this repo
+
+From the pi-rs repo root:
+
+```bash
+cargo build
+cargo test
+```
+
+## Step 6 — Run the parity suite (end-to-end verification)
+
+```bash
+cd /path/to/pi-rs/parity
+node run-parity.mjs
+```
+
+Success criteria: all cases pass (the repo's README/TRACKING.md record the
+current case count; 239+ cases as of the last update). If markdown-lexer
+cases fail, re-check step 3 (missing seam) and step 1 (Node < 24).
+
+## Troubleshooting / notes
+
+- **Env overrides**: if the original repo is NOT at `/tmp/pi-repo`, export
+  `PI_DIST=<repo>/packages/coding-agent/dist/index.js` and
+  `PI_TUI_SRC=<repo>/packages/tui/src/utils.ts` before running parity.
+- **`~/.pi/agent/bin`** (fd, rg): auto-downloaded by the pi agent at runtime;
+  no action needed.
+- Push remote for this repo is the `Shitnobi/pi-rs` fork (see `MIGRATION.md`
+  for human-oriented background).
+- Do not modify anything inside `/tmp/pi-repo` beyond step 3's patch.
