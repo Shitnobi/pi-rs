@@ -1085,4 +1085,30 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       URL subset deviations, fake-saver harness design).
 - [x] CLI Stage A: `pi-cli/src/config.rs`, `migrations.rs`, `cli/args.rs`
       (commit `626e091`).
-- [ ] Agent-session tranches (tokio, per plan §5.5).
+- [x] Session-manager + small-modules wave (commits `7bddbaa`, `171de2b`):
+      `session_manager.rs` (JSONL sessions, streaming load, migrate,
+      projections), `nested_tool_calls.rs`, `pi_manifest.rs`,
+      `output_guard.rs`, `defaults.rs`, `diagnostics.rs`. Parity: 261 new
+      cases — `session-manager` (62 fn-style) + `sess-manager` (129
+      op-style/manager) + nested-tool-calls (28) + pi-manifest (22) +
+      output-guard (17) + defaults (3), all fail=0. Divergence fixes in
+      `171de2b`: pi-core migrate gate (`header?.version ?? 1` + JS
+      relational coercion — no-header migrates, string "2" runs v2→v3);
+      quoted-8-hex id normalization inside readFile JSONL strings; fn-style
+      migrate id normalization (dist imports randomUUID from "crypto" as
+      ESM — the crypto dispatcher override is invisible to it, ESM
+      namespace snapshot); ambient cwd → `<cwd>` (TS process.cwd() vs Rust
+      AMBIENT_CWD "/"); listDir ENOENT Node-style message; ModelRef
+      Option fields (assistant message without provider/model → model {});
+      mtimes non-integer silently skipped (Node utimesSync with Invalid
+      Date is a no-op). NOTE: two parallel session-manager ports exist —
+      crates/pi-session (older, used by the `session-manager` fn-style
+      harness) and crates/pi-core (new wave, used by `sess-manager`);
+      reconcile/dedupe before the agent-session wave touches sessions.
+      ENV NOTE: /tmp gets wiped by a cleaner mid-session — the TS
+      reference now lives durably at /home/shinobi/pi-repo with a
+      /tmp/pi-repo symlink (recreate with `ln -sfn /home/shinobi/pi-repo
+      /tmp/pi-repo`); write long-running outputs under /home/shinobi.
+- [ ] Agent-session tranches (tokio, per plan §5.5). Wave-1 spec ready:
+      /home/shinobi/agent-session-wave1-spec.md (tranches 0–2: pi-agent
+      skeleton, message conversion, tool-call pipeline).
