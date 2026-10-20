@@ -75,7 +75,7 @@ impl ModelsStore for InMemoryCodingAgentModelsStore {
 		options: Option<&ModelsStoreOperationOptions<'_>>,
 	) -> Result<(), JsError> {
 		check_aborted(options)?;
-		self.entries.remove(provider_id);
+		self.entries.remove(provider_id); // BTreeMap (sorted) — pre-existing design
 		Ok(())
 	}
 }
@@ -242,7 +242,7 @@ impl<B: AuthStorageBackend> ModelsStore for FileModelsStore<B> {
 		let latest = self.storage.with_lock(
 			&mut |content| {
 				let mut current = Self::parse_stored(content)?;
-				current.remove(provider_id);
+				current.shift_remove(provider_id); // JS delete preserves order
 				let latest = current.clone();
 				let next = js_stringify_pretty(&Value::Object(current));
 				Ok(LockResult { result: Some(latest), next: Some(next) })

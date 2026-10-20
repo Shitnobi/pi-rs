@@ -233,7 +233,7 @@ impl CallToolResult {
     /// result, key order preserved, `_meta` dropped.
     pub fn script_result(&self) -> Value {
         let mut copy = self.fields.clone();
-        copy.remove("_meta");
+        copy.shift_remove("_meta"); // JS delete preserves order
         Value::Object(copy)
     }
 }
