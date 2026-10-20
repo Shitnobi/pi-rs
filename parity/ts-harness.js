@@ -2385,6 +2385,492 @@ async function runModule(tool, args, cwd) {
 				throw new Error("unknown provider-composer fn: " + args.fn);
 		}
 	}
+	if (tool === "model-runtime" || tool === "model-registry") {
+		const mr = require(path.join(distDir, "core", "model-runtime.js"));
+		const reg = require(path.join(distDir, "core", "model-registry.js"));
+		// Env scrub: both sides own the environment completely.
+		for (const key of Object.keys(process.env)) delete process.env[key];
+		Object.assign(process.env, args.env ?? {});
+		delete process.env.PI_OFFLINE;
+		if (args.offline) process.env.PI_OFFLINE = "1";
+		// Scripted clock.
+		Date.now = () => args.nowMs ?? 0;
+		// LAZY scripted catalog fetch: only errors when the runtime actually
+		// performs a network request without a spec (Rust catalog-hook mirror).
+		const fetchSpec = args.fetch ?? null;
+		globalThis.fetch = async () => {
+			if (!fetchSpec) throw new Error("no scripted fetch response");
+			const status = fetchSpec.status ?? 200;
+			return {
+				status,
+				ok: status >= 200 && status < 300,
+				headers: {
+					get: (name) =>
+						name === "last-modified" ? (fetchSpec.lastModified ?? null) : name === "etag" ? (fetchSpec.etag ?? null) : null,
+				},
+				json: async () => fetchSpec.body ?? null,
+				text: async () => "",
+			};
+		};
+		const { mkdtempSync, writeFileSync } = require("fs");
+		const os = require("os");
+		const tmp = mkdtempSync(path.join(os.tmpdir(), "pi-mr-"));
+		const authPath = path.join(tmp, "auth.json");
+		writeFileSync(authPath, args.authJson ?? "{}");
+		let modelsPath;
+		if (typeof args.modelsJson === "string") {
+			modelsPath = path.join(tmp, "models.json");
+			writeFileSync(modelsPath, args.modelsJson);
+		}
+		// Recording models store (seeded from args.stored).
+		const storeOps = [];
+		const storedEntries = new Map(Object.entries(args.stored ?? {}));
+		const clone = (v) => JSON.parse(JSON.stringify(v));
+		const modelsStore = {
+			read: async (providerId) => {
+				storeOps.push({ op: "read", providerId });
+				const entry = storedEntries.get(providerId);
+				return entry === undefined ? undefined : clone(entry);
+			},
+			write: async (providerId, entry) => {
+				const value = clone(entry);
+				storeOps.push({ op: "write", providerId, entry: value });
+				storedEntries.set(providerId, value);
+			},
+			delete: async (providerId) => {
+				storeOps.push({ op: "delete", providerId });
+				storedEntries.delete(providerId);
+			},
+		};
+		const routes = [];
+		const runtime = await mr.ModelRuntime.create({
+			authPath,
+			modelsPath: typeof args.modelsJson === "string" ? modelsPath : null,
+			modelsStore,
+			allowModelNetwork: args.allowModelNetwork ?? false,
+			refreshOnCreate: args.refreshOnCreate ?? false,
+		});
+		const target = tool === "model-registry" ? new reg.ModelRegistry(runtime) : runtime;
+
+		const stepError = (e) => {
+			const causes = [];
+			let cause = e && e.cause;
+			while (cause) {
+				causes.push(cause instanceof Error ? cause.message : String(cause));
+				cause = cause && cause.cause;
+			}
+			return { error: e instanceof Error ? e.message : String(e), causes };
+		};
+		const providerSummary = (p) =>
+			p
+				? { id: p.id, name: p.name, baseUrl: p.baseUrl ?? null, headers: p.headers ? { ...p.headers } : null }
+				: null;
+		const checkValue = (check) =>
+			check ? (check.source !== undefined ? { source: check.source, type: check.type } : { type: check.type }) : null;
+		const authResultValue = (resolution) =>
+			resolution
+				? {
+						auth: resolution.auth,
+						env: resolution.env ? { ...resolution.env } : null,
+						source: resolution.source ?? null,
+					}
+				: null;
+		const chatModelRef = (step) => {
+			const model = runtime.getModel(step.model?.provider, step.model?.modelId);
+			if (!model) throw new Error(`model not found: ${step.model?.provider}/${step.model?.modelId}`);
+			return model;
+		};
+		const typedModelRef = (step, type) => {
+			const model = runtime.getModelOfType(type, step.model?.provider, step.model?.modelId);
+			if (!model) throw new Error(`model not found: ${step.model?.provider}/${step.model?.modelId}`);
+			return model;
+		};
+		const modelTypeArg = (step) => {
+			if (step.type === "chat" || step.type === "image" || step.type === "classifier") return step.type;
+			throw new Error(`unknown model type: ${JSON.stringify(step.type)}`);
+		};
+		const normalizeTimestamp = (value) =>
+			value && typeof value === "object" && "timestamp" in value ? { ...value, timestamp: 0 } : value;
+		const buildNativeProvider = (spec) => {
+			const chatOnly = (models) => (models ?? []).filter((model) => !model.type || model.type === "chat");
+			const provider = {
+				id: spec.id,
+				name: spec.name ?? spec.id,
+				baseUrl: spec.baseUrl,
+				headers: spec.headers,
+				auth: {},
+				getModels: () => chatOnly(spec.models),
+				getAllModels: () => spec.models ?? [],
+				stream: () => {},
+				streamSimple: () => {},
+			};
+			for (const impl of Object.values(spec.images ?? {})) {
+				provider.generateImages = async () => ({ marker: impl.marker ?? "images" });
+				break;
+			}
+			for (const impl of Object.values(spec.classifiers ?? {})) {
+				provider.classify = async () => ({ marker: impl.marker ?? "classify" });
+				break;
+			}
+			return provider;
+		};
+		const buildExtensionConfig = (spec) => {
+			const config = {};
+			if (spec.name !== undefined) config.name = spec.name;
+			if (spec.baseUrl !== undefined) config.baseUrl = spec.baseUrl;
+			if (spec.apiKey !== undefined) config.apiKey = spec.apiKey;
+			if (spec.api !== undefined) config.api = spec.api;
+			if (spec.headers !== undefined) config.headers = spec.headers;
+			if (spec.authHeader !== undefined) config.authHeader = spec.authHeader;
+			if (spec.models !== undefined) config.models = spec.models;
+			if (spec.oauth) {
+				const oauth = spec.oauth;
+				config.oauth = {
+					name: oauth.name,
+					isSubscription: oauth.isSubscription,
+					login: async () => {
+						throw new Error("login not exercised");
+					},
+					refreshToken: async () => {
+						throw new Error("refreshToken not exercised");
+					},
+					getApiKey: (credential) =>
+						typeof oauth.getApiKey === "string"
+							? oauth.getApiKey
+							: (credential?.[oauth.getApiKey?.field ?? "access"] ?? ""),
+				};
+			}
+			if (spec.refreshModels) {
+				const rms = spec.refreshModels;
+				config.refreshModels = async () => {
+					if (rms.error) throw new Error(rms.error);
+					return rms.models ?? [];
+				};
+			}
+			if (spec.images) {
+				config.images = {};
+				for (const [api, impl] of Object.entries(spec.images)) {
+					config.images[api] = { generateImages: async () => ({ marker: impl.marker ?? "images" }) };
+				}
+			}
+			if (spec.classifiers) {
+				config.classifiers = {};
+				for (const [api, impl] of Object.entries(spec.classifiers)) {
+					config.classifiers[api] = { classify: async () => ({ marker: impl.marker ?? "classify" }) };
+				}
+			}
+			return config;
+		};
+		const configSummary = (config) => {
+			if (!config) return null;
+			const out = {};
+			if (config.name !== undefined) out.name = config.name;
+			if (config.baseUrl !== undefined) out.baseUrl = config.baseUrl;
+			if (config.apiKey !== undefined) out.apiKey = config.apiKey;
+			if (config.api !== undefined) out.api = config.api;
+			if (config.headers !== undefined) out.headers = { ...config.headers };
+			if (config.authHeader !== undefined) out.authHeader = config.authHeader;
+			if (config.models !== undefined) out.models = config.models;
+			out.oauth = config.oauth
+				? { name: config.oauth.name, isSubscription: config.oauth.isSubscription ?? null }
+				: null;
+			out.hasRefreshModels = config.refreshModels !== undefined;
+			out.images = config.images ? Object.keys(config.images) : null;
+			out.classifiers = config.classifiers ? Object.keys(config.classifiers) : null;
+			return out;
+		};
+		const standIn = (provider, id) => ({
+			id,
+			name: id,
+			api: "a",
+			provider,
+			baseUrl: "",
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			reasoning: false,
+			contextWindow: 0,
+			maxTokens: 0,
+		});
+		const buildVirtualModel = (spec) => {
+			const routeSpec = spec.route ?? {};
+			return {
+				provider: spec.provider,
+				id: spec.id,
+				name: spec.name ?? spec.id,
+				thinkingLevels: spec.thinkingLevels,
+				contextWindow: spec.contextWindow,
+				maxTokens: spec.maxTokens,
+				route: (request) => {
+					if (routeSpec.echo) {
+						routes.push({
+							model: { provider: request.model.provider, id: request.model.id },
+							thinkingLevel: request.thinkingLevel,
+							reason: request.reason,
+							previous: request.previous
+								? {
+										model: { provider: request.previous.model.provider, id: request.previous.model.id },
+										thinkingLevel: request.previous.thinkingLevel ?? null,
+									}
+								: null,
+							failed: request.failed
+								? {
+										model: { provider: request.failed.model.provider, id: request.failed.model.id },
+										thinkingLevel: request.failed.thinkingLevel ?? null,
+										message: request.failed.message,
+									}
+								: null,
+							state: request.state ?? null,
+							messages: request.messages,
+						});
+					}
+					return {
+						model: standIn(routeSpec.provider, routeSpec.model),
+						thinkingLevel: routeSpec.thinkingLevel ?? "off",
+						state: routeSpec.state ?? undefined,
+					};
+				},
+			};
+		};
+		const noopInteraction = {
+			prompt: async () => {
+				throw new Error("login prompt not exercised");
+			},
+			notify: () => {},
+		};
+		const settleRefresh = async () => {
+			await runtime.refresh({ allowNetwork: false });
+		};
+		const refreshOptions = (step) => ({
+			allowNetwork: step.allowNetwork,
+			providers: step.providers,
+			force: step.force ?? false,
+		});
+		const refreshResultValue = (result) => ({
+			aborted: result.aborted,
+			errors: Object.fromEntries([...result.errors].map(([id, error]) => [id, error.message])),
+		});
+		const resolvedAuthValue = (auth) => {
+			if (!auth) return null;
+			const out = { ok: auth.ok };
+			if (auth.ok) {
+				if (auth.apiKey !== undefined) out.apiKey = auth.apiKey;
+				if (auth.headers !== undefined) out.headers = { ...auth.headers };
+				if (auth.baseUrl !== undefined) out.baseUrl = auth.baseUrl;
+				if (auth.env !== undefined) out.env = { ...auth.env };
+			} else {
+				out.error = auth.error;
+			}
+			return out;
+		};
+		const req = (step) => step.providerId ?? undefined;
+
+		async function runStep(step) {
+			const fn = step.fn;
+			let value;
+			switch (fn) {
+				// ---- ModelRuntime surface ----
+				case "getProviders":
+					value = runtime.getProviders().map(providerSummary);
+					break;
+				case "getModels":
+					value = runtime.getModels(req(step));
+					break;
+				case "getModel":
+					value = runtime.getModel(step.providerId, step.modelId) ?? null;
+					break;
+				case "getAllModels":
+					value = runtime.getAllModels(req(step));
+					break;
+				case "getModelsOfType":
+					value = runtime.getModelsOfType(modelTypeArg(step), req(step));
+					break;
+				case "getModelOfType":
+					value = runtime.getModelOfType(modelTypeArg(step), step.providerId, step.modelId) ?? null;
+					break;
+				case "getError":
+					value = target.getError() ?? null;
+					break;
+				case "getAvailableSnapshot":
+					value = runtime.getAvailableSnapshot();
+					break;
+				case "getAvailable":
+					value = tool === "model-registry" ? target.getAvailable() : await runtime.getAvailable(req(step));
+					break;
+				case "checkAuth":
+					value = checkValue(await runtime.checkAuth(step.providerId));
+					break;
+				case "hasConfiguredAuth":
+					value =
+						tool === "model-registry"
+							? target.hasConfiguredAuth(chatModelRef(step))
+							: runtime.hasConfiguredAuth(step.providerId);
+					break;
+				case "isUsingOAuth":
+					value =
+						tool === "model-registry"
+							? target.isUsingOAuth(chatModelRef(step))
+							: runtime.isUsingOAuth(step.providerId);
+					break;
+				case "isUsingSubscription":
+					value = runtime.isUsingSubscription(step.providerId);
+					break;
+				case "getProviderAuthStatus":
+					value = target.getProviderAuthStatus(step.providerId);
+					break;
+				case "getRegisteredProviderIds":
+					value = target.getRegisteredProviderIds();
+					break;
+				case "getRegisteredProviderConfig":
+					value = configSummary(target.getRegisteredProviderConfig(step.providerId));
+					break;
+				case "getRegisteredNativeProvider":
+					value = providerSummary(target.getRegisteredNativeProvider(step.providerId));
+					break;
+				case "getAuth":
+					value = authResultValue(await runtime.getAuth(step.providerId));
+					break;
+				case "getAuthModel":
+					value = authResultValue(await runtime.getAuth(chatModelRef(step)));
+					break;
+				case "getCompatibilityRequestConfig": {
+					const compatibility = runtime.getCompatibilityRequestConfig(chatModelRef(step));
+					value = {
+						headers: compatibility.headers ? { ...compatibility.headers } : null,
+						authHeader: compatibility.authHeader,
+					};
+					break;
+				}
+				case "setRuntimeApiKey":
+					await runtime.setRuntimeApiKey(step.providerId, step.apiKey);
+					value = null;
+					break;
+				case "removeRuntimeApiKey":
+					await runtime.removeRuntimeApiKey(step.providerId);
+					value = null;
+					break;
+				case "listCredentials":
+					value = (await runtime.listCredentials()).map((entry) => ({
+						providerId: entry.providerId,
+						type: entry.type,
+					}));
+					break;
+				case "login":
+					value = await runtime.login(
+						step.providerId,
+						step.type === "oauth" ? "oauth" : "api_key",
+						noopInteraction,
+					);
+					break;
+				case "logout":
+					await runtime.logout(step.providerId);
+					value = null;
+					break;
+				case "registerProvider": {
+					if (tool === "model-registry") {
+						target.registerProvider(step.providerId, buildExtensionConfig(step.config));
+					} else {
+						runtime.registerProvider(step.providerId, buildExtensionConfig(step.config));
+					}
+					if (step.settle) await settleRefresh();
+					value = null;
+					break;
+				}
+				case "registerNativeProvider": {
+					const provider = buildNativeProvider(step.provider);
+					if (tool === "model-registry") {
+						target.registerProvider(provider);
+					} else {
+						runtime.registerNativeProvider(provider);
+					}
+					if (step.settle) await settleRefresh();
+					value = null;
+					break;
+				}
+				case "unregisterProvider":
+					target.unregisterProvider(step.providerId);
+					if (step.settle) await settleRefresh();
+					value = null;
+					break;
+				case "registerVirtualModel":
+					target.registerVirtualModel(buildVirtualModel(step.definition));
+					if (step.settle) await settleRefresh();
+					value = null;
+					break;
+				case "unregisterVirtualModel":
+					target.unregisterVirtualModel(step.providerId, step.modelId);
+					if (step.settle) await settleRefresh();
+					value = null;
+					break;
+				case "resolveModel": {
+					const model = chatModelRef(step);
+					const route = await runtime.resolveModel(model, step.messages ?? [], {
+						reason: step.reason ?? "direct",
+						thinkingLevel: step.thinkingLevel ?? "off",
+						failed: step.failed ?? undefined,
+						state: step.state ?? undefined,
+					});
+					value = { model: route.model, thinkingLevel: route.thinkingLevel, state: route.state ?? null };
+					break;
+				}
+				case "refresh":
+					value = refreshResultValue(await target.refresh(refreshOptions(step)));
+					break;
+				case "generateImages":
+					value = normalizeTimestamp(await target.generateImages(typedModelRef(step, "image"), step.context ?? {}));
+					break;
+				case "classify":
+					value = normalizeTimestamp(await target.classify(typedModelRef(step, "classifier"), step.context ?? {}));
+					break;
+				// ---- ModelRegistry facade-only reads ----
+				case "getAll":
+					value = target.getAll();
+					break;
+				case "find":
+					value = target.find(step.providerId, step.modelId) ?? null;
+					break;
+				case "findOfType":
+					value = target.findOfType(modelTypeArg(step), step.providerId, step.modelId) ?? null;
+					break;
+				case "getApiKeyAndHeaders":
+					value = resolvedAuthValue(await target.getApiKeyAndHeaders(chatModelRef(step)));
+					break;
+				case "getProviderDisplayName":
+					value = target.getProviderDisplayName(step.providerId);
+					break;
+				case "getProviderAuth":
+					value = authResultValue(await target.getProviderAuth(step.providerId));
+					break;
+				case "getApiKeyForProvider":
+					value = (await target.getApiKeyForProvider(step.providerId)) ?? null;
+					break;
+				case "getAvailableOfType":
+					value = await target.getAvailableOfType(modelTypeArg(step), req(step));
+					break;
+				case "getProvider":
+					value = providerSummary(target.getProvider(step.providerId));
+					break;
+				default:
+					throw new Error(`unknown ${tool} fn: ${fn}`);
+			}
+			return { result: value === undefined ? null : value };
+		}
+
+		const steps = Array.isArray(args.steps) ? args.steps : [args];
+		const results = [];
+		let settleSeen = false;
+		for (const step of steps) {
+			if (step.settle) settleSeen = true;
+			try {
+				results.push(await runStep(step));
+			} catch (e) {
+				results.push(stepError(e));
+			}
+		}
+		const out = { results };
+		if (!settleSeen) out.storeOps = storeOps;
+		out.routes = routes;
+		return { result: out };
+	}
 	return undefined;
 }
 

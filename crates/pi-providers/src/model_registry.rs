@@ -65,6 +65,12 @@ impl ModelRegistry {
 		&self.runtime
 	}
 
+	/// Mutable access to the wrapped runtime (harness-supporting addition;
+	/// TS exposes the runtime publicly and callers mutate it directly).
+	pub fn runtime_mut(&mut self) -> &mut ModelRuntime {
+		&mut self.runtime
+	}
+
 	/// Reload models.json (TS: "await before making synchronous registry
 	/// reads"; sync here).
 	pub fn refresh(

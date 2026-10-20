@@ -337,7 +337,7 @@ fn headers_value(headers: Option<&[(String, String)]>) -> Value {
 	}
 }
 
-fn provider_headers_value(headers: Option<&ProviderHeaders>) -> Value {
+pub fn provider_headers_value(headers: Option<&ProviderHeaders>) -> Value {
 	match headers {
 		None => Value::Null,
 		Some(headers) => Value::Object(

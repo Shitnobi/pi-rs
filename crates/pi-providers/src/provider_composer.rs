@@ -188,12 +188,30 @@ fn resolve_or_throw(config: &str, description: &str, env: Option<&Env>) -> Resul
 			return Ok(value);
 		}
 	}
-	let runner = {
-		let cache = global_cache().lock().unwrap();
-		cache.runner.clone().ok_or_else(|| JsError::new("no command runner installed"))?
+	// Only command values execute through the runner; plain strings and env
+	// templates resolve without one (TS never touches the shell for them).
+	let runner: Arc<dyn CommandRunner + Send + Sync> = if is_command_config_value(config) {
+		global_cache()
+			.lock()
+			.unwrap_or_else(|p| p.into_inner())
+			.runner
+			.clone()
+			.ok_or_else(|| JsError::new("no command runner installed"))?
+	} else {
+		Arc::new(NoCommandRunner)
 	};
 	resolve_config_value_or_throw(config, description, env, runner.as_ref())
 		.map_err(|error| JsError::new(error.message))
+}
+
+/// A command runner that never executes anything — commands never reach it
+/// (only non-command config values resolve through it).
+struct NoCommandRunner;
+
+impl CommandRunner for NoCommandRunner {
+	fn run(&self, _command: &str) -> Option<String> {
+		None
+	}
 }
 
 // ============================================================================

@@ -260,9 +260,9 @@ fn provider_display_name(provider_id: &str) -> String {
 		"moonshotai-cn" => "Moonshot AI CN",
 		"nvidia" => "NVIDIA",
 		"openai" => "OpenAI",
-		"openai-codex" => "OpenAI Codex",
-		"opencode" => "OpenCode",
-		"opencode-go" => "OpenCode",
+		"openai-codex" => "OpenAI Codex (legacy)",
+		"opencode" => "OpenCode Zen",
+		"opencode-go" => "OpenCode Go",
 		"openrouter" => "OpenRouter",
 		"qwen-token-plan" => "Qwen Token Plan",
 		"qwen-token-plan-cn" => "Qwen Token Plan CN",
@@ -281,6 +281,50 @@ fn provider_display_name(provider_id: &str) -> String {
 		other => other,
 	};
 	name.to_string()
+}
+
+/// Provider-level `baseUrl` from the TS builtin provider configs
+/// (`providers/*.js`). Only providers that define a static `baseUrl` in
+/// their config have one here; the others (per-request resolution, e.g.
+/// azure computes it from the request options) surface `null`.
+fn provider_base_url(provider_id: &str) -> Option<&'static str> {
+	let url = match provider_id {
+		"ant-ling" => "https://api.ant-ling.com/v1",
+		"anthropic" => "https://api.anthropic.com",
+		"baseten" => "https://inference.baseten.co/v1",
+		"cerebras" => "https://api.cerebras.ai/v1",
+		"deepseek" => "https://api.deepseek.com",
+		"fireworks" => "https://api.fireworks.ai/inference",
+		"github-copilot" => "https://api.individual.githubcopilot.com",
+		"google" => "https://generativelanguage.googleapis.com/v1beta",
+		"groq" => "https://api.groq.com/openai/v1",
+		"huggingface" => "https://router.huggingface.co/v1",
+		"kimi-coding" => "https://api.kimi.com/coding/v1",
+		"meta" => "https://api.meta.ai/v1",
+		"minimax" => "https://api.minimax.io/anthropic",
+		"minimax-cn" => "https://api.minimaxi.com/anthropic",
+		"mistral" => "https://api.mistral.ai",
+		"moonshotai" => "https://api.moonshot.ai/v1",
+		"moonshotai-cn" => "https://api.moonshot.cn/v1",
+		"nvidia" => "https://integrate.api.nvidia.com/v1",
+		"openai" => "https://api.openai.com/v1",
+		"openai-codex" => "https://chatgpt.com/backend-api",
+		"openrouter" => "https://openrouter.ai/api/v1",
+		"qwen-token-plan" => "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+		"qwen-token-plan-cn" => "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+		"qwen-token-plan-individual" => "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+		"together" => "https://api.together.ai/v1",
+		"vercel-ai-gateway" => "https://ai-gateway.vercel.sh",
+		"xai" => "https://api.x.ai/v1",
+		"xiaomi" => "https://api.xiaomimimo.com/v1",
+		"xiaomi-token-plan-ams" => "https://token-plan-ams.xiaomimimo.com/v1",
+		"xiaomi-token-plan-cn" => "https://token-plan-cn.xiaomimimo.com/v1",
+		"xiaomi-token-plan-sgp" => "https://token-plan-sgp.xiaomimimo.com/v1",
+		"zai" => "https://api.z.ai/api/coding/paas/v4",
+		"zai-coding-cn" => "https://open.bigmodel.cn/api/coding/paas/v4",
+		_ => return None,
+	};
+	Some(url)
 }
 
 /// API-key env var names per provider (vendored from pi-ai
@@ -361,6 +405,27 @@ impl ApiKeyAuth for BuiltinApiKeyAuth {
 		_signal: Option<&AbortSignal>,
 	) -> Result<Option<AuthCheck>, JsError> {
 		Ok(None)
+	}
+
+	/// TS `envApiKeyAuth.login`: prompt for the key (`{ type: "api_key",
+	/// key }`). Harness interactions that cannot prompt surface their own
+	/// error, mirroring the TS flow.
+	fn has_login(&self) -> bool {
+		true
+	}
+
+	fn login(
+		&self,
+		interaction: &mut dyn crate::pi_ai::models::AuthInteraction,
+		_options: Option<&crate::pi_ai::models::LoginOptions>,
+	) -> Result<Credential, JsError> {
+		let key = interaction.prompt(&serde_json::json!({
+			"type": "secret",
+			"message": format!("Enter {}", self.name),
+		}))?;
+		Ok(Credential::ApiKey(ApiKeyCredential::from_map(
+			[("key".to_string(), serde_json::json!(key))].into_iter().collect(),
+		)?))
 	}
 
 	fn resolve(
@@ -586,29 +651,48 @@ fn builtin_providers(
 			.filter(|m| is_model_type(m, &ModelType::Chat))
 			.map(|m| m.to_value())
 			.collect();
-		let builtin_all_values: Vec<Value> = builtin_all.iter().map(|m| m.to_value()).collect();
+		// TS provider `models:` arrays are `[...chat, ...image, ...classifier]`
+		// (`getAllBuiltinModels` order) — not the raw catalog api-group order.
+		let mut builtin_all_values: Vec<Value> = Vec::new();
+		for ty in [ModelType::Chat, ModelType::Image, ModelType::Classifier] {
+			for m in &builtin_all {
+				if is_model_type(m, &ty) {
+					builtin_all_values.push(m.to_value());
+				}
+			}
+		}
 		let chat_models: Arc<Vec<Model>> = Arc::new(
 			builtin_chat
 				.iter()
 				.filter_map(|m| serde_json::from_value(m.clone()).ok())
 				.collect(),
 		);
-		let base_url = all_values
-			.iter()
-			.find_map(|m| m.get("baseUrl").and_then(Value::as_str))
-			.map(str::to_string);
+		// Provider-level baseUrl comes from the TS provider config, not the
+		// model entries (e.g. google-vertex models carry a per-request
+		// `{location}` template while the provider defines none).
+		let base_url = provider_base_url(provider_id).map(str::to_string);
 		let auth = ProviderAuth {
 			api_key: Some(Arc::new(BuiltinApiKeyAuth::new(provider_id))),
 			oauth: None,
 		};
 		let dynamic: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
 		let state_dynamic = Arc::clone(&dynamic);
+		// TS radius keeps an optional dynamic gateway catalog
+		// (`dynamicModels ?? baselineModels`).
+		let radius_dynamic: Arc<Mutex<Option<Vec<Model>>>> = Arc::new(Mutex::new(None));
 		// `getModels` merges the remote-catalog overlay (TS
 		// `withRemoteCatalog` wraps the provider's own model list); radius
 		// is a pass-through with a static list.
 		let get_models: crate::pi_ai::provider::GetModelsFn = if provider_id == "radius" {
 			let chat_models = Arc::clone(&chat_models);
-			Box::new(move || chat_models.to_vec())
+			let radius_dynamic = Arc::clone(&radius_dynamic);
+			Box::new(move || {
+				radius_dynamic
+					.lock()
+					.unwrap_or_else(|p| p.into_inner())
+					.clone()
+					.unwrap_or_else(|| chat_models.to_vec())
+			})
 		} else {
 			let builtin_chat = builtin_chat.clone();
 			let dynamic = Arc::clone(&dynamic);
@@ -631,6 +715,46 @@ fn builtin_providers(
 		.with_base_url(base_url);
 
 		if provider_id == "radius" {
+			// TS `radius.refreshModels`: restore the persisted gateway
+			// catalog (models re-homed to this provider id replace the
+			// shipped baseline via `publish({ update })`, no persist). The
+			// legacy pre-ModelsStore import and the gateway network fetch
+			// are outside the parity surface (the runtime gates network
+			// off in every harness case).
+			let radius_dynamic = Arc::clone(&radius_dynamic);
+			let provider_id = provider_id.to_string();
+			provider = provider.with_refresh_models(Box::new(
+				move |context: &mut crate::pi_ai::models::RefreshModelsContext<'_>| {
+					let radius_dynamic = Arc::clone(&radius_dynamic);
+					if let Some(entry) = context.stored {
+						let restored: Vec<Model> = entry
+							.models
+							.iter()
+							.filter(|m| m.provider() == provider_id)
+							.filter_map(|m| match m {
+								AnyModel::Chat(model) => Some(model.clone()),
+								_ => None,
+							})
+							.collect();
+						let publication = crate::pi_ai::models::ModelsPublication {
+							persist: crate::pi_ai::models::Persist::Unchanged,
+							update: Some(Box::new(move || {
+								*radius_dynamic.lock().unwrap_or_else(|p| p.into_inner()) = Some(restored);
+							})),
+						};
+						if !(context.publish)(publication)? {
+							return Ok(());
+						}
+					}
+					if !context.allow_network || context.signal.is_some_and(AbortSignal::aborted) {
+						return Ok(());
+					}
+					// Network phase: load the gateway catalog. No parity
+					// case enables network for radius (the runtime gates it
+					// off before this point in every harness case).
+					Ok(())
+				},
+			));
 			out.push(provider);
 			continue;
 		}

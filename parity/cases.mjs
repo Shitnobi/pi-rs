@@ -6005,6 +6005,336 @@ export const cases = [
 
 		return __cases;
 	})(),
+
+// model-runtime / model-registry (facade wave). Steps-based protocol: one
+// runtime per case, `steps` run in order; `settle: true` on register steps
+// runs an explicit refresh({allowNetwork:false}) on both sides (the TS
+// register* fns fire a discarded void refresh the sync port skips).
+...(() => {
+	const mr = (name, args) => ({ tool: "model-runtime", name: "mr-" + name, args });
+	const reg = (name, args) => ({ tool: "model-registry", name: "reg-" + name, args });
+	const __cases = [];
+	const mrModel = (id, provider = "ext1", extra = {}) => ({
+		id,
+		name: id,
+		api: "openai-completions",
+		provider,
+		baseUrl: "https://ext.example",
+		input: ["text"],
+		cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0.25 },
+		reasoning: false,
+		contextWindow: 10000,
+		maxTokens: 1000,
+		...extra,
+	});
+	const mrImageModel = (id, provider) => ({ ...mrModel(id, provider), type: "image", output: ["image"], api: "openai-images" });
+	const mrClassifierModel = (id, provider) => ({ ...mrModel(id, provider), type: "classifier", contextWindow: 100, api: "openai-classifiers" });
+	const mrVirtual = (extra = {}) => ({
+		provider: "anthropic",
+		id: "vm1",
+		name: "VM One",
+		route: { provider: "anthropic", model: "claude-fable-5", thinkingLevel: "low", echo: true },
+		...extra,
+	});
+	const mrSteps = (steps, extra = {}) => ({ steps, offline: true, ...extra });
+
+	// ---- catalog basics ----
+	__cases.push(mr("providers-offline", mrSteps([{ fn: "getProviders" }])));
+	__cases.push(mr("providers-env", mrSteps(
+		[
+			{ fn: "checkAuth", providerId: "openai" },
+			{ fn: "getProviderAuthStatus", providerId: "openai" },
+			{ fn: "hasConfiguredAuth", providerId: "openai" },
+			{ fn: "isUsingOAuth", providerId: "openai" },
+			{ fn: "isUsingSubscription", providerId: "openai" },
+		],
+		{ env: { OPENAI_API_KEY: "sk-test" } },
+	)));
+	__cases.push(mr("models-all", mrSteps([{ fn: "getModels" }])));
+	__cases.push(mr("models-provider", mrSteps([{ fn: "getModels", providerId: "anthropic" }])));
+	__cases.push(mr("model-found", mrSteps([{ fn: "getModel", providerId: "anthropic", modelId: "claude-fable-5" }])));
+	__cases.push(mr("model-not-found", mrSteps([{ fn: "getModel", providerId: "anthropic", modelId: "nope" }])));
+	__cases.push(mr("models-of-type-image", mrSteps([{ fn: "getModelsOfType", type: "image" }])));
+	__cases.push(mr("models-of-type-classifier-scoped", mrSteps([{ fn: "getModelsOfType", type: "classifier", providerId: "cloudflare-workers-ai" }])));
+	__cases.push(mr("model-of-type", mrSteps([
+		{ fn: "getModelOfType", type: "image", providerId: "openrouter", modelId: "black-forest-labs/flux-3-image" },
+		{ fn: "getModelOfType", type: "image", providerId: "openrouter", modelId: "nope" },
+	])));
+	__cases.push(mr("all-models-provider", mrSteps([{ fn: "getAllModels", providerId: "openai" }])));
+	__cases.push(mr("error-clean", mrSteps([{ fn: "getError" }])));
+	__cases.push(mr("snapshot-empty", mrSteps([{ fn: "getAvailableSnapshot" }])));
+
+	// ---- availability & auth status ----
+	__cases.push(mr("available-env", mrSteps([{ fn: "getAvailable" }], { env: { OPENAI_API_KEY: "sk-test" } })));
+	__cases.push(mr("available-provider-env", mrSteps([{ fn: "getAvailable", providerId: "anthropic" }], { env: { ANTHROPIC_API_KEY: "sk-ant" } })));
+	__cases.push(mr("available-none", mrSteps([{ fn: "getAvailable" }])));
+	__cases.push(mr("check-auth-env", mrSteps([{ fn: "checkAuth", providerId: "anthropic" }], { env: { ANTHROPIC_API_KEY: "sk-ant" } })));
+	__cases.push(mr("check-auth-none", mrSteps([{ fn: "checkAuth", providerId: "openai" }])));
+	__cases.push(mr("status-env", mrSteps([{ fn: "getProviderAuthStatus", providerId: "openai" }], { env: { OPENAI_API_KEY: "sk-test" } })));
+	__cases.push(mr("status-none", mrSteps([{ fn: "getProviderAuthStatus", providerId: "anthropic" }])));
+	__cases.push(mr("runtime-key-status", mrSteps([
+		{ fn: "setRuntimeApiKey", providerId: "anthropic", apiKey: "rk" },
+		{ fn: "getProviderAuthStatus", providerId: "anthropic" },
+		{ fn: "listCredentials" },
+		{ fn: "hasConfiguredAuth", providerId: "anthropic" },
+		{ fn: "getAvailableSnapshot" },
+	])));
+	__cases.push(mr("remove-runtime-key", mrSteps([
+		{ fn: "setRuntimeApiKey", providerId: "anthropic", apiKey: "rk" },
+		{ fn: "removeRuntimeApiKey", providerId: "anthropic" },
+		{ fn: "getProviderAuthStatus", providerId: "anthropic" },
+		{ fn: "listCredentials" },
+	])));
+	__cases.push(mr("stored-credential", mrSteps(
+		[
+			{ fn: "getAvailable" },
+			{ fn: "getProviderAuthStatus", providerId: "anthropic" },
+			{ fn: "listCredentials" },
+			{ fn: "checkAuth", providerId: "anthropic" },
+		],
+		{ authJson: JSON.stringify({ anthropic: { type: "api_key", key: "stored-key" } }) },
+	)));
+
+	// ---- getAuth ----
+	__cases.push(mr("getauth-env", mrSteps([{ fn: "getAuth", providerId: "openai" }], { env: { OPENAI_API_KEY: "sk-test" } })));
+	__cases.push(mr("getauth-model", mrSteps([{ fn: "getAuthModel", model: { provider: "openai", modelId: "gpt-4" } }], { env: { OPENAI_API_KEY: "sk-test" } })));
+	__cases.push(mr("getauth-none", mrSteps([{ fn: "getAuth", providerId: "anthropic" }])));
+
+	// ---- register / unregister ----
+	__cases.push(mr("register-provider", mrSteps([
+		{ fn: "registerProvider", providerId: "ext1", config: { name: "Ext One", baseUrl: "https://ext.example", apiKey: "ext-key", models: [mrModel("m1")] }, settle: true },
+		{ fn: "getModels", providerId: "ext1" },
+		{ fn: "getRegisteredProviderIds" },
+		{ fn: "getRegisteredProviderConfig", providerId: "ext1" },
+		{ fn: "getProviderAuthStatus", providerId: "ext1" },
+		{ fn: "hasConfiguredAuth", providerId: "ext1" },
+	])));
+	__cases.push(mr("register-provider-merge", mrSteps([
+		{ fn: "registerProvider", providerId: "ext1", config: { name: "Ext One", baseUrl: "https://ext.example", models: [mrModel("m1")] }, settle: true },
+		{ fn: "registerProvider", providerId: "ext1", config: { name: "Ext Two" }, settle: true },
+		{ fn: "getRegisteredProviderConfig", providerId: "ext1" },
+		{ fn: "getModels", providerId: "ext1" },
+	])));
+	__cases.push(mr("register-provider-invalid", mrSteps([
+		{ fn: "registerProvider", providerId: "ext1", config: { name: "No Base" } },
+		{ fn: "getRegisteredProviderIds" },
+	])));
+	__cases.push(mr("register-native", mrSteps([
+		{ fn: "registerNativeProvider", provider: { id: "nat1", name: "Native One", baseUrl: "https://nat.example", models: [mrModel("n1", "nat1")] }, settle: true },
+		{ fn: "getModels", providerId: "nat1" },
+		{ fn: "getRegisteredNativeProvider", providerId: "nat1" },
+		{ fn: "getRegisteredProviderIds" },
+	])));
+	__cases.push(mr("register-native-empty-id", mrSteps([
+		{ fn: "registerNativeProvider", provider: { id: "", models: [] } },
+	])));
+	__cases.push(mr("unregister-provider", mrSteps([
+		{ fn: "registerProvider", providerId: "ext1", config: { name: "Ext One", baseUrl: "https://ext.example", models: [mrModel("m1")] }, settle: true },
+		{ fn: "unregisterProvider", providerId: "ext1", settle: true },
+		{ fn: "getModels", providerId: "ext1" },
+		{ fn: "getRegisteredProviderIds" },
+	])));
+
+	// ---- virtual models ----
+	__cases.push(mr("virtual-register", mrSteps([
+		{ fn: "registerVirtualModel", definition: mrVirtual(), settle: true },
+		{ fn: "setRuntimeApiKey", providerId: "anthropic", apiKey: "rk" },
+		{ fn: "getModels", providerId: "anthropic" },
+		{ fn: "getModel", providerId: "anthropic", modelId: "vm1" },
+	])));
+	__cases.push(mr("virtual-resolve", mrSteps([
+		{ fn: "registerVirtualModel", definition: mrVirtual(), settle: true },
+		{ fn: "setRuntimeApiKey", providerId: "anthropic", apiKey: "rk" },
+		{ fn: "resolveModel", model: { provider: "anthropic", modelId: "vm1" }, reason: "user", thinkingLevel: "high", messages: [{ role: "assistant", provider: "openai", model: "gpt-4", thinkingLevel: "low", stopReason: "stop" }] },
+	])));
+	__cases.push(mr("virtual-resolve-failed", mrSteps([
+		{ fn: "registerVirtualModel", definition: mrVirtual(), settle: true },
+		{ fn: "setRuntimeApiKey", providerId: "anthropic", apiKey: "rk" },
+		{ fn: "resolveModel", model: { provider: "anthropic", modelId: "vm1" }, reason: "retry", thinkingLevel: "low", failed: { role: "assistant", provider: "openai", model: "gpt-4", thinkingLevel: "low", stopReason: "error", errorMessage: "boom" } },
+	])));
+	__cases.push(mr("virtual-resolve-state", mrSteps([
+		{ fn: "registerVirtualModel", definition: mrVirtual({ route: { provider: "anthropic", model: "claude-fable-5", thinkingLevel: "low", echo: true, state: { step: 2 } } }), settle: true },
+		{ fn: "setRuntimeApiKey", providerId: "anthropic", apiKey: "rk" },
+		{ fn: "resolveModel", model: { provider: "anthropic", modelId: "vm1" }, reason: "continuation", thinkingLevel: "low", state: { step: 1 } },
+	])));
+	__cases.push(mr("virtual-no-credentials", mrSteps([
+		{ fn: "registerVirtualModel", definition: mrVirtual(), settle: true },
+		{ fn: "resolveModel", model: { provider: "anthropic", modelId: "vm1" }, reason: "user", thinkingLevel: "low" },
+	])));
+	__cases.push(mr("virtual-not-physical", mrSteps([
+		{ fn: "registerVirtualModel", definition: mrVirtual({ route: { provider: "anthropic", model: "nope" } }), settle: true },
+		{ fn: "setRuntimeApiKey", providerId: "anthropic", apiKey: "rk" },
+		{ fn: "resolveModel", model: { provider: "anthropic", modelId: "vm1" }, reason: "user", thinkingLevel: "low" },
+	])));
+	__cases.push(mr("virtual-conflict", mrSteps([
+		{ fn: "registerVirtualModel", definition: mrVirtual({ id: "claude-fable-5" }) },
+	])));
+	__cases.push(mr("virtual-empty", mrSteps([
+		{ fn: "registerVirtualModel", definition: mrVirtual({ provider: "" }) },
+	])));
+	__cases.push(mr("virtual-not-registered", mrSteps([
+		{ fn: "resolveModel", model: { provider: "anthropic", modelId: "claude-fable-5" }, reason: "user", thinkingLevel: "low" },
+	])));
+	__cases.push(mr("virtual-unregister", mrSteps([
+		{ fn: "registerVirtualModel", definition: mrVirtual(), settle: true },
+		{ fn: "unregisterVirtualModel", providerId: "anthropic", modelId: "vm1", settle: true },
+		{ fn: "getModel", providerId: "anthropic", modelId: "vm1" },
+		{ fn: "resolveModel", model: { provider: "anthropic", modelId: "vm1" }, reason: "user", thinkingLevel: "low" },
+	])));
+
+	// ---- login / logout ----
+	__cases.push(mr("login-error", mrSteps([{ fn: "login", providerId: "openai", type: "api_key" }])));
+	__cases.push(mr("logout", mrSteps(
+		[
+			{ fn: "getAvailable" },
+			{ fn: "logout", providerId: "anthropic" },
+			{ fn: "listCredentials" },
+			{ fn: "getProviderAuthStatus", providerId: "anthropic" },
+		],
+		{ authJson: JSON.stringify({ anthropic: { type: "api_key", key: "stored-key" } }) },
+	)));
+
+	// ---- refresh ----
+	__cases.push(mr("refresh-offline", mrSteps([{ fn: "refresh", allowNetwork: false }])));
+	__cases.push(mr("refresh-network-gated-offline", mrSteps([{ fn: "refresh", allowNetwork: true }])));
+	__cases.push(mr("refresh-fetch", mrSteps(
+		[
+			{ fn: "refresh", allowNetwork: true, providers: ["openai"], force: true },
+			{ fn: "getModels", providerId: "openai" },
+		],
+		{
+			fetch: { status: 200, lastModified: 1792457207915, body: { models: [mrModel("dyn-1", "openai")] } },
+			stored: { openai: { models: [], lastModified: 1792457207915, checkedAt: 0, etag: "\"e1\"" } },
+		},
+	)));
+
+	// ---- models.json overlays ----
+	__cases.push(mr("overlay-status", mrSteps(
+		[{ fn: "getProviderAuthStatus", providerId: "openai" }, { fn: "getAuth", providerId: "openai" }],
+		{ modelsJson: JSON.stringify({ providers: { openai: { baseUrl: "https://x.example", apiKey: "cfg-key" } } }) },
+	)));
+	__cases.push(mr("overlay-model-override", mrSteps(
+		[{ fn: "getModel", providerId: "openai", modelId: "gpt-4" }],
+		{ modelsJson: JSON.stringify({ providers: { openai: { baseUrl: "https://x.example", modelOverrides: { "gpt-4": { name: "Renamed GPT", maxTokens: 777 } } } } }) },
+	)));
+	__cases.push(mr("compat-config", mrSteps(
+		[{ fn: "getCompatibilityRequestConfig", model: { provider: "openai", modelId: "gpt-4" } }],
+		{ modelsJson: JSON.stringify({ providers: { openai: { baseUrl: "https://x.example", headers: { "X-Cfg": "c" }, authHeader: true, modelOverrides: { "gpt-4": { headers: { "X-Model": "m" } } } } } }) },
+	)));
+	__cases.push(mr("composition-error", mrSteps(
+		[{ fn: "getError" }],
+		{ modelsJson: JSON.stringify({ providers: { prov: { baseUrl: "https://x.example", models: [{ id: "m1", api: "no-such-api" }] } } }) },
+	)));
+
+	// ---- images / classifiers ----
+	__cases.push(mr("generate-images-error", mrSteps([
+		{ fn: "generateImages", model: { provider: "openrouter", modelId: "black-forest-labs/flux-3-image" }, context: { input: [] } },
+	])));
+	__cases.push(mr("generate-images-marker", mrSteps([
+		{ fn: "registerNativeProvider", provider: { id: "nat1", name: "Native One", baseUrl: "https://nat.example", models: [mrImageModel("im1", "nat1")], images: { "openai-images": { marker: "nat-images" } } }, settle: true },
+		{ fn: "setRuntimeApiKey", providerId: "nat1", apiKey: "rk" },
+		{ fn: "generateImages", model: { provider: "nat1", modelId: "im1" }, context: { input: [] } },
+	])));
+	__cases.push(mr("classify-error", mrSteps([
+		{ fn: "classify", model: { provider: "cloudflare-workers-ai", modelId: "@cf/cloudflare/clef" }, context: { state: {}, questions: {} } },
+	])));
+	__cases.push(mr("classify-marker", mrSteps([
+		{ fn: "registerNativeProvider", provider: { id: "nat1", name: "Native One", baseUrl: "https://nat.example", models: [mrClassifierModel("cl1", "nat1")], classifiers: { "openai-classifiers": { marker: "nat-classify" } } }, settle: true },
+		{ fn: "setRuntimeApiKey", providerId: "nat1", apiKey: "rk" },
+		{ fn: "classify", model: { provider: "nat1", modelId: "cl1" }, context: { state: {}, questions: {} } },
+	])));
+
+	// ---- registry facade ----
+	__cases.push(reg("getall", mrSteps([{ fn: "getAll" }])));
+	__cases.push(reg("getavailable-env", mrSteps([{ fn: "getAvailable" }], { env: { OPENAI_API_KEY: "sk-test" } })));
+	__cases.push(reg("find", mrSteps([
+		{ fn: "find", providerId: "anthropic", modelId: "claude-fable-5" },
+		{ fn: "find", providerId: "anthropic", modelId: "nope" },
+	])));
+	__cases.push(reg("find-of-type", mrSteps([
+		{ fn: "findOfType", type: "image", providerId: "openrouter", modelId: "black-forest-labs/flux-3-image" },
+		{ fn: "findOfType", type: "image", providerId: "openrouter", modelId: "nope" },
+	])));
+	__cases.push(reg("has-configured-auth", mrSteps(
+		[
+			{ fn: "hasConfiguredAuth", model: { provider: "openai", modelId: "gpt-4" } },
+			{ fn: "hasConfiguredAuth", model: { provider: "anthropic", modelId: "claude-fable-5" } },
+		],
+		{ env: { OPENAI_API_KEY: "sk-test" } },
+	)));
+	__cases.push(reg("apikey-headers-ok", mrSteps(
+		[{ fn: "getApiKeyAndHeaders", model: { provider: "openai", modelId: "gpt-4" } }],
+		{ env: { OPENAI_API_KEY: "sk-test" } },
+	)));
+	__cases.push(reg("apikey-headers-nokey", mrSteps(
+		[{ fn: "getApiKeyAndHeaders", model: { provider: "openai", modelId: "gpt-4" } }],
+	)));
+	__cases.push(reg("apikey-headers-authheader", mrSteps(
+		[{ fn: "getApiKeyAndHeaders", model: { provider: "openai", modelId: "gpt-4" } }],
+		{ modelsJson: JSON.stringify({ providers: { openai: { baseUrl: "https://x.example", authHeader: true } } }) },
+	)));
+	__cases.push(reg("display-name", mrSteps([
+		{ fn: "getProviderDisplayName", providerId: "anthropic" },
+		{ fn: "getProviderDisplayName", providerId: "nope" },
+	])));
+	__cases.push(reg("provider-auth", mrSteps([{ fn: "getProviderAuth", providerId: "openai" }], { env: { OPENAI_API_KEY: "sk-test" } })));
+	__cases.push(reg("apikey-for-provider", mrSteps([
+		{ fn: "getApiKeyForProvider", providerId: "openai" },
+		{ fn: "getApiKeyForProvider", providerId: "anthropic" },
+	], { env: { OPENAI_API_KEY: "sk-test" } })));
+	__cases.push(reg("is-using-oauth", mrSteps([{ fn: "isUsingOAuth", model: { provider: "openai", modelId: "gpt-4" } }], { env: { OPENAI_API_KEY: "sk-test" } })));
+	__cases.push(reg("models-of-type", mrSteps([{ fn: "getModelsOfType", type: "image" }])));
+	__cases.push(reg("available-of-type", mrSteps([{ fn: "getAvailableOfType", type: "image" }], { env: { OPENROUTER_API_KEY: "or-test" } })));
+	__cases.push(reg("model-of-type", mrSteps([{ fn: "getModelOfType", type: "image", providerId: "openrouter", modelId: "black-forest-labs/flux-3-image" }])));
+	__cases.push(reg("get-provider", mrSteps([
+		{ fn: "getProvider", providerId: "anthropic" },
+		{ fn: "getProvider", providerId: "nope" },
+	])));
+	__cases.push(reg("get-error", mrSteps([{ fn: "getError" }])));
+	__cases.push(reg("check-auth", mrSteps([{ fn: "checkAuth", providerId: "openai" }], { env: { OPENAI_API_KEY: "sk-test" } })));
+	__cases.push(reg("status", mrSteps([{ fn: "getProviderAuthStatus", providerId: "openai" }], { env: { OPENAI_API_KEY: "sk-test" } })));
+	__cases.push(reg("registered-ids", mrSteps([{ fn: "getRegisteredProviderIds" }])));
+	__cases.push(reg("get-models", mrSteps([{ fn: "getModels", providerId: "anthropic" }])));
+	__cases.push(reg("get-model", mrSteps([{ fn: "getModel", providerId: "anthropic", modelId: "claude-fable-5" }])));
+	__cases.push(reg("register-by-name", mrSteps([
+		{ fn: "registerProvider", providerId: "ext1", config: { name: "Ext One", baseUrl: "https://ext.example", apiKey: "ext-key", models: [mrModel("m1")] }, settle: true },
+		{ fn: "getModels", providerId: "ext1" },
+		{ fn: "find", providerId: "ext1", modelId: "m1" },
+		{ fn: "getRegisteredProviderConfig", providerId: "ext1" },
+	])));
+	__cases.push(reg("register-by-name-no-config", mrSteps([
+		{ fn: "registerProvider", providerId: "ext1" },
+	])));
+	__cases.push(reg("register-native", mrSteps([
+		{ fn: "registerNativeProvider", provider: { id: "nat1", name: "Native One", baseUrl: "https://nat.example", models: [mrModel("n1", "nat1")] }, settle: true },
+		{ fn: "getModels", providerId: "nat1" },
+		{ fn: "getRegisteredNativeProvider", providerId: "nat1" },
+	])));
+	__cases.push(reg("unregister", mrSteps([
+		{ fn: "registerProvider", providerId: "ext1", config: { name: "Ext One", baseUrl: "https://ext.example", models: [mrModel("m1")] }, settle: true },
+		{ fn: "unregisterProvider", providerId: "ext1", settle: true },
+		{ fn: "find", providerId: "ext1", modelId: "m1" },
+	])));
+	__cases.push(reg("register-virtual", mrSteps([
+		{ fn: "registerVirtualModel", definition: mrVirtual({ route: { provider: "anthropic", model: "claude-fable-5" } }), settle: true },
+		{ fn: "setRuntimeApiKey", providerId: "anthropic", apiKey: "rk" },
+		{ fn: "getAll" },
+	])));
+	__cases.push(reg("resolve-model", mrSteps([
+		{ fn: "registerVirtualModel", definition: mrVirtual(), settle: true },
+		{ fn: "setRuntimeApiKey", providerId: "anthropic", apiKey: "rk" },
+		{ fn: "resolveModel", model: { provider: "anthropic", modelId: "vm1" }, reason: "user", thinkingLevel: "low" },
+	])));
+	__cases.push(reg("refresh", mrSteps([{ fn: "refresh", allowNetwork: false }])));
+	__cases.push(reg("generate-images-error", mrSteps([
+		{ fn: "generateImages", model: { provider: "openrouter", modelId: "black-forest-labs/flux-3-image" }, context: { input: [] } },
+	])));
+	__cases.push(reg("classify-error", mrSteps([
+		{ fn: "classify", model: { provider: "cloudflare-workers-ai", modelId: "@cf/cloudflare/clef" }, context: { state: {}, questions: {} } },
+	])));
+
+	return __cases;
+})(),
 ];
 
 // config-value sub-case builder (hoisted; used by the cases above).
