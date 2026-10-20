@@ -25,3 +25,4 @@ pub mod event_bus;
 pub mod timings;
 pub mod slash_commands;
 pub mod settings_defaults;
+pub mod prompt_templates;
