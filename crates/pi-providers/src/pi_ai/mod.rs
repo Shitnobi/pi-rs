@@ -19,6 +19,7 @@ use serde_json::Value;
 #[macro_use]
 pub mod macros;
 
+pub mod compat;
 pub mod credential;
 pub mod js;
 pub mod model;

@@ -410,11 +410,13 @@ pub fn refresh_with_remote_catalog(
 	let response = fetch(&request_catalog(provider_id, catalog_base_url, validator.as_deref()))?;
 	let checked_at = now;
 	// 304: the overlay already holds the stored body.
-	if response.status == 304 && stored.is_some() {
-		let persist = stored.unwrap().with_checked_at(checked_at);
-		let accepted = accept();
-		publishes.push(PublishRecord { persist: Some(persist), update: false, accepted });
-		return Ok(());
+	if response.status == 304 {
+		if let Some(stored) = stored {
+			let persist = stored.with_checked_at(checked_at);
+			let accepted = accept();
+			publishes.push(PublishRecord { persist: Some(persist), update: false, accepted });
+			return Ok(());
+		}
 	}
 	if response.status == 404 || response.status == 501 {
 		let empty = StoredCatalog::from_value(&json!({ "models": [] }));

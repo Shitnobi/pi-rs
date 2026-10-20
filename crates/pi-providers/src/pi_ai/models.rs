@@ -14,9 +14,10 @@ use crate::error::JsError;
 use crate::pi_ai::credential::{
 	AuthCheck, AuthOperationOptions, AuthResult, AuthType, Credential,
 };
-use crate::pi_ai::model::{
-	AnyModel, ImageModel, Model, ModelThinkingLevel, ModelType, ProviderEnv,
-};
+use crate::pi_ai::model::{AnyModel, ImageModel, Model, ModelThinkingLevel, ProviderEnv};
+// Re-exported for downstream modules (provider_composer) — TS re-imports
+// `ModelType` from the models surface freely.
+pub use crate::pi_ai::model::ModelType;
 use crate::pi_ai::models_store::ModelsStoreEntry;
 use crate::pi_ai::provider::{
 	AssistantImages, AssistantMessage, AssistantMessageEventStream, ClassifierContext,

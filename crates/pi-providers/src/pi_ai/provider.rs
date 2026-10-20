@@ -267,6 +267,26 @@ impl Provider {
 		self.filter_models_fn.is_some()
 	}
 
+	/// Whether this provider has a `fetchDeferred` operation.
+	pub fn has_fetch_deferred(&self) -> bool {
+		self.fetch_deferred_fn.is_some()
+	}
+
+	/// Whether this provider has a `cancelDeferred` operation.
+	pub fn has_cancel_deferred(&self) -> bool {
+		self.cancel_deferred_fn.is_some()
+	}
+
+	/// Whether this provider has a `generateImages` operation.
+	pub fn has_generate_images(&self) -> bool {
+		self.generate_images_fn.is_some()
+	}
+
+	/// Whether this provider has a `classify` operation.
+	pub fn has_classify(&self) -> bool {
+		self.classify_fn.is_some()
+	}
+
 	/// Whether this provider has its own `filterAllModels` policy.
 	pub fn has_filter_all_models(&self) -> bool {
 		self.filter_all_models_fn.is_some()

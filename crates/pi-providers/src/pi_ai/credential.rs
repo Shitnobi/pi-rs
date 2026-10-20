@@ -305,6 +305,11 @@ impl AuthType {
 pub trait ApiKeyAuth {
 	/// Display name, e.g. "Anthropic API key".
 	fn name(&self) -> &str;
+	/// Whether the TS object has a `check` method (optional in the TS
+	/// interface; `composeApiKeyAuth` guards on its presence).
+	fn has_check(&self) -> bool {
+		true
+	}
 	/// Optional side-effect-free availability check.
 	fn check(
 		&self,
