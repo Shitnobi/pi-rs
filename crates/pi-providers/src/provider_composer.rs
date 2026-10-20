@@ -1420,8 +1420,20 @@ pub fn compose_model_provider(
 	model_config: &ModelConfig,
 	extension: Option<ProviderConfigInput>,
 ) -> Result<Provider, JsError> {
+	compose_model_provider_shared(provider_id, base.map(Arc::new), model_config, extension)
+}
+
+/// Shared-base variant of [`compose_model_provider`] for callers (e.g.
+/// `ModelRuntime`) that keep their builtin providers behind `Arc` and must
+/// compose repeatedly without consuming the base. Added for the
+/// model-runtime.ts port; behavior is identical to the by-value entry point.
+pub fn compose_model_provider_shared(
+	provider_id: &str,
+	base: Option<Arc<Provider>>,
+	model_config: &ModelConfig,
+	extension: Option<ProviderConfigInput>,
+) -> Result<Provider, JsError> {
 	let config = model_config.get_provider(provider_id).cloned();
-	let base = base.map(Arc::new);
 	let shared = Arc::new(ComposerShared {
 		provider_id: provider_id.to_string(),
 		config: config.clone(),

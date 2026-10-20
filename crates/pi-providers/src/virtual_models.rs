@@ -358,6 +358,17 @@ pub fn with_virtual_models(
 	provider: Option<Provider>,
 	virtual_models: Vec<Model>,
 ) -> Provider {
+	with_virtual_models_shared(provider_id, provider.map(Arc::new), virtual_models)
+}
+
+/// Shared-base variant of [`with_virtual_models`] for callers (e.g.
+/// `ModelRuntime`) that keep their providers behind `Arc`. Added for the
+/// model-runtime.ts port; behavior is identical to the by-value entry point.
+pub fn with_virtual_models_shared(
+	provider_id: &str,
+	provider: Option<Arc<Provider>>,
+	virtual_models: Vec<Model>,
+) -> Provider {
 	let virtual_models = Arc::new(virtual_models);
 	match provider {
 		None => Provider::new(
@@ -372,7 +383,6 @@ pub fn with_virtual_models(
 			Box::new(|model, _ctx, _opts| unrouted_stream(model)),
 		),
 		Some(provider) => {
-			let provider = Arc::new(provider);
 			let ids: HashSet<String> =
 				virtual_models.iter().map(|m| m.id.clone()).collect();
 

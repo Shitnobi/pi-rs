@@ -32,6 +32,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use pi_core::ai::date_now_millis;
@@ -517,7 +518,7 @@ struct AppliedAuth {
 /// `getAuth`/`checkAuth` take `&self` while OAuth refresh mutates stored
 /// credentials (TS `getAuth`'s `resolveStoredOAuth` → `credentials.modify`).
 pub struct ModelsImpl<'a> {
-	providers: IndexMap<String, Provider>,
+	providers: IndexMap<String, Arc<Provider>>,
 	credentials: RefCell<Box<dyn CredentialStore + 'a>>,
 	models_store: Box<dyn ModelsStore + 'a>,
 	auth_context: Box<dyn AuthContext + 'a>,
@@ -803,8 +804,13 @@ impl<'a> ModelsImpl<'a> {
 			return Err(JsError::abort());
 		}
 		let providers: Vec<&Provider> = match provider_id {
-			Some(provider_id) => self.providers.get(provider_id).into_iter().collect(),
-			None => self.providers.values().collect(),
+			Some(provider_id) => self
+				.providers
+				.get(provider_id)
+				.map(|p| p.as_ref())
+				.into_iter()
+				.collect(),
+			None => self.providers.values().map(|p| p.as_ref()).collect(),
 		};
 		let options = AuthOperationOptions { signal };
 		let mut authenticated = Vec::new();
@@ -821,7 +827,7 @@ impl<'a> ModelsImpl<'a> {
 	}
 
 	fn require_provider(&self, provider_id: &str) -> Result<&Provider, JsError> {
-		self.providers.get(provider_id).ok_or_else(|| {
+		self.providers.get(provider_id).map(|p| p.as_ref()).ok_or_else(|| {
 			ModelsError::new(
 				ModelsErrorKind::Provider,
 				format!("Unknown provider: {provider_id}"),
@@ -976,7 +982,7 @@ fn build_request_options(options: Option<&Value>, applied: &AppliedAuth) -> Valu
 /// resolves with its terminal result (`AssistantMessage(stream.0)` in the
 /// placeholder world); setup errors propagate as `Err` (TS `result()`
 /// rejects).
-fn stream_terminal_result(stream: &AssistantMessageEventStream) -> Result<AssistantMessage, JsError> {
+pub fn stream_terminal_result(stream: &AssistantMessageEventStream) -> Result<AssistantMessage, JsError> {
 	if is_error_stream(stream) {
 		let message = stream_result(stream)
 			.map(|message| message.0)
@@ -992,11 +998,11 @@ fn stream_terminal_result(stream: &AssistantMessageEventStream) -> Result<Assist
 
 impl Models for ModelsImpl<'_> {
 	fn get_providers(&self) -> Vec<&Provider> {
-		self.providers.values().collect()
+		self.providers.values().map(|p| p.as_ref()).collect()
 	}
 
 	fn get_provider(&self, id: &str) -> Option<&Provider> {
-		self.providers.get(id)
+		self.providers.get(id).map(|p| p.as_ref())
 	}
 
 	fn get_models(&self, provider: Option<&str>) -> Vec<Model> {
@@ -1534,6 +1540,34 @@ fn model_headers(model: &AnyModel) -> Option<ProviderHeaders> {
 	})
 }
 
+impl ModelsImpl<'_> {
+	/// Shared-provider accessor: the provider handles behind `Arc`
+	/// (callers that keep providers behind `Arc`, e.g. `ModelRuntime`,
+	/// re-register them without cloning). Added for the model-runtime.ts
+	/// port.
+	pub fn provider_arcs(&self) -> Vec<Arc<Provider>> {
+		self.providers.values().cloned().collect()
+	}
+
+	/// Shared-provider accessor for a single provider.
+	pub fn provider_arc(&self, id: &str) -> Option<Arc<Provider>> {
+		self.providers.get(id).cloned()
+	}
+
+	/// Shared-provider variant of [`MutableModels::set_provider`] for
+	/// callers (e.g. `ModelRuntime`) that hold providers behind `Arc` and
+	/// must re-register them without cloning. Added for the
+	/// model-runtime.ts port; behavior is identical to the trait method.
+	pub fn set_provider_shared(&mut self, provider: Arc<Provider>) {
+		supersede_provider_refresh(
+			&mut self.refresh_generations,
+			&mut self.refresh_signals,
+			&provider.id,
+		);
+		self.providers.insert(provider.id.clone(), provider);
+	}
+}
+
 impl MutableModels for ModelsImpl<'_> {
 	fn set_provider(&mut self, provider: Provider) {
 		supersede_provider_refresh(
@@ -1541,7 +1575,7 @@ impl MutableModels for ModelsImpl<'_> {
 			&mut self.refresh_signals,
 			&provider.id,
 		);
-		self.providers.insert(provider.id.clone(), provider);
+		self.providers.insert(provider.id.clone(), Arc::new(provider));
 	}
 
 	fn delete_provider(&mut self, id: &str) {
