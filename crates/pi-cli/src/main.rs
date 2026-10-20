@@ -16,6 +16,8 @@ mod migrations;
 mod providers_harness;
 mod config_harness;
 mod resolver_harness;
+mod auth_harness;
+mod composer_harness;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -202,6 +204,12 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         }
         "model-resolver" => {
             return resolver_harness::run(name, &input)
+        }
+        "auth-storage" | "remote-catalog" => {
+            return auth_harness::run(name, &input)
+        }
+        "provider-composer" => {
+            return composer_harness::run(name, &input)
         }
         _ => {}
     }
