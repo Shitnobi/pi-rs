@@ -13,6 +13,7 @@ use serde_json::Value;
 mod cli;
 mod config;
 mod migrations;
+mod providers_harness;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -190,6 +191,10 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "mcp-servers" => return run_mcp_servers_harness(&input),
         "mcp-tools" => return run_mcp_tools_harness(&input),
         "tool-search" => return run_tool_search_harness(&input),
+        "config-value" | "http-dispatcher" | "auth-guidance" | "models-store"
+        | "runtime-credentials" | "virtual-models" => {
+            return providers_harness::run(name, &input)
+        }
         _ => {}
     }
     let result: Result<pi_tools::ToolOutput, String> = match name {

@@ -121,7 +121,7 @@ mod tests {
 		let path = dir.join("does-not-exist.json");
 		let backend = FileAuthStorageBackend::new(path.to_string_lossy().to_string());
 		let result: String = backend
-			.with_lock(|content| Ok(LockResult { result: content.unwrap_or("empty").to_string(), next: None }), None)
+			.with_lock(&mut |content| Ok(LockResult { result: content.unwrap_or("empty").to_string(), next: None }), None)
 			.unwrap();
 		assert_eq!(result, "empty");
 	}
@@ -132,10 +132,10 @@ mod tests {
 		let path = dir.join("nested/sub/data.json");
 		let backend = FileAuthStorageBackend::new(path.to_string_lossy().to_string());
 		backend
-			.with_lock(|_| Ok(LockResult { result: (), next: Some("{\"a\":1}".to_string()) }), None)
+			.with_lock(&mut |_| Ok(LockResult { result: (), next: Some("{\"a\":1}".to_string()) }), None)
 			.unwrap();
 		let content: String = backend
-			.with_lock(|content| Ok(LockResult { result: content.unwrap().to_string(), next: None }), None)
+			.with_lock(&mut |content| Ok(LockResult { result: content.unwrap().to_string(), next: None }), None)
 			.unwrap();
 		assert_eq!(content, "{\"a\":1}");
 		std::fs::remove_dir_all(&dir).ok();
@@ -147,7 +147,7 @@ mod tests {
 		let path = dir.join("skip.json");
 		let backend = FileAuthStorageBackend::new(path.to_string_lossy().to_string());
 		let err: Result<(), _> = backend.with_lock::<()>(
-			|_| Err(JsError::new("boom")),
+			&mut |_| Err(JsError::new("boom")),
 			None,
 		);
 		assert!(err.is_err());
@@ -159,7 +159,7 @@ mod tests {
 	fn abort_rejects_before_read() {
 		let backend = FileAuthStorageBackend::new("/nonexistent/pi-test.json");
 		let result: Result<(), JsError> =
-			backend.with_lock(|_| unreachable!(), Some(&opts_aborted()));
+			backend.with_lock(&mut |_| unreachable!(), Some(&opts_aborted()));
 		assert_eq!(result.unwrap_err().message, "This operation was aborted");
 	}
 

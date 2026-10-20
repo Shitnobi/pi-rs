@@ -5182,7 +5182,502 @@ export const cases = [
 			b: 0.0,
 		},
 	},
+
+	// ------------------------------------------------- config-value (module)
+	// core/resolve-config-value.ts: "$VAR"/"${VAR}" templates, "!cmd" shell
+	// values, and header resolution. Env is always passed explicitly and only
+	// uses the reserved PI_PARITY_ prefix, which never exists in either
+	// harness process's environment (the TS side falls back to process.env).
+	// Commands run for real via the shell: only deterministic ones are used.
+	cv("resolve-single-env-ref", "resolveConfigValue", "$PI_PARITY_KEY", { PI_PARITY_KEY: "sk-secret" }),
+	cv("resolve-braced-env-ref", "resolveConfigValue", "${PI_PARITY_KEY}", { PI_PARITY_KEY: "sk-secret" }),
+	cv("resolve-mixed-literal-and-ref", "resolveConfigValue", "Bearer $PI_PARITY_KEY", {
+		PI_PARITY_KEY: "sk-secret",
+	}),
+	cv("resolve-multiple-refs", "resolveConfigValue", "$PI_PARITY_A/${PI_PARITY_B}/$PI_PARITY_A", {
+		PI_PARITY_A: "one",
+		PI_PARITY_B: "two",
+	}),
+	cv("resolve-missing-var-null", "resolveConfigValue", "$PI_PARITY_MISSING", {}),
+	cv("resolve-empty-env-value-unset", "resolveConfigValue", "$PI_PARITY_KEY", { PI_PARITY_KEY: "" }),
+	cv("resolve-dollar-alone", "resolveConfigValue", "$", {}),
+	cv("resolve-dollar-dollar-escape", "resolveConfigValue", "a$$b", {}),
+	cv("resolve-empty-braces-literal", "resolveConfigValue", "${}", {}),
+	cv("resolve-unterminated-brace-literal", "resolveConfigValue", "pre${PI_PARITY_KEY", { PI_PARITY_KEY: "x" }),
+	cv("resolve-no-default-operator", "resolveConfigValue", "$PI_PARITY_KEY:-fallback", { PI_PARITY_KEY: "x" }),
+	cv("resolve-literal", "resolveConfigValue", "plain-literal-value", {}),
+	cv("resolve-command-printf", "resolveConfigValue", "!printf pi-parity-key", {}),
+	cv("resolve-command-echo-trims-newline", "resolveConfigValue", "!echo hello", {}),
+	cv("resolve-command-empty-stdout-null", "resolveConfigValue", "!true", {}),
+	cv("resolve-command-nonzero-exit-null", "resolveConfigValue", "!exit 7", {}),
+	cv("is-command-config-value-true", "isCommandConfigValue", "!echo hi", {}),
+	cv("is-command-config-value-literal-false", "isCommandConfigValue", "not-a-command", {}),
+	cv("is-command-config-value-bare-bang", "isCommandConfigValue", "!", {}),
+	cv("is-configured-present", "isConfigValueConfigured", "$PI_PARITY_KEY", { PI_PARITY_KEY: "sk" }),
+	cv("is-configured-missing", "isConfigValueConfigured", "$PI_PARITY_KEY", {}),
+	cv("is-configured-failing-command", "isConfigValueConfigured", "!exit 7", {}),
+	cv("env-var-name-single-ref", "getConfigValueEnvVarName", "$PI_PARITY_KEY", {}),
+	cv("env-var-name-mixed-null", "getConfigValueEnvVarName", "prefix-$PI_PARITY_KEY", {}),
+	cv("env-var-names-multi-dedup", "getConfigValueEnvVarNames", "$PI_PARITY_A ${PI_PARITY_B} $PI_PARITY_A", {}),
+	cv("env-var-names-command-empty", "getConfigValueEnvVarNames", "!printf x", {}),
+	cv("missing-env-var-names", "getMissingConfigValueEnvVarNames", "$PI_PARITY_A/$PI_PARITY_B/$PI_PARITY_C", {
+		PI_PARITY_B: "set",
+	}),
+	cv("or-throw-missing-error", "resolveConfigValueOrThrow", "$PI_PARITY_MISSING", {}, { description: "api key" }),
+	cv("or-throw-command-error", "resolveConfigValueOrThrow", "!exit 7", {}, { description: "api key" }),
+	cv(
+		"headers-resolve",
+		"resolveHeaders",
+		"",
+		{ PI_PARITY_KEY: "sk-secret" },
+		{
+			headers: {
+				Authorization: "Bearer $PI_PARITY_KEY",
+				"X-Static": "fixed",
+				"X-Tool": "!printf tool-value",
+			},
+		},
+	),
+	cv(
+		"headers-partial-unresolvable",
+		"resolveHeaders",
+		"",
+		{},
+		{ headers: { "X-Missing": "$PI_PARITY_MISSING", "X-Static": "fixed" } },
+	),
+	cv("headers-empty-null", "resolveHeaders", "", {}, { headers: {} }),
+	cv(
+		"headers-or-throw-success",
+		"resolveHeadersOrThrow",
+		"",
+		{ PI_PARITY_KEY: "sk-secret" },
+		{ description: "api key", headers: { Authorization: "Bearer $PI_PARITY_KEY" } },
+	),
+	cv(
+		"headers-or-throw-missing-error",
+		"resolveHeadersOrThrow",
+		"",
+		{},
+		{ description: "api key", headers: { Authorization: "Bearer $PI_PARITY_MISSING" } },
+	),
+
+	// ------------------------------------------------ http-dispatcher (module)
+	// core/http-dispatcher.ts: parse/format of the idle-timeout choices.
+	hdp("choice-number", 300000),
+	hdp("zero", 0),
+	hdp("string-whitespace", " 100 "),
+	hdp("string-hex", "0x1E"),
+	hdp("string-exponent", "1e3"),
+	hdp("string-plus", "+5"),
+	hdp("string-disabled", "disabled"),
+	hdp("string-invalid-null", "abc"),
+	hdp("string-empty-null", ""),
+	hdp("null-value-null", null),
+	hdp("negative-null", -5),
+	hdp("float-floor", 2.9),
+	hdp("object-null", {}),
+	hdf("non-choice-millis", 1500),
+	hdf("non-choice-sub-second", 100),
+	hdf("choice-five-min", 300000),
+	hdf("choice-disabled", 0),
+	hdf("non-choice-odd", 1501),
+
+	// -------------------------------------------------- auth-guidance (module)
+	// core/auth-guidance.ts: login help and no-model messages. The harness
+	// substitutes the docs path with the literal "<docs>" in the output.
+	{
+		name: "auth-guidance/provider-login-help",
+		tool: "auth-guidance",
+		args: { fn: "getProviderLoginHelp", docsPath: "/DOCS" },
+	},
+	{
+		name: "auth-guidance/no-models-available",
+		tool: "auth-guidance",
+		args: { fn: "formatNoModelsAvailableMessage", docsPath: "/DOCS" },
+	},
+	{
+		name: "auth-guidance/no-model-selected",
+		tool: "auth-guidance",
+		args: { fn: "formatNoModelSelectedMessage", docsPath: "/DOCS" },
+	},
+	{
+		name: "auth-guidance/no-api-key-found",
+		tool: "auth-guidance",
+		args: { fn: "formatNoApiKeyFoundMessage", docsPath: "/DOCS", provider: "anthropic" },
+	},
+	{
+		name: "auth-guidance/no-api-key-found-unknown-provider",
+		tool: "auth-guidance",
+		args: { fn: "formatNoApiKeyFoundMessage", docsPath: "/DOCS", provider: "unknown" },
+	},
+
+	// --------------------------------------------------- models-store (module)
+	// core/models-store.ts: InMemoryCodingAgentModelsStore and FileModelsStore
+	// (pi-ai ModelsStoreEntry: {models, lastModified?, checkedAt?, etag?}).
+	// File cases use a unique path per case; the harness namespaces by pid.
+	msInMemory("read-empty-null", [{ op: "read", providerId: "anthropic" }]),
+	msInMemory("write-read-roundtrip", [
+		{ op: "write", providerId: "anthropic", entry: msEntry() },
+		{ op: "read", providerId: "anthropic" },
+	]),
+	msInMemory("overwrite", [
+		{ op: "write", providerId: "anthropic", entry: msEntry({ etag: '"v1"' }) },
+		{
+			op: "write",
+			providerId: "anthropic",
+			entry: msEntry({ etag: '"v2"', lastModified: 1700000000 }),
+		},
+		{ op: "read", providerId: "anthropic" },
+	]),
+	msInMemory("delete", [
+		{ op: "write", providerId: "anthropic", entry: msEntry() },
+		{ op: "delete", providerId: "anthropic" },
+		{ op: "read", providerId: "anthropic" },
+	]),
+	msInMemory("multi-provider", [
+		{ op: "write", providerId: "anthropic", entry: msEntry() },
+		{
+			op: "write",
+			providerId: "openai",
+			entry: msEntry({
+				models: [msModel({ id: "gpt-x", name: "GPT X", api: "openai", provider: "openai", baseUrl: "https://api.openai.com/v1" })],
+			}),
+		},
+		{ op: "read", providerId: "anthropic" },
+		{ op: "read", providerId: "openai" },
+		{ op: "read", providerId: "unknown-provider" },
+	]),
+	msFile("absent-initial-null", "case-a", null, [{ op: "read", providerId: "anthropic" }]),
+	msFile("initial-content-read", "case-b", JSON.stringify({ anthropic: msEntry({ etag: '"etag-1"' }) }), [
+		{ op: "read", providerId: "anthropic" },
+		{ op: "read", providerId: "openai" },
+	]),
+	msFile("initial-content-bom", "case-c", "﻿" + JSON.stringify({ anthropic: msEntry() }), [
+		{ op: "read", providerId: "anthropic" },
+	]),
+	msFile("invalid-json-error", "case-d", "{", [{ op: "read", providerId: "anthropic" }]),
+	// NOTE: non-object JSON roots ("null", "[1,2]") are a documented port
+	// divergence — the TS parse is an unchecked cast (property access on
+	// null throws "Cannot read properties of null"; on arrays string keys
+	// read undefined), while the Rust parse_stored rejects non-objects with
+	// "Invalid models-store.json: expected a JSON object". Not parity-
+	// tested; see models_store.rs parse_stored.
+	msFile("entry-null-value-read-null", "case-e", JSON.stringify({ anthropic: null }), [
+		{ op: "read", providerId: "anthropic" },
+	]),
+	msFile("unrelated-provider-read-null", "case-f", JSON.stringify({ other: msEntry() }), [
+		{ op: "read", providerId: "anthropic" },
+	]),
+	msFile("write-content-pretty", "case-g", null, [
+		{ op: "write", providerId: "anthropic", entry: msEntry({ etag: '"v1"' }) },
+	]),
+	msFile("delete-leaves-empty-object", "case-h", JSON.stringify({ anthropic: msEntry() }), [
+		{ op: "delete", providerId: "anthropic" },
+	]),
+
+	// --------------------------------------------- runtime-credentials (module)
+	// core/runtime-credentials.ts: RuntimeCredentials overlay over a backing
+	// CredentialStore (pi-ai Credential: {type:"api_key", key?} | oauth).
+	rc("read-unknown-null", [], [{ op: "read", providerId: "anthropic" }]),
+	rc("override-shadows-backing", [rcKey("anthropic", "backing-key")], [
+		{ op: "set", providerId: "anthropic", key: "runtime-key" },
+		{ op: "read", providerId: "anthropic" },
+		{ op: "has", providerId: "anthropic" },
+	]),
+	rc("remove-restores-backing", [rcKey("anthropic", "backing-key")], [
+		{ op: "set", providerId: "anthropic", key: "runtime-key" },
+		{ op: "remove", providerId: "anthropic" },
+		{ op: "read", providerId: "anthropic" },
+		{ op: "has", providerId: "anthropic" },
+	]),
+	rc("has-false-without-override", [rcKey("anthropic", "backing-key")], [
+		{ op: "has", providerId: "anthropic" },
+	]),
+	rc("set-then-remove-has", [], [
+		{ op: "set", providerId: "anthropic", key: "k" },
+		{ op: "has", providerId: "anthropic" },
+		{ op: "remove", providerId: "anthropic" },
+		{ op: "has", providerId: "anthropic" },
+	]),
+	rc(
+		"list-backing-order-override-merge",
+		[rcKey("zeta", "z"), rcKey("alpha", "a"), rcKey("mid", "m")],
+		[
+			{ op: "set", providerId: "alpha", key: "a2" },
+			{ op: "set", providerId: "beta", key: "b" },
+			{ op: "list" },
+		],
+	),
+	rc("list-empty", [], [{ op: "list" }]),
+	rc("list-append-insertion-order", [rcKey("first", "1")], [
+		{ op: "set", providerId: "zz", key: "z" },
+		{ op: "set", providerId: "aa", key: "a" },
+		{ op: "list" },
+	]),
+	rc("delete-removes-override-and-backing", [rcKey("anthropic", "backing-key")], [
+		{ op: "set", providerId: "anthropic", key: "runtime-key" },
+		{ op: "delete", providerId: "anthropic" },
+		{ op: "read", providerId: "anthropic" },
+		{ op: "has", providerId: "anthropic" },
+		{ op: "list" },
+	]),
+	rc("modify-set-new-credential", [rcKey("anthropic", "old-key")], [
+		{
+			op: "modify",
+			providerId: "anthropic",
+			set: { type: "oauth", refresh: "r1", access: "a1", expires: 1700000000 },
+		},
+	]),
+	rc("modify-no-set-unchanged", [rcKey("anthropic", "current-key")], [
+		{ op: "modify", providerId: "anthropic" },
+	]),
+	rc("modify-unknown-null", [], [{ op: "modify", providerId: "anthropic" }]),
+	rc(
+		"read-oauth-backing",
+		[{ providerId: "github", credential: { type: "oauth", refresh: "r1", access: "a1", expires: 1700000000 } }],
+		[
+			{ op: "read", providerId: "github" },
+			{ op: "list" },
+		],
+	),
+
+	// ------------------------------------------------- virtual-models (module)
+	// core/virtual-models.ts: catalog entries that route to physical models.
+	vmCase("is-virtual-model-true", {
+		fn: "isVirtualModel",
+		model: vmModel("vm-1", "anthropic", "pi-virtual"),
+	}),
+	vmCase("is-virtual-model-false", {
+		fn: "isVirtualModel",
+		model: vmModel("claude-sonnet-4", "anthropic", "anthropic"),
+	}),
+	vmCase("find-latest-no-assistant-null", {
+		fn: "findLatestResponse",
+		messages: [{ role: "user", content: "hi", timestamp: 1780000000000 }],
+	}),
+	vmCase("find-latest-all-error-null", {
+		fn: "findLatestResponse",
+		messages: [vmAssistant({ stopReason: "error" }), vmAssistant({ stopReason: "aborted", model: "m2" })],
+	}),
+	vmCase("find-latest-error-after-good", {
+		fn: "findLatestResponse",
+		messages: [vmAssistant({ model: "good-model" }), vmAssistant({ stopReason: "error", model: "bad-model" })],
+	}),
+	vmCase("find-latest-latest-good-wins", {
+		fn: "findLatestResponse",
+		messages: [vmAssistant({ model: "first-model" }), vmAssistant({ model: "second-model" })],
+	}),
+	vmCase("branch-model-change", {
+		fn: "getBranchSelection",
+		branch: [vmModelChange(1, "anthropic", "claude-sonnet-4")],
+		models: [],
+	}),
+	vmCase("branch-model-change-wins-over-response", {
+		fn: "getBranchSelection",
+		branch: [vmMsgEntry(1, vmAssistant()), vmModelChange(2, "openai", "gpt-x")],
+		models: [],
+	}),
+	vmCase("branch-physical-response-only", {
+		fn: "getBranchSelection",
+		branch: [vmMsgEntry(1, vmAssistant({ provider: "anthropic", model: "claude-sonnet-4" }))],
+		models: [],
+	}),
+	vmCase("branch-virtual-change-holds", {
+		fn: "getBranchSelection",
+		branch: [vmModelChange(1, "anthropic", "vm-1"), vmMsgEntry(2, vmAssistant({ model: "claude-sonnet-4" }))],
+		models: [vmModel("vm-1", "anthropic", "pi-virtual")],
+	}),
+	vmCase("branch-virtual-change-unregistered-fallback", {
+		fn: "getBranchSelection",
+		branch: [vmModelChange(1, "anthropic", "vm-1"), vmMsgEntry(2, vmAssistant({ model: "claude-sonnet-4" }))],
+		models: [],
+	}),
+	vmCase("branch-last-model-change-wins", {
+		fn: "getBranchSelection",
+		branch: [
+			vmModelChange(1, "anthropic", "vm-1"),
+			vmMsgEntry(2, vmAssistant()),
+			vmModelChange(3, "openai", "gpt-x"),
+		],
+		models: [vmModel("vm-1", "anthropic", "pi-virtual")],
+	}),
+	vmCase("branch-no-selection-null", {
+		fn: "getBranchSelection",
+		branch: [vmMsgEntry(1, { role: "user", content: "hi", timestamp: 1780000000000 })],
+		models: [],
+	}),
+	vmCase("state-found", {
+		fn: "getVirtualModelState",
+		branch: [vmStateEntry(1, "anthropic", "vm-1", { turn: 3 })],
+		provider: "anthropic",
+		modelId: "vm-1",
+	}),
+	vmCase("state-missing-null", {
+		fn: "getVirtualModelState",
+		branch: [vmStateEntry(1, "anthropic", "vm-1", { turn: 3 })],
+		provider: "openai",
+		modelId: "vm-9",
+	}),
+	vmCase("state-latest-wins", {
+		fn: "getVirtualModelState",
+		branch: [vmStateEntry(1, "anthropic", "vm-1", { turn: 1 }), vmStateEntry(2, "anthropic", "vm-1", { turn: 2 })],
+		provider: "anthropic",
+		modelId: "vm-1",
+	}),
+	vmCase("create-defaults", {
+		fn: "createVirtualModel",
+		definition: { provider: "anthropic", id: "vm-1", name: "Router One" },
+	}),
+	vmCase("create-thinking-levels", {
+		fn: "createVirtualModel",
+		definition: { provider: "openai", id: "vm-2", name: "Router Two", thinkingLevels: ["low", "high"] },
+	}),
+	vmCase("create-full", {
+		fn: "createVirtualModel",
+		definition: {
+			provider: "anthropic",
+			id: "vm-3",
+			name: "Router Three",
+			thinkingLevels: ["off", "medium"],
+			input: ["text"],
+			contextWindow: 128000,
+			maxTokens: 8192,
+		},
+	}),
 ];
+
+// config-value sub-case builder (hoisted; used by the cases above).
+// `extra` merges optional description/headers fields into the args.
+function cv(name, fn, config, env, extra = {}) {
+	return {
+		name: "config-value/" + name,
+		tool: "config-value",
+		args: { fn, config, env: env ?? {}, ...extra },
+	};
+}
+
+// http-dispatcher sub-case builders (hoisted; used by the cases above).
+function hdp(name, value) {
+	return {
+		name: "http-dispatcher/parse-" + name,
+		tool: "http-dispatcher",
+		args: { fn: "parseHttpIdleTimeoutMs", value },
+	};
+}
+function hdf(name, timeoutMs) {
+	return {
+		name: "http-dispatcher/format-" + name,
+		tool: "http-dispatcher",
+		args: { fn: "formatHttpIdleTimeoutMs", timeoutMs },
+	};
+}
+
+// models-store sub-case builders (hoisted; used by the cases above).
+// Entry is a pi-ai ModelsStoreEntry: {models, lastModified?, checkedAt?, etag?}.
+function msEntry(o = {}) {
+	return {
+		// Key order matches the ModelsStoreEntry interface (and the Rust
+		// port's to_value emission) so file-content strings compare equal.
+		models: o.models ?? [msModel()],
+		...(o.lastModified !== undefined ? { lastModified: o.lastModified } : {}),
+		...(o.checkedAt !== undefined ? { checkedAt: o.checkedAt } : {}),
+		...(o.etag !== undefined ? { etag: o.etag } : {}),
+	};
+}
+
+// Full chat-model shape (all fields the typed Rust port round-trips), in
+// the Model interface's field order.
+function msModel(o = {}) {
+	return {
+		id: o.id ?? "model-a",
+		name: o.name ?? "Model A",
+		api: o.api ?? "anthropic",
+		provider: o.provider ?? "anthropic",
+		baseUrl: o.baseUrl ?? "https://api.anthropic.com",
+		input: o.input ?? ["text"],
+		cost: o.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		reasoning: o.reasoning ?? false,
+		contextWindow: o.contextWindow ?? 128000,
+		maxTokens: o.maxTokens ?? 16384,
+	};
+}
+function msInMemory(name, steps) {
+	return {
+		name: "models-store/inMemory-" + name,
+		tool: "models-store",
+		args: { fn: "inMemory", steps },
+	};
+}
+function msFile(name, path, initialContent, steps) {
+	return {
+		name: "models-store/file-" + name,
+		tool: "models-store",
+		args: { fn: "file", path, initialContent, steps },
+	};
+}
+
+// runtime-credentials sub-case builders (hoisted; used by the cases above).
+function rc(name, backing, steps) {
+	return {
+		name: "runtime-credentials/" + name,
+		tool: "runtime-credentials",
+		args: { fn: "overlay", backing, steps },
+	};
+}
+function rcKey(providerId, key) {
+	return { providerId, credential: { type: "api_key", key } };
+}
+
+// virtual-models sub-case builders (hoisted; used by the cases above).
+function vmCase(name, args) {
+	return {
+		name: "virtual-models/" + name,
+		tool: "virtual-models",
+		args: { ...args },
+	};
+}
+/** Structurally valid AssistantMessage with overridable fields. */
+function vmAssistant(o = {}) {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: o.text ?? "ok" }],
+		api: o.api ?? "anthropic",
+		provider: o.provider ?? "anthropic",
+		model: o.model ?? "claude-sonnet-4",
+		usage: {
+			input: 10,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 15,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: o.stopReason ?? "stop",
+		timestamp: 1780000000000,
+	};
+}
+function vmTs(n) {
+	return `2026-02-01T00:00:${String(n).padStart(2, "0")}.000Z`;
+}
+function vmMsgEntry(n, message) {
+	return { type: "message", id: "vm-e" + n, parentId: null, timestamp: vmTs(n), message };
+}
+function vmModelChange(n, provider, modelId) {
+	return { type: "model_change", id: "vm-e" + n, parentId: null, timestamp: vmTs(n), provider, modelId };
+}
+function vmStateEntry(n, provider, modelId, state) {
+	return {
+		type: "custom",
+		id: "vm-e" + n,
+		parentId: null,
+		timestamp: vmTs(n),
+		customType: "pi.virtual-model-state",
+		data: { provider, modelId, state },
+	};
+}
+function vmModel(id, provider, api = "anthropic") {
+	return { id, name: id, api, provider };
+}
 
 // tui-components sub-case builders (hoisted; used by the cases above).
 function tc(name, component, opts = {}) {

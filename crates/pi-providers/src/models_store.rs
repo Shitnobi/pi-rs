@@ -27,7 +27,7 @@ use serde_json::{Map, Value};
 
 use crate::auth_storage::{AuthStorageBackend, FileAuthStorageBackend, LockResult};
 use crate::error::JsError;
-use crate::pi_ai::credential::{check_aborted, AuthOperationOptions};
+use crate::pi_ai::credential::check_aborted;
 use crate::pi_ai::js::{js_json_parse, js_stringify_pretty};
 use crate::pi_ai::models_store::{ModelsStore, ModelsStoreEntry, ModelsStoreOperationOptions};
 use pi_core::text::strip_bom;
@@ -179,7 +179,7 @@ impl<B: AuthStorageBackend> FileModelsStore<B> {
 			}
 		}
 		self.storage.with_lock(
-			|content| {
+			&mut |content| {
 				let data = Self::parse_stored(content)?;
 				// TS reloadFromStorage recomputes the revision under the
 				// lock and records it.
@@ -215,7 +215,7 @@ impl<B: AuthStorageBackend> ModelsStore for FileModelsStore<B> {
 	) -> Result<(), JsError> {
 		let entry_value = entry.to_value();
 		let latest = self.storage.with_lock(
-			|content| {
+			&mut |content| {
 				let mut current = Self::parse_stored(content)?;
 				current.insert(provider_id.to_string(), entry_value.clone());
 				let latest = current.clone();
@@ -240,7 +240,7 @@ impl<B: AuthStorageBackend> ModelsStore for FileModelsStore<B> {
 		options: Option<&ModelsStoreOperationOptions<'_>>,
 	) -> Result<(), JsError> {
 		let latest = self.storage.with_lock(
-			|content| {
+			&mut |content| {
 				let mut current = Self::parse_stored(content)?;
 				current.remove(provider_id);
 				let latest = current.clone();
@@ -261,6 +261,7 @@ impl<B: AuthStorageBackend> ModelsStore for FileModelsStore<B> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::pi_ai::credential::AuthOperationOptions;
 	use pi_tools::shell::AbortSignal;
 	use serde_json::json;
 	use std::cell::RefCell;
@@ -317,7 +318,7 @@ mod tests {
 		assert_eq!(store.read("p", None).unwrap(), None);
 	}
 
-	fn store_with(content: Option<&str>, path: &str) -> (FileModelsStore<FakeBackend>, std::rc::Rc<FakeBackend>) {
+	fn store_with(content: Option<&str>, path: &str) -> (FileModelsStore<FakeBackendHandle>, std::rc::Rc<FakeBackend>) {
 		let backend = std::rc::Rc::new(FakeBackend::new(content));
 		let store = FileModelsStore::with_backend(
 			FakeBackendHandle(std::rc::Rc::clone(&backend)),
@@ -358,7 +359,7 @@ mod tests {
 		assert_eq!(read.etag.as_deref(), Some("\"e\""));
 
 		// The written content is 2-space pretty JSON.
-		let content = backend.0.content.borrow().clone().unwrap();
+		let content = backend.content.borrow().clone().unwrap();
 		assert!(content.contains("\n  \"p\": {"));
 		assert!(content.starts_with('{'));
 
@@ -408,9 +409,9 @@ mod tests {
 			})
 		});
 		_ = store.read("p", None);
-		let locks_before = backend.0.locks.get();
+		let locks_before = backend.locks.get();
 		_ = store.read("p", None);
-		assert_eq!(backend.0.locks.get(), locks_before, "unchanged revision must serve the cache");
+		assert_eq!(backend.locks.get(), locks_before, "unchanged revision must serve the cache");
 	}
 
 	#[test]
@@ -420,8 +421,9 @@ mod tests {
 		let (mut store, backend) = store_with(Some("{\"p\": {\"models\": []}}"), &path);
 		// Armed → fixed revision; unarmed → no revision (always reload).
 		let armed = std::sync::Arc::new(AtomicBool::new(false));
+		let armed_fn = std::sync::Arc::clone(&armed);
 		store.revision_fn = Box::new(move |_| {
-			if armed.load(Ordering::SeqCst) {
+			if armed_fn.load(Ordering::SeqCst) {
 				Some("rev".to_string())
 			} else {
 				None
@@ -430,15 +432,15 @@ mod tests {
 		_ = store.read("p", None).unwrap(); // reload, cached revision None
 		armed.store(true, Ordering::SeqCst);
 		_ = store.read("p", None).unwrap(); // reload, cached revision Some("rev")
-		let locks_cached = backend.0.locks.get();
+		let locks_cached = backend.locks.get();
 		_ = store.read("p", None).unwrap(); // served from cache
-		assert_eq!(backend.0.locks.get(), locks_cached, "unchanged revision serves the cache");
+		assert_eq!(backend.locks.get(), locks_cached, "unchanged revision serves the cache");
 
 		// Writing resets the cached revision (TS leaves it undefined)…
 		store.write("q", &entry("m"), None).unwrap();
 		// …so the next read reloads from storage.
 		_ = store.read("q", None).unwrap();
-		assert!(backend.0.locks.get() > locks_cached, "read after write must reload");
+		assert!(backend.locks.get() > locks_cached, "read after write must reload");
 	}
 
 	#[test]
@@ -451,10 +453,10 @@ mod tests {
 		let store_b = FileModelsStore::with_backend(FakeBackendHandle(std::rc::Rc::clone(&backend)), path)
 			.with_revision_fn(Box::new(|_| Some("same-rev".to_string())));
 		_ = store_b.read("p", None).unwrap(); // prime
-		let locks_before = backend.0.locks.get();
+		let locks_before = backend.locks.get();
 		let result = store_b.read("p", None).unwrap();
 		assert!(result.is_some());
-		assert_eq!(backend.0.locks.get(), locks_before, "stable revision serves the cache");
+		assert_eq!(backend.locks.get(), locks_before, "stable revision serves the cache");
 	}
 
 	#[test]

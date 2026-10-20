@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 pi-core = { path = "../pi-core" }
+pi-providers = { path = "../pi-providers" }
 pi-session = { path = "../pi-session" }
 pi-tools = { path = "../pi-tools" }
 pi-tui = { path = "../pi-tui" }

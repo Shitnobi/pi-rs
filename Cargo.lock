@@ -454,6 +454,7 @@ name = "pi-cli"
 version = "0.1.0"
 dependencies = [
  "pi-core",
+ "pi-providers",
  "pi-session",
  "pi-tools",
  "pi-tui",

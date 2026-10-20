@@ -1,27 +1,58 @@
 # pi-rs Port Tracking
 
-## ⚠️ Current checkpoint (2026-10-19) — resume here
+## ⚠️ Current checkpoint (2026-10-19, later) — resume here
+
+**State: providers foundation wave COMPLETE and parity-green.** The 3 E0308s
+in `models_store.rs` are fixed (the `with_lock` closures now pass `&mut` to
+match the `&mut dyn FnMut` trait parameter; test helper return type corrected
+to `FileModelsStore<FakeBackendHandle>`; one `Arc` clone fix). The wave's
+parity harness entries are landed:
+
+- New module-level harness tools (TS side `parity/ts-harness.js`, Rust side
+  `crates/pi-cli/src/providers_harness.rs`, wired via `run_tool_input`):
+  `config-value` (9 fns, real `/bin/sh` command execution mirroring TS
+  `execSync`), `http-dispatcher` (parse/format), `auth-guidance` (docs-path
+  normalized to `<docs>` on both sides), `models-store` (inMemory + file
+  variants over per-case temp dirs), `runtime-credentials` (overlay over an
+  insertion-ordered fake mirroring pi-ai `InMemoryCredentialStore` Map
+  semantics), `virtual-models` (5 fns).
+- 102 new parity cases (`parity/cases.mjs`): config-value 34,
+  http-dispatcher 18, auth-guidance 5, models-store 13, runtime-credentials
+  13, virtual-models 19. **Full parity: 1390/1390.**
+- `cargo test --workspace`: 1517 passed / 0 failed. Clippy: 0 errors.
+
+Documented divergences (see comments in cases.mjs / harness):
+- `models_store::parse_stored` rejects non-object JSON roots; the TS parse is
+  an unchecked cast (null root throws "Cannot read properties of null",
+  array roots read string keys as undefined). Not parity-tested.
+- `FileAuthStorageBackend` creates the file lazily; TS pre-creates `"{}"` at
+  construction (mode 0o600). The harness mirrors the TS side effect so the
+  final-content comparison matches.
+- `pi_ai::InMemoryCredentialStore` uses BTreeMap (sorted); the harness fake
+  is insertion-ordered to match the TS Map. (If that store becomes
+  parity-visible later, switch it to insertion order per plan trap #20.)
+
+**Next steps (in order):**
+1. Config/resolution wave: `model_config.rs`, `model_resolver.rs`,
+   `provider_attribution.rs` (currently 1-line stubs) — port per
+   `docs/plans/phase3-providers.md` steps 4/6/9, parity-green via new
+   module-level harness entries.
+2. Auth/composer wave: full `auth_storage` (AuthStorage/ReadOnly/
+   InMemoryAuthStorageBackend — only the backend trait is ported),
+   `provider_composer`, `remote_catalog`.
+3. Facade wave: `model_runtime`, `model_registry`.
+Each wave parity-green via new harness entries, then batter targets +
+regressions.
+
+## Previous checkpoint (2026-10-19, earlier) — superseded
 
 **State: mid-tranche, code does NOT compile.** The providers foundation wave
 (commit `8f8b0e4`, uncommitted agent work batch-committed as WIP) is partially
 landed in `crates/pi-providers/`: `auth_guidance.rs`, `auth_storage.rs`,
-`config_value.rs`, `http_config.rs`, `models_store.rs`, `runtime_credentials.rs`,
-`virtual_models.rs`, and the `pi_ai/` modules (`js`, `credential`, `macros`,
-`model`, `models`, `models_store`, `provider`), plus `error.rs` and
-`crates/pi-tools/src/node_fs.rs` changes.
-
-**Immediate next steps (in order):**
-1. Fix the 3 compile errors in `crates/pi-providers/src/models_store.rs`
-   (E0308 at lines ~182, ~218, ~243: the `with_lock` closures' return shape
-   doesn't match `auth_storage::LockResult` — likely needs `LockResult`
-   wrapping or `mut` closure signature adjustment per the compiler hints).
-2. `cargo check --workspace` green, then `cargo test --workspace` green
-   (all other crates were green at 1262/1262 parity + 1228 tests before
-   this tranche).
-3. Resume the providers plan in `docs/plans/phase3-providers.md`:
-   finish the foundation wave, then config/resolution (model_config,
-   model_resolver, provider_attribution), auth/composer, facades — each
-   wave parity-green via new module-level harness entries.
+`config_value.rs`, `http_config.rs`, `models_store.rs`,
+`runtime_credentials.rs`, `virtual_models.rs`, and the `pi_ai/` modules
+(`js`, `credential`, `macros`, `model`, `models`, `models_store`,
+`provider`), plus `error.rs` and `crates/pi-tools/src/node_fs.rs` changes.
 
 Note: `pi-tui` has ~58 pre-existing warnings (known, see T5 notes); only
 `pi-providers` errors block the build.
@@ -954,10 +985,10 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
   `docs/decisions/G8-async-runtime.md`.
 - [x] `crates/pi-providers` scaffolded (Cargo.toml, module stubs, workspace member).
 - [~] Providers tranche: **IN PROGRESS — see "Current checkpoint" at top.**
-      Foundation wave partially committed (`8f8b0e4`: pi-ai type surface,
-      config_value, http_config, auth_guidance, auth_storage,
-      runtime_credentials, models_store, virtual_models — not yet compiling,
-      3 E0308s in models_store.rs). Remaining after foundation:
+      Foundation wave COMPLETE and parity-green (compiles, 1517 tests,
+      1390/1390 parity incl. 102 new module-level cases for config-value,
+      http-dispatcher, auth-guidance, models-store, runtime-credentials,
+      virtual-models). Remaining:
       config/resolution (model_config, model_resolver, provider_attribution)
       → auth/composer (provider_composer, remote_catalog) → facades
       (model_runtime, model_registry) — each wave parity-green via new

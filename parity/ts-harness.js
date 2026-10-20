@@ -19,6 +19,13 @@
  * - "mcp-tools": extensions/mcp/tools.js pure conversion functions (the
  *   output saver is a deterministic fake on both sides)
  * - "tool-search": extensions/tool-search/tool.ts tokenizer/document/ranker
+ * - "config-value": core/resolve-config-value.js config resolution
+ * - "http-dispatcher": core/http-dispatcher.js idle-timeout parse/format
+ * - "auth-guidance": core/auth-guidance.js messages (docs path normalized)
+ * - "models-store": core/models-store.js in-memory and file stores
+ * - "runtime-credentials": core/runtime-credentials.js overlay over the
+ *   real pi-ai InMemoryCredentialStore
+ * - "virtual-models": core/virtual-models.js virtual model helpers
  */
 const path = require("path");
 const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
@@ -1625,6 +1632,190 @@ async function runModule(tool, args, cwd) {
 			}
 			default:
 				throw new Error("unknown tool-search fn: " + args.fn);
+		}
+	}
+	if (tool === "config-value") {
+		const rcv = require(path.join(distDir, "core", "resolve-config-value.js"));
+		// Defeat the process-lifetime command cache so each case executes fresh.
+		rcv.clearConfigValueCache();
+		switch (args.fn) {
+			case "getConfigValueEnvVarName":
+				return { result: rcv.getConfigValueEnvVarName(args.config) ?? null };
+			case "getConfigValueEnvVarNames":
+				return { result: rcv.getConfigValueEnvVarNames(args.config) };
+			case "getMissingConfigValueEnvVarNames":
+				return { result: rcv.getMissingConfigValueEnvVarNames(args.config, args.env) };
+			case "isCommandConfigValue":
+				return { result: rcv.isCommandConfigValue(args.config) };
+			case "isConfigValueConfigured":
+				return { result: rcv.isConfigValueConfigured(args.config, args.env) };
+			case "resolveConfigValue":
+				// Commands execute for real (execSync) — intended on both sides.
+				return { result: rcv.resolveConfigValue(args.config, args.env) ?? null };
+			case "resolveConfigValueOrThrow":
+				return { result: rcv.resolveConfigValueOrThrow(args.config, args.description, args.env) };
+			case "resolveHeaders":
+				return { result: rcv.resolveHeaders(args.headers, args.env) ?? null };
+			case "resolveHeadersOrThrow":
+				return { result: rcv.resolveHeadersOrThrow(args.headers, args.description, args.env) ?? null };
+			default:
+				throw new Error("unknown config-value fn: " + args.fn);
+		}
+	}
+	if (tool === "http-dispatcher") {
+		const hd = require(path.join(distDir, "core", "http-dispatcher.js"));
+		switch (args.fn) {
+			case "parseHttpIdleTimeoutMs":
+				return { result: hd.parseHttpIdleTimeoutMs(args.value) ?? null };
+			case "formatHttpIdleTimeoutMs":
+				return { result: hd.formatHttpIdleTimeoutMs(args.timeoutMs) };
+			default:
+				throw new Error("unknown http-dispatcher fn: " + args.fn);
+		}
+	}
+	if (tool === "auth-guidance") {
+		const ag = require(path.join(distDir, "core", "auth-guidance.js"));
+		const configMod = require(path.join(distDir, "config.js"));
+		// The guidance strings embed getDocsPath() (package-absolute,
+		// machine-specific). Normalize it to "<docs>"; the Rust harness does
+		// the same substitution with its own docsPath.
+		const realDocs = configMod.getDocsPath();
+		const normalize = (s) => String(s).split(realDocs).join("<docs>");
+		switch (args.fn) {
+			case "getProviderLoginHelp":
+				return { result: normalize(ag.getProviderLoginHelp()) };
+			case "formatNoModelsAvailableMessage":
+				return { result: normalize(ag.formatNoModelsAvailableMessage()) };
+			case "formatNoModelSelectedMessage":
+				return { result: normalize(ag.formatNoModelSelectedMessage()) };
+			case "formatNoApiKeyFoundMessage":
+				return { result: normalize(ag.formatNoApiKeyFoundMessage(args.provider)) };
+			default:
+				throw new Error("unknown auth-guidance fn: " + args.fn);
+		}
+	}
+	if (tool === "models-store") {
+		const ms = require(path.join(distDir, "core", "models-store.js"));
+		const runSteps = async (store, steps, reads) => {
+			for (const step of steps || []) {
+				switch (step.op) {
+					case "write":
+						await store.write(step.providerId, step.entry);
+						break;
+					case "read":
+						reads.push((await store.read(step.providerId)) ?? null);
+						break;
+					case "delete":
+						await store.delete(step.providerId);
+						break;
+					default:
+						throw new Error("unknown models-store step op: " + step.op);
+				}
+			}
+		};
+		switch (args.fn) {
+			case "inMemory": {
+				const store = new ms.InMemoryCodingAgentModelsStore();
+				const reads = [];
+				await runSteps(store, args.steps, reads);
+				return { result: { reads } };
+			}
+			case "file": {
+				const os = require("os");
+				const fs = require("fs");
+				const dir = path.join(os.tmpdir(), "pi-parity-models-store", String(process.pid));
+				const abs = path.join(dir, args.path);
+				fs.mkdirSync(path.dirname(abs), { recursive: true });
+				const reads = [];
+				try {
+					if (typeof args.initialContent === "string") {
+						fs.writeFileSync(abs, args.initialContent);
+					} else {
+						// "else leave absent": guarantee absence even when a
+						// prior case in the same process touched the path.
+						fs.rmSync(abs, { force: true });
+					}
+					const store = new ms.FileModelsStore(abs);
+					await runSteps(store, args.steps, reads);
+					const content = fs.existsSync(abs) ? fs.readFileSync(abs, "utf-8") : null;
+					return { result: { reads, content } };
+				} finally {
+					fs.rmSync(dir, { recursive: true, force: true });
+				}
+			}
+			default:
+				throw new Error("unknown models-store fn: " + args.fn);
+		}
+	}
+	if (tool === "runtime-credentials") {
+		const rcm = require(path.join(distDir, "core", "runtime-credentials.js"));
+		// The REAL InMemoryCredentialStore from the pi-ai package (not a fake).
+		const { pathToFileURL } = require("url");
+		const CREDENTIAL_STORE_SRC =
+			process.env.PI_AI_CREDENTIAL_STORE || "/tmp/pi-repo/packages/ai/dist/auth/credential-store.js";
+		const aiAuth = await import(pathToFileURL(CREDENTIAL_STORE_SRC).href);
+		const store = new aiAuth.InMemoryCredentialStore();
+		for (const backing of args.backing || []) {
+			const credential = backing.credential;
+			await store.modify(backing.providerId, async () => credential);
+		}
+		const rc = new rcm.RuntimeCredentials(store);
+		const has = [];
+		const reads = [];
+		const lists = [];
+		const modifies = [];
+		for (const step of args.steps || []) {
+			switch (step.op) {
+				case "set":
+					rc.setRuntimeApiKey(step.providerId, step.key);
+					break;
+				case "remove":
+					rc.removeRuntimeApiKey(step.providerId);
+					break;
+				case "has":
+					has.push(rc.hasRuntimeApiKey(step.providerId));
+					break;
+				case "read":
+					reads.push((await rc.read(step.providerId)) ?? null);
+					break;
+				case "list":
+					lists.push(await rc.list());
+					break;
+				case "delete":
+					await rc.delete(step.providerId);
+					break;
+				case "modify":
+					modifies.push(
+						(await rc.modify(step.providerId, async () => (step.set === undefined ? undefined : step.set))) ??
+							null,
+					);
+					break;
+				default:
+					throw new Error("unknown runtime-credentials step op: " + step.op);
+			}
+		}
+		return { result: { has, reads, lists, modifies } };
+	}
+	if (tool === "virtual-models") {
+		const vm = require(path.join(distDir, "core", "virtual-models.js"));
+		switch (args.fn) {
+			case "isVirtualModel":
+				return { result: vm.isVirtualModel(args.model) };
+			case "findLatestResponse":
+				return { result: vm.findLatestResponse(args.messages) ?? null };
+			case "getBranchSelection": {
+				const models = args.models || [];
+				const result = vm.getBranchSelection(args.branch, (provider, modelId) =>
+					models.find((model) => model.provider === provider && model.id === modelId),
+				);
+				return { result: result ?? null };
+			}
+			case "getVirtualModelState":
+				return { result: vm.getVirtualModelState(args.branch, args.provider, args.modelId) ?? null };
+			case "createVirtualModel":
+				return { result: { model: vm.createVirtualModel(args.definition) } };
+			default:
+				throw new Error("unknown virtual-models fn: " + args.fn);
 		}
 	}
 	return undefined;
