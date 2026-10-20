@@ -14,6 +14,8 @@ mod cli;
 mod config;
 mod migrations;
 mod providers_harness;
+mod config_harness;
+mod resolver_harness;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -194,6 +196,12 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "config-value" | "http-dispatcher" | "auth-guidance" | "models-store"
         | "runtime-credentials" | "virtual-models" => {
             return providers_harness::run(name, &input)
+        }
+        "provider-attribution" | "model-config" => {
+            return config_harness::run(name, &input)
+        }
+        "model-resolver" => {
+            return resolver_harness::run(name, &input)
         }
         _ => {}
     }
