@@ -325,21 +325,23 @@ fn parse_remote_case(input: &Value) -> Result<RemoteCase, String> {
 	})
 }
 
+/// Build the scripted response (called lazily — a case without a response
+/// only errors when the port actually performs a request).
+fn response_from_spec(response: &Value) -> Result<rc::CatalogResponse, String> {
+	let status = response["status"].as_u64().ok_or("missing response status")? as u16;
+	Ok(rc::CatalogResponse {
+		status,
+		ok: (200..300).contains(&status),
+		last_modified: response
+			.get("lastModified")
+			.and_then(Value::as_str)
+			.map(str::to_string),
+		etag: response.get("etag").and_then(Value::as_str).map(str::to_string),
+		body: response.get("body").cloned().unwrap_or(Value::Null),
+	})
+}
+
 impl RemoteCase {
-	fn fetch(&self) -> Result<rc::CatalogResponse, String> {
-		let response = self.response.as_ref().ok_or("remote-catalog: no scripted response")?;
-		let status = response["status"].as_u64().ok_or("missing response status")? as u16;
-		Ok(rc::CatalogResponse {
-			status,
-			ok: (200..300).contains(&status),
-			last_modified: response
-				.get("lastModified")
-				.and_then(Value::as_str)
-				.map(str::to_string),
-			etag: response.get("etag").and_then(Value::as_str).map(str::to_string),
-			body: response.get("body").cloned().unwrap_or(Value::Null),
-		})
-	}
 
 	fn publishes_value(publishes: &[PublishRecord]) -> Value {
 		Value::Array(
@@ -363,9 +365,11 @@ fn run_remote_catalog(input: &Value) -> Result<Value, String> {
 		"withRemoteCatalog" => {
 			let mut dynamic = Vec::new();
 			let mut publishes = Vec::new();
-			let response = case.fetch()?;
-			let response = response.clone();
-			let fetch = move |_req: &rc::CatalogRequest| Ok::<_, pi_providers::error::JsError>(response.clone());
+			let scripted = case.response.clone();
+			let fetch = move |_req: &rc::CatalogRequest| match &scripted {
+				Some(spec) => Ok::<_, pi_providers::error::JsError>(response_from_spec(spec)?),
+				None => Err(pi_providers::error::JsError::new("remote-catalog: no scripted response")),
+			};
 			rc::refresh_with_remote_catalog(
 				&mut dynamic,
 				&mut publishes,
@@ -415,9 +419,11 @@ fn run_remote_catalog(input: &Value) -> Result<Value, String> {
 			};
 			let mut personal = Vec::new();
 			let mut publishes = Vec::new();
-			let response = case.fetch()?;
-			let response = response.clone();
-			let fetch = move |_req: &rc::CatalogRequest| Ok::<_, pi_providers::error::JsError>(response.clone());
+			let scripted = case.response.clone();
+			let fetch = move |_req: &rc::CatalogRequest| match &scripted {
+				Some(spec) => Ok::<_, pi_providers::error::JsError>(response_from_spec(spec)?),
+				None => Err(pi_providers::error::JsError::new("remote-catalog: no scripted response")),
+			};
 			rc::refresh_with_personalized_catalog(
 				&mut personal,
 				&mut publishes,

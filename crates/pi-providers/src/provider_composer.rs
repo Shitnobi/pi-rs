@@ -1199,7 +1199,7 @@ impl OAuthAuth for ComposedOAuthAuth {
 	}
 }
 
-fn compose_api_key_auth(
+pub fn compose_api_key_auth(
 	provider_id: &str,
 	base: Option<&Provider>,
 	config: Option<&Value>,
@@ -1228,7 +1228,7 @@ fn compose_api_key_auth(
 	}))
 }
 
-fn compose_oauth_auth(
+pub fn compose_oauth_auth(
 	provider_id: &str,
 	base: Option<&Provider>,
 	config: Option<&Value>,
@@ -1488,7 +1488,12 @@ pub fn compose_model_provider(
 		},
 	);
 
+	let get_all_models_shared = shared.clone();
+	let get_all_models: crate::pi_ai::provider::GetAllModelsFn =
+		Box::new(move || get_all_models_shared.get_all_models().unwrap_or_default());
+
 	let mut provider = Provider::new(provider_id.to_string(), name, auth, get_models, stream, stream_simple)
+		.with_get_all_models(get_all_models)
 		.with_base_url(base_url)
 		.with_headers(headers);
 

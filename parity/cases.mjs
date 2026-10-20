@@ -5777,8 +5777,234 @@ export const cases = [
 		savedModelId: "gone-model",
 		availableModels: [mrFind("aab", "myprov"), mrFind("claude-opus-4-8", "anthropic")],
 	}),
-	mrRestore("nothing-available", { savedProvider: "anthropic", savedModelId: "gone-model" }),
 
+	...(function () {
+		const __cases = [];
+		// =====================================================================
+		// auth-storage
+		// =====================================================================
+
+		const asCase = (name, fn, extra = {}) => ({ tool: "auth-storage", name: "as-" + name, args: { fn, ...extra } });
+		const asContent = (name, content, fn = "readOnlyLoad") =>
+			asCase(name, fn, { content: content === null ? undefined : content });
+		const oauthCred = { type: "oauth", access: "a", refresh: "r", expires: 1234567890 };
+
+		__cases.push(asCase("load-valid", "readOnlyLoad", { content: JSON.stringify({ p1: { type: "api_key", key: "k" }, p2: oauthCred }) }));
+		__cases.push(asCase("load-missing-file", "readOnlyLoad", {}));
+		__cases.push(asContent("load-invalid-json", "{\"a\":}"));
+		__cases.push(asContent("load-array", "[1,2]"));
+		__cases.push(asContent("load-string", "\"hello\""));
+		__cases.push(asContent("load-null", "null"));
+		__cases.push(asContent("load-bad-credential", JSON.stringify({ p: { type: "nope" } })));
+		__cases.push(asContent("load-bad-api-key-env", JSON.stringify({ p: { type: "api_key", key: "k", env: { a: 1 } } })));
+		__cases.push(asContent("load-oauth-missing-refresh", JSON.stringify({ p: { type: "oauth", access: "a", expires: 1 } })));
+		__cases.push(asContent("load-okey-api-key-no-key", JSON.stringify({ p: { type: "api_key" } })));
+		__cases.push(asCase("read-plain-key", "readOnlyRead", { content: JSON.stringify({ p: { type: "api_key", key: "k" } }), providerId: "p" }));
+		__cases.push(asCase("read-missing-provider", "readOnlyRead", { content: JSON.stringify({ p: { type: "api_key", key: "k" } }), providerId: "q" }));
+		__cases.push(asCase("read-missing-file", "readOnlyRead", { providerId: "p" }));
+		__cases.push(asCase("read-command-key", "readOnlyRead", { content: JSON.stringify({ p: { type: "api_key", key: "!echo hi" } }), providerId: "p" }));
+		__cases.push(asCase("read-env-key-cred-env", "readOnlyRead", { content: JSON.stringify({ p: { type: "api_key", key: "$MY_KEY", env: { MY_KEY: "from-cred" } } }), providerId: "p" }));
+		__cases.push(asCase("read-env-key-ambient", "readOnlyRead", { content: JSON.stringify({ p: { type: "api_key", key: "$MY_KEY" } }), providerId: "p", env: { MY_KEY: "ambient" } }));
+		__cases.push(asCase("read-env-key-missing", "readOnlyRead", { content: JSON.stringify({ p: { type: "api_key", key: "$MY_KEY" } }), providerId: "p" }));
+		__cases.push(asCase("read-oauth", "readOnlyRead", { content: JSON.stringify({ p: oauthCred }), providerId: "p" }));
+		__cases.push(asCase("list-order", "readOnlyList", { content: JSON.stringify({ zz: { type: "api_key", key: "k" }, a: oauthCred, m: { type: "api_key" } }) }));
+		__cases.push(asCase("list-empty-file", "readOnlyList", { content: "{}" }));
+		__cases.push(asCase("list-missing", "readOnlyList", {}));
+		__cases.push(asCase("modify-read-only", "readOnlyModify", { content: "{}", providerId: "p" }));
+		__cases.push(asCase("delete-read-only", "readOnlyDelete", { content: "{}", providerId: "p" }));
+		asCase("backend-initial-and-locks", "inMemoryBackend", {
+			initial: JSON.stringify({ a: 1 }),
+			locks: [{ result: "x" }, { result: "y", next: "{\"b\":2}" }, { result: null }],
+		});
+		__cases.push(asCase("backend-no-initial", "inMemoryBackend", { locks: [{ result: 1 }, { result: 2, next: "{\"a\":true}" }] }));
+		__cases.push(asCase("backend-empty-locks", "inMemoryBackend", { locks: [] }));
+		asCase("seq-read-modify-delete", "authStorageSequence", {
+			data: { p: { type: "api_key", key: "k" } },
+			steps: [
+				{ op: "read", providerId: "p" },
+				{ op: "modify", providerId: "q", set: { type: "api_key", key: "k2" } },
+				{ op: "list" },
+				{ op: "delete", providerId: "p" },
+				{ op: "read", providerId: "p" },
+				{ op: "list" },
+			],
+		});
+		asCase("seq-modify-undefined", "authStorageSequence", {
+			data: { p: { type: "api_key", key: "k" } },
+			steps: [{ op: "modify", providerId: "p" }, { op: "read", providerId: "p" }],
+		});
+		asCase("seq-modify-null-set", "authStorageSequence", {
+			data: { p: { type: "api_key", key: "k" } },
+			steps: [{ op: "modify", providerId: "p", set: null }, { op: "read", providerId: "p" }],
+		});
+		asCase("seq-merge-order", "authStorageSequence", {
+			data: { a: { type: "api_key", key: "1" }, zz: { type: "api_key", key: "2" } },
+			steps: [
+				{ op: "modify", providerId: "m", set: { type: "api_key", key: "3" } },
+				{ op: "delete", providerId: "a" },
+				{ op: "list" },
+			],
+		});
+		asCase("seq-reload-and-read", "authStorageSequence", {
+			data: { p: { type: "api_key", key: "$K", env: { K: "v" } } },
+			steps: [
+				{ op: "read", providerId: "p" },
+				{ op: "reload" },
+				{ op: "read", providerId: "p" },
+				{ op: "read", providerId: "nope" },
+			],
+		});
+		__cases.push(asCase("seq-empty", "authStorageSequence", { steps: [] }));
+		__cases.push(asCase("stored-credential-present", "readStoredCredential", { providerId: "p", content: JSON.stringify({ p: oauthCred }) }));
+		__cases.push(asCase("stored-credential-missing", "readStoredCredential", { providerId: "p" }));
+		__cases.push(asCase("stored-credential-invalid-json", "readStoredCredential", { providerId: "p", content: "{" }));
+
+		// =====================================================================
+		// remote-catalog
+		// =====================================================================
+
+		const rcModel = (id, provider = "prov", extra = {}) => ({
+			id,
+			name: id,
+			api: "openai-completions",
+			provider,
+			baseUrl: "https://api.example",
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			reasoning: false,
+			contextWindow: 1000,
+			maxTokens: 100,
+			...extra,
+		});
+		const rcCase = (name, fn, extra = {}) => ({ tool: "remote-catalog", name: "rc-" + name, args: { fn, providerId: "prov", models: [rcModel("b1"), rcModel("b2")], now: 1000000000000, ...extra } });
+		const rc200 = (body) => ({ status: 200, body });
+		const rcStored = (models, extra = {}) => ({ models, checkedAt: 999999000000, lastModified: 1000000000000, etag: "W/e1", ...extra });
+
+		__cases.push(rcCase("fresh-200", "withRemoteCatalog", { response: rc200([rcModel("r1"), rcModel("b1", "prov", { name: "remote b1" })]) }));
+		__cases.push(rcCase("fresh-200-image-models", "withRemoteCatalog", { allModels: [rcModel("b1"), { ...rcModel("im1"), type: "image", output: ["image"] }], response: rc200([{ ...rcModel("r1"), type: "image", output: ["image"] }]) }));
+		__cases.push(rcCase("fresh-200-other-provider", "withRemoteCatalog", { response: rc200([rcModel("x1", "other")]) }));
+		__cases.push(rcCase("fresh-200-invalid-body", "withRemoteCatalog", { response: rc200(42) }));
+		__cases.push(rcCase("fresh-200-body-object-shape", "withRemoteCatalog", { response: rc200({ models: [rcModel("r1")] }) }));
+		__cases.push(rcCase("no-response-scripted", "withRemoteCatalog", { allowNetwork: false }));
+		__cases.push(rcCase("allow-network-false", "withRemoteCatalog", { response: rc200([rcModel("r1")]), allowNetwork: false }));
+		__cases.push(rcCase("force-true", "withRemoteCatalog", { stored: rcStored([rcModel("s1")]), force: true, response: rc200([rcModel("r1")]) }));
+		__cases.push(rcCase("stored-304-with-models", "withRemoteCatalog", { stored: rcStored([rcModel("s1")]), response: { status: 304, etag: "e" } }));
+		__cases.push(rcCase("stored-404", "withRemoteCatalog", { stored: rcStored([rcModel("s1")]), response: { status: 404 } }));
+		__cases.push(rcCase("stored-501", "withRemoteCatalog", { stored: rcStored([rcModel("s1")]), response: { status: 501 } }));
+		__cases.push(rcCase("no-stored-404", "withRemoteCatalog", { response: { status: 404 } }));
+		__cases.push(rcCase("not-ok-400", "withRemoteCatalog", { response: { status: 400 } }));
+		__cases.push(rcCase("freshness-skip", "withRemoteCatalog", { stored: rcStored([rcModel("s1")]), response: rc200([rcModel("r1")]) }));
+		__cases.push(rcCase("freshness-expired", "withRemoteCatalog", { stored: rcStored([rcModel("s1")], { checkedAt: 999999000000 - 5 * 60 * 60 * 1000 }), response: rc200([rcModel("r1")]) }));
+		__cases.push(rcCase("stored-no-last-modified", "withRemoteCatalog", { stored: { models: [rcModel("s1")], checkedAt: 1000000000000 }, response: rc200([rcModel("r1")]) }));
+		__cases.push(rcCase("stored-older-local", "withRemoteCatalog", { localGeneratedAt: 2000000000000, stored: rcStored([rcModel("s1")]) }));
+		__cases.push(rcCase("stored-newer-local", "withRemoteCatalog", { localGeneratedAt: 500000000000, stored: rcStored([rcModel("s1")]) }));
+		__cases.push(rcCase("local-undefined-restore", "withRemoteCatalog", { stored: rcStored([rcModel("s1")]), allowNetwork: false }));
+		__cases.push(rcCase("etag-empty-stored", "withRemoteCatalog", { stored: { models: [], checkedAt: 999999000000, lastModified: 1000000000000, etag: "e" }, response: rc200([rcModel("r1")]) }));
+		__cases.push(rcCase("pers-identity", "withPersonalizedCatalog", { response: rc200([rcModel("r1")]), personalize: { op: "identity" } }));
+		__cases.push(rcCase("pers-empty", "withPersonalizedCatalog", { response: rc200([rcModel("r1")]), personalize: { op: "empty" } }));
+		__cases.push(rcCase("pers-reverse", "withPersonalizedCatalog", { response: rc200([rcModel("r1")]), personalize: { op: "reverse" } }));
+		__cases.push(rcCase("pers-ids", "withPersonalizedCatalog", { response: rc200([rcModel("r1")]), personalize: { op: "ids", ids: ["b2"] } }));
+		__cases.push(rcCase("pers-404", "withPersonalizedCatalog", { response: { status: 404 }, personalize: { op: "identity" } }));
+		__cases.push(rcCase("pers-not-ok", "withPersonalizedCatalog", { response: { status: 400 }, personalize: { op: "identity" } }));
+		__cases.push(rcCase("pers-stored", "withPersonalizedCatalog", { stored: rcStored([rcModel("s1")]), allowNetwork: false, personalize: { op: "identity" } }));
+		__cases.push(rcCase("pers-allow-network-false", "withPersonalizedCatalog", { response: rc200([rcModel("r1")]), allowNetwork: false, personalize: { op: "identity" } }));
+		__cases.push(rcCase("pers-local-newer", "withPersonalizedCatalog", { localGeneratedAt: 2000000000000, response: rc200([rcModel("r1")]), personalize: { op: "identity" } }));
+
+		// =====================================================================
+		// provider-composer
+		// =====================================================================
+
+		const pcModel = (id, extra = {}) => ({
+			id,
+			name: id,
+			api: "openai-completions",
+			provider: "prov",
+			baseUrl: "https://api.example",
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0.25 },
+			reasoning: false,
+			contextWindow: 10000,
+			maxTokens: 1000,
+			...extra,
+		});
+		const pcBase = (extra = {}) => ({
+			id: "prov",
+			name: "Base Provider",
+			baseUrl: "https://base.example",
+			headers: { "X-Base": "1" },
+			models: [pcModel("b1"), pcModel("b2", { reasoning: true })],
+			auth: { apiKey: { name: "Base key", resolve: { auth: { apiKey: "resolved-base" } } } },
+			...extra,
+		});
+		const pcCase = (name, fn, extra = {}) => ({
+			tool: "provider-composer",
+			name: "pc-" + name,
+			args: { fn, providerId: "prov", ...extra },
+		});
+		const pcExt = (extra = {}) => ({
+			name: "Ext Provider",
+			baseUrl: "https://ext.example",
+			apiKey: "ext-key",
+			...extra,
+		});
+
+		__cases.push(pcCase("validate-ok", "validateExtensionProvider", { base: pcBase(), extension: pcExt({ models: [pcModel("e1")] }) }));
+		__cases.push(pcCase("validate-no-models", "validateExtensionProvider", { base: pcBase(), extension: pcExt() }));
+		__cases.push(pcCase("validate-missing-base-url", "validateExtensionProvider", { base: pcBase(), extension: pcExt({ models: [pcModel("e1", { baseUrl: undefined })] }) }));
+		__cases.push(pcCase("validate-config-oauth-no-base-url", "validateExtensionProvider", { base: pcBase(), modelConfig: { providers: { prov: { oauth: "radius" } } }, extension: pcExt() }));
+		__cases.push(pcCase("compose-layers", "composeModelProvider", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://config.example" } } }, extension: pcExt({ models: [pcModel("e1")] }) }));
+		__cases.push(pcCase("compose-base-only", "composeModelProvider", { base: pcBase() }));
+		__cases.push(pcCase("compose-no-auth", "composeModelProvider", { base: { ...pcBase(), auth: {} }, modelConfig: { providers: { prov: { baseUrl: "https://x.example" } } } }));
+		__cases.push(pcCase("compose-oauth-only", "composeModelProvider", { base: { ...pcBase(), auth: {} }, extension: pcExt({ apiKey: undefined, oauth: { name: "Ext OAuth", getApiKey: "static-key" } }), modelConfig: { providers: { prov: { baseUrl: "https://x.example" } } } }));
+		__cases.push(pcCase("compose-name-precedence", "composeModelProvider", { base: pcBase(), modelConfig: { providers: { prov: { name: "Config Name" } } }, extension: pcExt() }));
+		__cases.push(pcCase("compose-models-json-models", "composeModelProvider", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://config.example", models: [{ id: "c1", name: "C1", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 5000, maxTokens: 500 }] } } } }));
+		__cases.push(pcCase("compose-models-json-override", "composeModelProvider", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://config.example", modelOverrides: { b1: { name: "Renamed", maxTokens: 777 } } } } } }));
+		__cases.push(pcCase("compose-models-json-empty-error", "composeModelProvider", { base: pcBase(), modelConfig: { providers: { prov: {} } } }));
+		__cases.push(pcCase("compose-mixed-types", "composeModelProvider", { base: { ...pcBase(), models: [pcModel("b1"), { ...pcModel("im1"), type: "image", output: ["image"] }, { ...pcModel("cl1"), type: "classifier", contextWindow: 100 }] } }));
+		__cases.push(pcCase("compose-refresh-from-base", "composeModelProvider", { base: pcBase({ refreshModels: { models: [] } }) }));
+		__cases.push(pcCase("refresh-extension", "refreshModels", { base: pcBase(), extension: pcExt({ models: [pcModel("e1")], refreshModels: { models: [pcModel("e1"), pcModel("e2")] } }) }));
+		__cases.push(pcCase("refresh-publish-rejected", "refreshModels", { base: pcBase(), extension: pcExt({ models: [pcModel("e1")], refreshModels: { models: [pcModel("e2")] } }), publishAccept: false }));
+		__cases.push(pcCase("refresh-aborted", "refreshModels", { base: pcBase(), extension: pcExt({ models: [pcModel("e1")], refreshModels: { models: [pcModel("e2")] } }), aborted: true }));
+		__cases.push(pcCase("refresh-extension-error", "refreshModels", { base: pcBase(), extension: pcExt({ refreshModels: { error: "boom" } }) }));
+		__cases.push(pcCase("refresh-base-error", "refreshModels", { base: pcBase({ refreshModels: { error: "base boom" } }), extension: pcExt({ refreshModels: { models: [pcModel("e2")] } }) }));
+		__cases.push(pcCase("refresh-oauth-modify", "refreshModels", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://x.example" } } }, extension: pcExt({ apiKey: undefined, oauth: { name: "O", getApiKey: "k", modifyModels: { op: "prefixIds" } } }), credential: { type: "oauth", access: "a", refresh: "r", expires: 1 } }));
+		__cases.push(pcCase("refresh-oauth-no-credential", "refreshModels", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://x.example" } } }, extension: pcExt({ apiKey: undefined, oauth: { name: "O", getApiKey: "k", modifyModels: { op: "reverse" } } }) }));
+		__cases.push(pcCase("headers-config-model", "resolveConfiguredModelHeaders", { model: pcModel("b1"), modelConfig: { providers: { prov: { baseUrl: "https://x.example", models: [{ id: "b1", headers: { "X-M": "$HDR" } }] } } }, env: { HDR: "mv" } }));
+		__cases.push(pcCase("headers-override", "resolveConfiguredModelHeaders", { model: pcModel("b1"), modelConfig: { providers: { prov: { baseUrl: "https://x.example", modelOverrides: { b1: { headers: { "X-O": "1" } } } } } } }));
+		__cases.push(pcCase("headers-extension-model", "resolveConfiguredModelHeaders", { model: pcModel("b1"), extension: pcExt({ models: [pcModel("b1", { headers: { "X-E": "2" } })] }) }));
+		__cases.push(pcCase("headers-none", "resolveConfiguredModelHeaders", { model: pcModel("b1") }));
+		__cases.push(pcCase("headers-missing-env", "resolveConfiguredModelHeaders", { model: pcModel("b1"), modelConfig: { providers: { prov: { baseUrl: "https://x.example", models: [{ id: "b1", headers: { "X-M": "$NOPE" } }] } } } }));
+		__cases.push(pcCase("compat-config", "resolveCompatibilityRequestConfig", { model: pcModel("b1", { headers: { "X-Model": "m" } }), modelConfig: { providers: { prov: { baseUrl: "https://x.example", headers: { "X-C": "c" }, authHeader: true } } } }));
+		__cases.push(pcCase("compat-extension-auth-header", "resolveCompatibilityRequestConfig", { model: pcModel("b1"), extension: pcExt({ authHeader: true }) }));
+		__cases.push(pcCase("compat-none", "resolveCompatibilityRequestConfig", { model: pcModel("b1") }));
+		__cases.push(pcCase("status-models-json-key", "configuredRequestAuthStatus", { modelConfig: { providers: { prov: { baseUrl: "https://x.example", apiKey: "literal" } } } }));
+		__cases.push(pcCase("status-fallback-extension", "configuredRequestAuthStatus", { extension: pcExt(), modelConfig: { providers: { prov: { baseUrl: "https://x.example", apiKey: "literal" } } } }));
+		__cases.push(pcCase("status-env-configured", "configuredRequestAuthStatus", { modelConfig: { providers: { prov: { baseUrl: "https://x.example", apiKey: "$MY_KEY" } } }, env: { MY_KEY: "v" } }));
+		__cases.push(pcCase("status-env-missing", "configuredRequestAuthStatus", { modelConfig: { providers: { prov: { baseUrl: "https://x.example", apiKey: "$MY_KEY" } } } }));
+		__cases.push(pcCase("status-command", "configuredRequestAuthStatus", { modelConfig: { providers: { prov: { baseUrl: "https://x.example", apiKey: "!echo k" } } } }));
+		__cases.push(pcCase("status-none", "configuredRequestAuthStatus", { modelConfig: { providers: { prov: { baseUrl: "https://x.example" } } } }));
+		__cases.push(pcCase("check-credential-key", "apiKeyCheck", { base: pcBase(), credential: { type: "api_key", key: "stored" } }));
+		__cases.push(pcCase("check-credential-no-key", "apiKeyCheck", { base: pcBase(), credential: { type: "api_key" } }));
+		__cases.push(pcCase("check-inherited", "apiKeyCheck", { base: pcBase({ auth: { apiKey: { name: "B", check: { source: "inherited-check" }, resolve: { auth: { apiKey: "r" } } } } }) }));
+		__cases.push(pcCase("check-raw-env-present", "apiKeyCheck", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://x.example", apiKey: "$MY_KEY" } } }, env: { MY_KEY: "v" } }));
+		__cases.push(pcCase("check-raw-env-missing", "apiKeyCheck", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://x.example", apiKey: "$MY_KEY" } } } }));
+		__cases.push(pcCase("check-command-key", "apiKeyCheck", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://x.example", apiKey: "!echo k" } } } }));
+		__cases.push(pcCase("resolve-credential", "apiKeyResolve", { base: pcBase(), credential: { type: "api_key", key: "stored" } }));
+		__cases.push(pcCase("resolve-raw-env", "apiKeyResolve", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://x.example", apiKey: "$MY_KEY" } } }, env: { MY_KEY: "v" } }));
+		__cases.push(pcCase("resolve-raw-missing-env", "apiKeyResolve", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://x.example", apiKey: "$MY_KEY" } } } }));
+		__cases.push(pcCase("resolve-inherited", "apiKeyResolve", { base: pcBase({ auth: { apiKey: { name: "B", resolve: { auth: { apiKey: "inherited" } } } } }), credential: { type: "api_key", key: "stored" } }));
+		__cases.push(pcCase("resolve-headers-auth-header", "apiKeyResolve", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://x.example", apiKey: "k", headers: { "X-H": "$HDR" }, authHeader: true } } }, env: { HDR: "hv" }, credential: { type: "api_key", key: "stored" } }));
+		__cases.push(pcCase("resolve-credential-env", "apiKeyResolve", { base: pcBase(), credential: { type: "api_key", key: "stored", env: { A: "1" } } }));
+		__cases.push(pcCase("oauth-static", "oauthToAuth", { base: pcBase(), extension: pcExt({ apiKey: undefined, oauth: { name: "O", getApiKey: "static-key" } }), modelConfig: { providers: { prov: { baseUrl: "https://x.example" } } }, credential: { type: "oauth", access: "a", refresh: "r", expires: 1 } }));
+		__cases.push(pcCase("oauth-field", "oauthToAuth", { base: pcBase(), extension: pcExt({ apiKey: undefined, oauth: { name: "O", getApiKey: { field: "access" } } }), modelConfig: { providers: { prov: { baseUrl: "https://x.example" } } }, credential: { type: "oauth", access: "the-access", refresh: "r", expires: 1 } }));
+		__cases.push(pcCase("oauth-headers", "oauthToAuth", { base: pcBase(), modelConfig: { providers: { prov: { baseUrl: "https://x.example", headers: { Authorization: "nope", "X-O": "$HDR" } } } }, extension: pcExt({ apiKey: undefined, oauth: { name: "O", getApiKey: "k" } }), credential: { type: "oauth", access: "a", refresh: "r", expires: 1, env: { HDR: "hv" } } }));
+		__cases.push(pcCase("images-extension", "generateImages", { base: pcBase(), extension: pcExt({ images: { "openai-images": { marker: "ext-images" } } }), model: { ...pcModel("im1"), type: "image", output: ["image"] } }));
+		__cases.push(pcCase("images-error", "generateImages", { base: pcBase(), model: { ...pcModel("im1"), type: "image", output: ["image"] } }));
+		__cases.push(pcCase("classify-extension", "classify", { base: pcBase(), extension: pcExt({ classifiers: { "openai-classifiers": { marker: "ext-classify" } } }), model: { ...pcModel("cl1"), type: "classifier", contextWindow: 100 } }));
+		__cases.push(pcCase("classify-error", "classify", { base: pcBase(), model: { ...pcModel("cl1"), type: "classifier", contextWindow: 100 } }));
+
+		return __cases;
+	})(),
 ];
 
 // config-value sub-case builder (hoisted; used by the cases above).

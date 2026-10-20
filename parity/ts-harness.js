@@ -29,6 +29,12 @@
  * - "provider-attribution": core/provider-attribution.js header merge
  * - "model-config": core/model-config.js load with injected inputs
  * - "model-resolver": core/model-resolver.js resolution functions
+ * - "auth-storage": core/auth-storage.js stores (read-only, in-memory,
+ *   sequence) with per-case temp files and injected env
+ * - "remote-catalog": core/remote-catalog-provider.js overlays with a
+ *   scripted fetch response and Date.now
+ * - "provider-composer": core/provider-composer.js composition over
+ *   scripted base/extension/modelConfig inputs
  */
 const path = require("path");
 const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
@@ -1980,6 +1986,403 @@ async function runModule(tool, args, cwd) {
 			}
 			default:
 				throw new Error("unknown model-resolver fn: " + args.fn);
+		}
+	}
+	if (tool === "auth-storage") {
+		const as = require(path.join(distDir, "core", "auth-storage.js"));
+		const fs = require("fs");
+		const os = require("os");
+		const rcv = require(path.join(distDir, "core", "resolve-config-value.js"));
+		rcv.clearConfigValueCache();
+		// Deterministic ambient env (the Rust harness injects the same map).
+		for (const key of Object.keys(process.env)) delete process.env[key];
+		Object.assign(process.env, args.env ?? {});
+		let counter = 0;
+		const tempFile = (content) => {
+			const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parity-auth-storage-"));
+			const file = path.join(dir, "case-" + counter++ + ".json");
+			if (typeof content === "string") fs.writeFileSync(file, content);
+			return file;
+		};
+		switch (args.fn) {
+			case "readOnlyLoad": {
+				const storage = new as.ReadOnlyAuthStorage(tempFile(args.content));
+				return { result: storage.load() };
+			}
+			case "readOnlyRead": {
+				const storage = new as.ReadOnlyAuthStorage(tempFile(args.content));
+				return { result: (await storage.read(args.providerId)) ?? null };
+			}
+			case "readOnlyList": {
+				const storage = new as.ReadOnlyAuthStorage(tempFile(args.content));
+				return { result: await storage.list() };
+			}
+			case "readOnlyModify": {
+				const storage = new as.ReadOnlyAuthStorage(tempFile(args.content));
+				return { result: await storage.modify(args.providerId ?? "p", async (current) => current) };
+			}
+			case "readOnlyDelete": {
+				const storage = new as.ReadOnlyAuthStorage(tempFile(args.content));
+				return { result: await storage.delete(args.providerId ?? "p") };
+			}
+			case "inMemoryBackend": {
+				const backend = new as.InMemoryAuthStorageBackend();
+				if (typeof args.initial === "string") {
+					backend.withLock(() => ({ result: undefined, next: args.initial }));
+				}
+				const results = [];
+				for (const lock of args.locks ?? []) {
+					results.push(
+						backend.withLock(() => ({
+							result: lock.result ?? null,
+							next: typeof lock.next === "string" ? lock.next : undefined,
+						})),
+					);
+				}
+				return { result: { results, value: backend.value ?? null } };
+			}
+			case "authStorageSequence": {
+				const storage = as.AuthStorage.inMemory(args.data ?? {});
+				const results = [];
+				for (const step of args.steps ?? []) {
+					switch (step.op) {
+						case "read":
+							results.push((await storage.read(step.providerId)) ?? null);
+							break;
+						case "modify":
+							results.push(
+								(await storage.modify(step.providerId, async () => step.set ?? undefined)) ?? null,
+							);
+							break;
+						case "delete":
+							await storage.delete(step.providerId);
+							results.push(null);
+							break;
+						case "list":
+							results.push(await storage.list());
+							break;
+						case "reload":
+							storage.reload();
+							results.push(null);
+							break;
+						default:
+							throw new Error("unknown auth-storage step op: " + step.op);
+					}
+				}
+				return {
+					result: {
+						results,
+						content: storage.storage.value ?? null,
+					},
+				};
+			}
+			case "readStoredCredential": {
+				return { result: (await as.readStoredCredential(args.providerId, tempFile(args.content))) ?? null };
+			}
+			default:
+				throw new Error("unknown auth-storage fn: " + args.fn);
+		}
+	}
+	if (tool === "remote-catalog") {
+		const rcp = require(path.join(distDir, "core", "remote-catalog-provider.js"));
+		const rcv = require(path.join(distDir, "core", "resolve-config-value.js"));
+		rcv.clearConfigValueCache();
+		// Scripted clock and fetch: the response is injected via args.
+		Date.now = () => args.now ?? 0;
+		const spec = args.response ?? null;
+		const makeResponse = () => {
+			const status = spec?.status ?? 200;
+			return {
+				status,
+				ok: status >= 200 && status < 300,
+				headers: {
+					get: (name) => {
+						if (name === "last-modified") return spec?.lastModified ?? null;
+						if (name === "etag") return spec?.etag ?? null;
+						return null;
+					},
+				},
+				json: async () => spec?.body ?? null,
+				text: async () => "",
+				body: undefined,
+			};
+		};
+		globalThis.fetch = async () => makeResponse();
+		const chatOnly = (models) => models.filter((model) => !model.type || model.type === "chat");
+		const baseProvider = {
+			id: args.providerId,
+			name: "base",
+			auth: {},
+			getModels: () => chatOnly(args.models ?? []),
+			getAllModels: () => args.allModels ?? args.models ?? [],
+			stream: () => {},
+			streamSimple: () => {},
+		};
+		const publishes = [];
+		const refreshContext = () => ({
+			stored: args.stored,
+			publish: async (publication) => {
+				publishes.push({ persist: publication.persist ?? null, update: !!publication.update });
+				publication.update?.();
+				return true;
+			},
+			allowNetwork: args.allowNetwork ?? true,
+			force: args.force ?? false,
+			signal: new AbortController().signal,
+		});
+		switch (args.fn) {
+			case "withRemoteCatalog": {
+				const provider = rcp.withRemoteCatalog(baseProvider, undefined, args.localGeneratedAt);
+				await provider.refreshModels(refreshContext());
+				return {
+					result: {
+						getModels: provider.getModels(),
+						getAllModels: provider.getAllModels(),
+						publishes,
+					},
+				};
+			}
+			case "withPersonalizedCatalog": {
+				const op = args.personalize?.op ?? "identity";
+				const ids = args.personalize?.ids ?? [];
+				const personalize = async (catalog) => {
+					if (op === "empty") return [];
+					if (op === "reverse") return [...catalog].reverse();
+					if (op === "ids") return catalog.filter((model) => ids.includes(model.id));
+					return catalog;
+				};
+				const provider = rcp.withPersonalizedCatalog(baseProvider, personalize, undefined, args.localGeneratedAt);
+				await provider.refreshModels(refreshContext());
+				return {
+					result: {
+						getModels: provider.getModels(),
+						getAllModels: provider.getAllModels(),
+						publishes,
+					},
+				};
+			}
+			default:
+				throw new Error("unknown remote-catalog fn: " + args.fn);
+		}
+	}
+	if (tool === "provider-composer") {
+		const pc = require(path.join(distDir, "core", "provider-composer.js"));
+		const rcv = require(path.join(distDir, "core", "resolve-config-value.js"));
+		rcv.clearConfigValueCache();
+		for (const key of Object.keys(process.env)) delete process.env[key];
+		Object.assign(process.env, args.env ?? {});
+		const chatOnly = (models) => models.filter((model) => !model.type || model.type === "chat");
+		const buildBase = () => {
+			const spec = args.base;
+			if (!spec) return undefined;
+			const models = spec.models ?? [];
+			const provider = {
+				id: spec.id ?? "base",
+				name: spec.name ?? "base",
+				baseUrl: spec.baseUrl,
+				headers: spec.headers,
+				auth: {},
+				getModels: () => chatOnly(models),
+				getAllModels: () => spec.allModels ?? models,
+				stream: () => {},
+				streamSimple: () => {},
+			};
+			if (spec.auth?.apiKey) {
+				const key = spec.auth.apiKey;
+				provider.auth.apiKey = {
+					name: key.name ?? "API key",
+					...("check" in key
+						? {
+								check: async () =>
+									key.check && typeof key.check === "object"
+										? { type: "api_key", source: key.check.source }
+										: undefined,
+							}
+						: {}),
+					resolve: async () =>
+						key.resolve && typeof key.resolve === "object" ? { auth: key.resolve.auth } : undefined,
+				};
+			}
+			if (spec.auth?.oauth) {
+				const oauth = spec.auth.oauth;
+				provider.auth.oauth = {
+					name: oauth.name ?? "OAuth",
+					isSubscription: oauth.isSubscription,
+					toAuth: async () => {
+						if (oauth.toAuth?.error) throw new Error(oauth.toAuth.error);
+						return oauth.toAuth ?? {};
+					},
+				};
+			}
+			if (spec.refreshModels) {
+				provider.refreshModels = async () => {
+					if (spec.refreshModels.error) throw new Error(spec.refreshModels.error);
+				};
+			}
+			return provider;
+		};
+		const buildModelConfig = () => ({ getProvider: (id) => args.modelConfig?.providers?.[id] });
+		const providerEntry = () => args.modelConfig?.providers?.[args.providerId];
+		const applyModifyModels = (op, models) => {
+			if (op === "reverse") return [...models].reverse();
+			if (op === "dropFirst") return models.slice(1);
+			if (op === "prefixIds") return models.map((model) => ({ ...model, id: "x-" + model.id }));
+			return models;
+		};
+		const buildExtension = () => {
+			const spec = args.extension;
+			if (!spec) return undefined;
+			const extension = {
+				name: spec.name,
+				baseUrl: spec.baseUrl,
+				apiKey: spec.apiKey,
+				api: spec.api,
+				headers: spec.headers,
+				authHeader: spec.authHeader,
+				models: spec.models,
+			};
+			if (spec.oauth) {
+				const oauth = spec.oauth;
+				extension.oauth = {
+					name: oauth.name,
+					isSubscription: oauth.isSubscription,
+					login: async () => {
+						throw new Error("login not exercised");
+					},
+					refreshToken: async () => {
+						throw new Error("refreshToken not exercised");
+					},
+					getApiKey: (credential) =>
+						typeof oauth.getApiKey === "string"
+							? oauth.getApiKey
+							: (credential?.[oauth.getApiKey?.field ?? "access"] ?? ""),
+					...(oauth.modifyModels
+						? { modifyModels: (models) => applyModifyModels(oauth.modifyModels.op, models) }
+						: {}),
+				};
+			}
+			if (spec.refreshModels) {
+				extension.refreshModels = async () => {
+					if (spec.refreshModels.error) throw new Error(spec.refreshModels.error);
+					return spec.refreshModels.models ?? [];
+				};
+			}
+			if (spec.images) {
+				extension.images = {};
+				for (const [api, impl] of Object.entries(spec.images)) {
+					extension.images[api] = { generateImages: async () => ({ marker: impl.marker }) };
+				}
+			}
+			if (spec.classifiers) {
+				extension.classifiers = {};
+				for (const [api, impl] of Object.entries(spec.classifiers)) {
+					extension.classifiers[api] = { classify: async () => ({ marker: impl.marker }) };
+				}
+			}
+			return extension;
+		};
+		const ctx = { env: async (name) => args.env?.[name], fileExists: async () => false };
+		const composeProvider = () => pc.composeModelProvider(args.providerId, buildBase(), buildModelConfig(), buildExtension());
+		switch (args.fn) {
+			case "validateExtensionProvider":
+				pc.validateExtensionProvider(args.providerId, buildBase(), providerEntry(), buildExtension());
+				return { result: null };
+			case "composeModelProvider": {
+				const provider = composeProvider();
+				return {
+					result: {
+						name: provider.name,
+						baseUrl: provider.baseUrl ?? null,
+						headers: provider.headers ?? null,
+						getModels: provider.getModels(),
+						getAllModels: provider.getAllModels(),
+						apiKey: provider.auth.apiKey?.name ?? null,
+						oauth: provider.auth.oauth?.name ?? null,
+						hasRefreshModels: !!provider.refreshModels,
+						hasGenerateImages: !!provider.generateImages,
+						hasClassify: !!provider.classify,
+					},
+				};
+			}
+			case "refreshModels": {
+				const provider = composeProvider();
+				if (!provider.refreshModels) throw new Error("composed provider has no refreshModels");
+				const published = [];
+				const controller = new AbortController();
+				if (args.aborted) controller.abort();
+				await provider.refreshModels({
+					credential: args.credential,
+					publish: async (publication) => {
+						published.push({ update: !!publication.update });
+						publication.update?.();
+						return args.publishAccept ?? true;
+					},
+					allowNetwork: true,
+					force: false,
+					signal: controller.signal,
+				});
+				return {
+					result: {
+						getModels: provider.getModels(),
+						getAllModels: provider.getAllModels(),
+						published: published[0] ?? null,
+					},
+				};
+			}
+			case "resolveConfiguredModelHeaders":
+				return {
+					result:
+						pc.resolveConfiguredModelHeaders(args.model, providerEntry(), buildExtension(), args.env) ?? null,
+				};
+			case "resolveCompatibilityRequestConfig": {
+				const config = pc.resolveCompatibilityRequestConfig(args.model, providerEntry(), buildExtension());
+				return { result: { headers: config.headers ?? null, authHeader: config.authHeader } };
+			}
+			case "configuredRequestAuthStatus":
+				return { result: pc.configuredRequestAuthStatus(providerEntry(), buildExtension()) ?? null };
+			case "apiKeyCheck": {
+				const provider = composeProvider();
+				const auth = provider.auth.apiKey;
+				if (!auth) throw new Error("no composed API key auth");
+				const credential = args.credential?.type === "api_key" ? args.credential : undefined;
+				const check = await auth.check({ ctx, credential, signal: new AbortController().signal });
+				return { result: check ?? null };
+			}
+			case "apiKeyResolve": {
+				const provider = composeProvider();
+				const auth = provider.auth.apiKey;
+				if (!auth) throw new Error("no composed API key auth");
+				const credential = args.credential?.type === "api_key" ? args.credential : undefined;
+				const resolved = await auth.resolve({ ctx, credential, signal: new AbortController().signal });
+				return {
+					result: resolved
+						? { auth: resolved.auth, env: resolved.env ?? null, source: resolved.source ?? null }
+						: null,
+				};
+			}
+			case "oauthToAuth": {
+				const provider = composeProvider();
+				const oauth = provider.auth.oauth;
+				if (!oauth) throw new Error("no composed OAuth auth");
+				if (args.credential?.type !== "oauth") throw new Error("oauthToAuth requires an OAuth credential");
+				return { result: await oauth.toAuth(args.credential) };
+			}
+			case "generateImages": {
+				const provider = composeProvider();
+				const result = provider.generateImages
+					? await provider.generateImages(args.model, {}, undefined)
+					: null;
+				if (result) result.timestamp = 0;
+				return { result };
+			}
+			case "classify": {
+				const provider = composeProvider();
+				const result = provider.classify ? await provider.classify(args.model, {}, undefined) : null;
+				if (result) result.timestamp = 0;
+				return { result };
+			}
+			default:
+				throw new Error("unknown provider-composer fn: " + args.fn);
 		}
 	}
 	return undefined;
