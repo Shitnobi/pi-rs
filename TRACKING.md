@@ -1282,7 +1282,34 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       skip_serializing_if (TS omits undefined display).
       Divergence note: TS system prompt default docs section
       renders host paths — parity cases always pin customPrompt.
+- [x] **Tranche 12 — auto-retry with backoff.** crates/pi-session/
+      agent_session/retry.rs (~170 LOC): retry_delay_ms (JS f64
+      semantics: baseDelayMs * 2^(attempt-1), safe-integer clamp,
+      maxAgentDelayMs default 60s cap), prepare_retry (enabled gate,
+      attempt increment/decrement-at-max, auto_retry_start with
+      errorMessage || "Unknown error", abortable sleep in the shared
+      retry_abort slot, rejection → finish_cancelled_retry),
+      omit_recovery_attempt (appendContextEdit(targetId, null) +
+      entry_appended + refresh_finalized_context; unresolved-projected
+      throw), abort_retry/is_retrying/abort_retry_tap. mod.rs:
+      Sleeper config injection (None = TokioSleeper; harness
+      RecordingSleeper records sleepLog and resolves or holds),
+      failed_response: Option<MsgId> bookkeeping, abort_tap also
+      aborts the retry handle. run.rs: handle_post_agent_run
+      rewritten to full TS _handlePostAgentRun parity (retryable-error
+      routing, auto_retry_end failure emission + attempt reset).
+      Parity harness `agent-session-retry` (12 cases; suite
+      2484/2484): TS side patches globalThis.setTimeout to record
+      sleepLog [{ms}] with immediate/pending modes; cases cover
+      success/multi-error-then-success/exhausted/disabled,
+      non-retryable + empty-error-message classification, backoff
+      caps (maxAgentDelayMs and safe-integer 1e300 →
+      9007199254740991), abort + abortRetry mid-sleep. Deferred:
+      context-overflow routing (goes through _checkCompaction's
+      overflow-recovery path — tranche 13; case noted in cases.mjs
+      for re-adding there); full _installAgentRequestProjection
+      virtual-model "retry" reason (tranche 14).
 - [ ] Remaining agent-session tranches (phase3-agent-session.md):
-      AgentSession slices 12–17 (retry, compaction,
+      AgentSession slices 13–17 (compaction,
       model, bash, tree, stats) and 18–19 (runtime, services+event-bus),
       extending crates/pi-session.
