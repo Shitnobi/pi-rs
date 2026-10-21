@@ -1249,7 +1249,40 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       baseToolsOverride:{} so createAllToolDefinitions (unported) never
       declares builtin tools the reduced Rust prepare_run can't patch;
       skill-name slice must skip the "/skill:" prefix (TS slice(7)).
+- [x] **Tranche 11 — run orchestration.** Two parts: 22d3c24
+      (library) + 7ea8764 (harness). crates/pi-session/
+      agent_session/run.rs (~560 LOC): full _startRun
+      (recordSelection, pendingToolNames lifecycle),
+      drive_run, _prepareRun (emitBeforeAgentStart + handler
+      messages + prepare_prompt_and_tool_loadout system patch),
+      _handlePostAgentRun (+_finishCancelledRetry),
+      _runBeforeSettleBoundary, boundary emit loop,
+      _applyBoundaryDrafts/_createBoundaryPreviewManager/
+      _buildBoundaryContext/_commitBoundaryDrafts (turn-end
+      boundary drafts with preview-manager uuid/clock sharing),
+      abort. system_prompt.rs (~300 LOC): normalize/
+      buildSystemPromptSections/diffSystemPromptSections port.
+      mod.rs: is_agent_run_active/agent_run_abort_requested as
+      Arc<AtomicBool> + abort_tap; ExtensionHost gains
+      boundary_handlers/emit_boundary. Parity harness
+      `agent-session-run` (12 cases; suite 2472/2472).
+      Key fixes found in differential: (a) _buildBoundaryContext
+      must use the session-side pi_core::messages::convert_to_llm
+      (maps custom/bashExecution/branchSummary → user), NOT the
+      agent's default_convert_to_llm (drops custom roles) —
+      otherwise continuation reports "without runnable model
+      context"; (b) TS keeps the turn loop alive mid-run across a
+      finishTurn-continue, so no agent_end fires between continued
+      turns — Rust suppresses AgentEnd while
+      turn_end_boundary_continue is pending (resumed run owns the
+      final agent_end); (c) <cwd> section content was JSON-quoted
+      (Value Display quotes strings) — unwrap Value::String;
+      (d) build_rules takes declaredTools not selectedTools;
+      (e) CustomMessage.display is Option<bool> with
+      skip_serializing_if (TS omits undefined display).
+      Divergence note: TS system prompt default docs section
+      renders host paths — parity cases always pin customPrompt.
 - [ ] Remaining agent-session tranches (phase3-agent-session.md):
-      AgentSession slices 11–17 (run, retry, compaction,
+      AgentSession slices 12–17 (retry, compaction,
       model, bash, tree, stats) and 18–19 (runtime, services+event-bus),
       extending crates/pi-session.
