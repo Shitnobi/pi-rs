@@ -1415,7 +1415,19 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       branch-summary-generation passes with both sides
       throwing "Entry s-root not found" (session entries are
       not branchable parents — symmetric ground truth).
+- [x] **Tranche 17 — stats & exports.** crates/pi-session/
+      agent_session/stats.rs: getSessionStats (byte-exact
+      stats JSON over mixed entries — message counts, token
+      aggregation, model usage, duration), getContextUsage
+      (reusing pi-core estimate/calculate helpers — provider
+      usage vs estimated vs projected-after-compaction),
+      exportToJsonl, summarizeForBugReport seam. Config gained
+      physical_model_lookup (Option<Arc<dyn Fn(&str,&str) ->
+      Option<Value>>>) for stats' physical-model resolution.
+      Parity harness `agent-session-stats` (25 cases; suite
+      2573/2573): stats on empty/mixed sessions, token
+      aggregation, context usage variants, JSONL export
+      byte-exactness, validation.
 - [ ] Remaining agent-session tranches (phase3-agent-session.md):
-      AgentSession slices 17 (stats)
-      and 18–19 (runtime, services+event-bus),
+      Slices 18–19 (runtime, services+event-bus),
       extending crates/pi-session.
