@@ -7141,6 +7141,432 @@ async function runModule(tool, args, cwd) {
 		}
 	}
 
+
+	if (tool === "agent-session-runtime") {
+		// dist/core/agent-session-runtime.js — AgentSessionRuntime
+		// (switchSession / newSession / fork / importFromJsonl / dispose)
+		// over a runtime factory building real AgentSessions with a
+		// scripted provider. Mirrors the Rust harness
+		// (crates/pi-cli/src/session_runtime_harness.rs). The initial
+		// session is SessionManager.open of <cwd>/pi-parity-asr/sessions/
+		// initial.jsonl (written from config.entries; `files` materializes
+		// further fixtures under the same fixed base — idempotent).
+		// crypto.getRandomValues is zero-filled so pi-ai uuidv7 is
+		// deterministic (sequence 0, 1, ... with the pinned Date).
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		const { AgentSession } = require(path.join(distDir, "core", "agent-session.js"));
+		const { SessionManager } = require(path.join(distDir, "core", "session-manager.js"));
+		const { SettingsManager } = require(path.join(distDir, "core", "settings-manager.js"));
+		const { AgentSessionRuntime, createAgentSessionRuntime } = require(path.join(distDir, "core", "agent-session-runtime.js"));
+		const fs = require("fs");
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		const config = args.config ?? {};
+		if (typeof config !== "object" || config === null || Array.isArray(config)) {
+			throw new Error("invalid config");
+		}
+		if (typeof config.systemPrompt !== "string") throw new Error("missing systemPrompt");
+		if (
+			!Array.isArray(config.entries) ||
+			config.entries.length === 0 ||
+			config.entries[0].type !== "session"
+		) {
+			throw new Error("missing entries");
+		}
+		if (config.model !== undefined && config.model !== null) {
+			if (typeof config.model !== "object" || Array.isArray(config.model)) {
+				throw new Error("invalid model");
+			}
+		}
+		if (!Array.isArray(args.script)) throw new Error("missing script");
+		if (!Array.isArray(args.providerTurns)) throw new Error("missing providerTurns");
+		const handlersIn = args.extensionHandlers ?? {};
+		if (typeof handlersIn !== "object" || handlersIn === null || Array.isArray(handlersIn)) {
+			throw new Error("invalid extensionHandlers");
+		}
+		for (const v of Object.values(handlersIn)) {
+			const ok = v === true || (v !== null && typeof v === "object" && !Array.isArray(v) &&
+				Object.keys(v).length === 1 && v.cancel === true);
+			if (!ok) throw new Error("invalid extensionHandlers");
+		}
+		const filesIn = args.files ?? {};
+		if (typeof filesIn !== "object" || filesIn === null || Array.isArray(filesIn)) {
+			throw new Error("invalid files");
+		}
+		for (const v of Object.values(filesIn)) {
+			if (typeof v !== "string") throw new Error("invalid files");
+		}
+
+		const base = path.join(cwd, "pi-parity-asr");
+		fs.rmSync(base, { recursive: true, force: true });
+		fs.mkdirSync(path.join(base, "sessions"), { recursive: true });
+		const initialPath = path.join(base, "sessions", "initial.jsonl");
+		fs.writeFileSync(initialPath, config.entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+		for (const [rel, content] of Object.entries(filesIn)) {
+			const target = path.join(base, rel);
+			fs.mkdirSync(path.dirname(target), { recursive: true });
+			fs.writeFileSync(target, content);
+		}
+
+		const realDateNow = Date.now;
+		Date.now = () => args.nowMs;
+		const RealDate = Date;
+		class PinnedDate extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(args.nowMs);
+				else super(...ctorArgs);
+			}
+		}
+		globalThis.Date = PinnedDate;
+		const realGetRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto);
+		globalThis.crypto.getRandomValues = (view) => {
+			for (let i = 0; i < view.length; i++) view[i] = 0;
+			return view;
+		};
+		const realCwd = process.cwd();
+		process.chdir(cwd);
+		let uuidI = 0;
+		const nextUuid = () => "uid" + String(++uuidI).padStart(5, "0");
+		try {
+			const trace = [];
+			const sessionIds = [];
+			const promptsSentToAgent = [];
+			let providerIdx = 0;
+			const fakeStreamFn = (_model, context, _options) => {
+				const turn = args.providerTurns[providerIdx];
+				if (turn === undefined) throw new Error("provider script exhausted");
+				providerIdx++;
+				promptsSentToAgent.push(JSON.parse(JSON.stringify(context.messages ?? [])));
+				return {
+					async *[Symbol.asyncIterator]() {
+						for (const event of turn.events ?? []) yield event;
+					},
+					result() {
+						return Promise.resolve(turn.result);
+					},
+				};
+			};
+			const snapEvent = (event) => JSON.parse(JSON.stringify(event));
+			const extensionErrors = [];
+			const fakeRunner = {
+				hasHandlers: (type) => Object.prototype.hasOwnProperty.call(handlersIn, type),
+				emit: async (event) => {
+					trace.push("emit:" + event.type);
+					const h = handlersIn[event.type];
+					if (h && typeof h === "object" && h.cancel === true) return { cancel: true };
+					return undefined;
+				},
+				emitMessageEnd: async (event) => {
+					return undefined;
+				},
+				emitError: (error) => {
+					extensionErrors.push({ extensionPath: error.extensionPath, event: error.event, error: error.error });
+				},
+				invalidate: (_message) => {
+					trace.push("invalidate");
+				},
+				getAllRegisteredTools: () => [],
+				createCommandContext: () => ({}),
+				emitBeforeAgentStart: async (_trigger, options) => ({
+					messages: [],
+					systemPromptOptions: JSON.parse(JSON.stringify(options)),
+				}),
+			};
+			const buildSession = async (sessionManager, factoryCwd) => {
+				sessionIds.push(sessionManager.getSessionId());
+				const projected = sessionManager.buildSessionProjection().messages;
+				const agent = new Agent({
+					streamFn: fakeStreamFn,
+					initialState: { messages: projected },
+				});
+				agent.state.model = config.model ?? undefined;
+				const settingsManager = SettingsManager.inMemory({});
+				const fakeLoader = {
+					getSkills: () => ({ skills: [], diagnostics: [] }),
+					getPrompts: () => ({ prompts: [], diagnostics: [] }),
+					getAgentsFiles: () => ({ agentsFiles: [] }),
+					getSystemPrompt: () => config.systemPrompt,
+					getAppendSystemPrompt: () => [],
+					getExtensions: () => ({
+						extensions: [],
+						runtime: {
+							mcpServers: { setChangeListener: () => {} },
+							pendingProviderRegistrations: [],
+							pendingNativeProviderRegistrations: [],
+							pendingVirtualModelRegistrations: [],
+						},
+						diagnostics: [],
+					}),
+					getThemes: () => ({ themes: [], diagnostics: [] }),
+				};
+				const modelRuntime = {
+					getModel: () => undefined,
+					getPhysicalModel: () => undefined,
+					hasConfiguredAuth: () => true,
+					checkAuth: async () => ({}),
+					isUsingOAuth: () => false,
+				};
+				const session = new AgentSession({
+					agent,
+					sessionManager,
+					settingsManager,
+					cwd: factoryCwd,
+					resourceLoader: fakeLoader,
+					modelRuntime,
+					usesDefaultTools: false,
+					baseToolsOverride: {},
+				});
+				session._extensionRunner = fakeRunner;
+				session.subscribe((event) => {
+					trace.push("sessionEvent:" + event.type);
+				});
+				return session;
+			};
+			const createRuntime = async (options) => {
+				if (options.sessionStartEvent) {
+					trace.push("sessionStart:" + options.sessionStartEvent.reason);
+				}
+				const session = await buildSession(options.sessionManager, options.cwd);
+				return {
+					session,
+					services: {
+						cwd: options.cwd,
+						agentDir: options.agentDir,
+						modelRuntime: {},
+						settingsManager: {},
+						resourceLoader: {},
+						diagnostics: [],
+					},
+					diagnostics: [],
+				};
+			};
+			globalThis.__piParityUuidOverride = nextUuid;
+			const sessionManager = SessionManager.open(initialPath);
+			const runtime = await createAgentSessionRuntime(createRuntime, {
+				cwd: base,
+				agentDir: base,
+				sessionManager,
+			});
+			runtime.setRebindSession(async (_session) => {
+				trace.push("rebind");
+			});
+			runtime.setBeforeSessionInvalidate(() => {
+				trace.push("beforeInvalidate");
+			});
+
+			const results = [];
+			for (const op of args.script) {
+				try {
+					if (op === null || typeof op !== "object" || Array.isArray(op)) {
+						throw new Error("ops entries must be objects");
+					}
+					if (typeof op.op !== "string") throw new Error("missing op");
+					let v = null;
+					switch (op.op) {
+						case "switchSession": {
+							if (typeof op.path !== "string") throw new Error("missing path");
+							v = await runtime.switchSession(op.path, {
+								cwdOverride: op.cwdOverride,
+								withSession: op.withSession === true ? async () => { trace.push("withSession"); } : undefined,
+							});
+							break;
+						}
+						case "newSession": {
+							v = await runtime.newSession({
+								parentSession: op.parentSession,
+								withSession: op.withSession === true ? async () => { trace.push("withSession"); } : undefined,
+							});
+							break;
+						}
+						case "fork": {
+							if (typeof op.entryId !== "string") throw new Error("missing entryId");
+							v = await runtime.fork(op.entryId, {
+								position: op.position,
+								withSession: op.withSession === true ? async () => { trace.push("withSession"); } : undefined,
+							});
+							break;
+						}
+						case "importFromJsonl": {
+							if (typeof op.path !== "string") throw new Error("missing path");
+							v = await runtime.importFromJsonl(op.path, op.cwdOverride);
+							break;
+						}
+						case "dispose":
+							await runtime.dispose();
+							break;
+						case "prompt": {
+							if (typeof op.text !== "string") throw new Error("missing text");
+							await runtime.session.prompt(op.text);
+							break;
+						}
+						case "setRetryAttempt": {
+							if (typeof op.n !== "number") throw new Error("missing n");
+							const session = runtime.session;
+							session._retryAttempt = op.n;
+							const controller = new AbortController();
+							session._retryAbortController = controller;
+							controller.signal.addEventListener("abort", () => {
+								session._retryAbortController = undefined;
+								session._finishCancelledRetry();
+							});
+							break;
+						}
+						case "getSessionId":
+							v = runtime.session.sessionManager.getSessionId();
+							break;
+						default:
+							throw new Error("unknown agent-session-runtime op: " + op.op);
+					}
+					results.push(v === undefined ? null : JSON.parse(JSON.stringify(v)));
+				} catch (e) {
+					results.push({ thrown: e && e.message !== undefined ? e.message : String(e) });
+				}
+			}
+			return {
+				result: {
+					results,
+					sessionIds,
+					shutdownOrder: trace,
+					finalEntries: runtime.session.sessionManager.getEntries(),
+					finalSessionFile: runtime.session.sessionFile ?? null,
+					promptsSentToAgent,
+				},
+			};
+		} finally {
+			globalThis.__piParityUuidOverride = null;
+			globalThis.crypto.getRandomValues = realGetRandomValues;
+			Date.now = realDateNow;
+			globalThis.Date = RealDate;
+			process.chdir(realCwd);
+		}
+	}
+
+	if (tool === "agent-session-services") {
+		// dist/core/agent-session-services.js — createAgentSessionServices
+		// (pending registration drain + applyExtensionFlagValues) over a
+		// recording fake ModelRuntime, SettingsManager.inMemory, and the
+		// real DefaultResourceLoader with inline extension factories.
+		// Mirrors the Rust harness
+		// (crates/pi-cli/src/session_services_harness.rs).
+		const { createAgentSessionServices } = require(path.join(distDir, "core", "agent-session-services.js"));
+		const { DefaultResourceLoader } = require(path.join(distDir, "core", "resource-loader.js"));
+		const { SettingsManager } = require(path.join(distDir, "core", "settings-manager.js"));
+		const fs = require("fs");
+		const optionsIn = args.options;
+		if (typeof optionsIn !== "object" || optionsIn === null || Array.isArray(optionsIn)) {
+			throw new Error("missing options");
+		}
+		if (typeof optionsIn.cwd !== "string") throw new Error("missing cwd");
+		if (optionsIn.agentDir !== undefined && optionsIn.agentDir !== null) {
+			if (typeof optionsIn.agentDir !== "string") throw new Error("invalid agentDir");
+		}
+		const flagPairs = optionsIn.extensionFlagValues ?? [];
+		if (!Array.isArray(flagPairs)) throw new Error("invalid extensionFlagValues");
+		for (const pair of flagPairs) {
+			const ok = Array.isArray(pair) && pair.length === 2 && typeof pair[0] === "string" &&
+				(typeof pair[1] === "boolean" || typeof pair[1] === "string");
+			if (!ok) throw new Error("invalid extensionFlagValues");
+		}
+		const extensionsIn = args.extensions ?? [];
+		if (!Array.isArray(extensionsIn)) throw new Error("invalid extensions");
+		for (const ext of extensionsIn) {
+			if (typeof ext !== "object" || ext === null || Array.isArray(ext)) {
+				throw new Error("invalid extension");
+			}
+			if (typeof ext.name !== "string") throw new Error("invalid extension");
+			const flags = ext.flags ?? [];
+			if (!Array.isArray(flags)) throw new Error("invalid flags");
+			for (const flag of flags) {
+				const ok = typeof flag === "object" && flag !== null && !Array.isArray(flag) &&
+					typeof flag.name === "string" && (flag.type === "boolean" || flag.type === "string");
+				if (!ok) throw new Error("invalid flag");
+			}
+			const providers = ext.providers ?? [];
+			if (!Array.isArray(providers)) throw new Error("invalid providers");
+			for (const provider of providers) {
+				const ok = typeof provider === "object" && provider !== null && !Array.isArray(provider) &&
+					typeof provider.name === "string";
+				if (!ok) throw new Error("invalid providers");
+			}
+			const native = ext.nativeProviders ?? [];
+			if (!Array.isArray(native)) throw new Error("invalid nativeProviders");
+			for (const provider of native) {
+				if (typeof provider !== "object" || provider === null || Array.isArray(provider)) {
+					throw new Error("invalid nativeProviders");
+				}
+			}
+			const virtualModels = ext.virtualModels ?? [];
+			if (!Array.isArray(virtualModels)) throw new Error("invalid virtualModels");
+			for (const definition of virtualModels) {
+				if (typeof definition !== "object" || definition === null || Array.isArray(definition)) {
+					throw new Error("invalid virtualModels");
+				}
+			}
+		}
+		const modelRuntimeIn = args.modelRuntime ?? {};
+		if (typeof modelRuntimeIn !== "object" || modelRuntimeIn === null || Array.isArray(modelRuntimeIn)) {
+			throw new Error("invalid modelRuntime");
+		}
+		const throwOn = modelRuntimeIn.throwOn ?? [];
+		if (!Array.isArray(throwOn)) throw new Error("invalid modelRuntime");
+		for (const op of throwOn) {
+			if (typeof op !== "string") throw new Error("invalid modelRuntime");
+		}
+
+		const base = path.join(cwd, "pi-parity-assv");
+		fs.rmSync(base, { recursive: true, force: true });
+		fs.mkdirSync(base, { recursive: true });
+		const realCwd = process.cwd();
+		process.chdir(cwd);
+		try {
+			const modelRuntimeCalls = [];
+			const modelRuntime = {
+				registerProvider(name, config) {
+					modelRuntimeCalls.push({ op: "registerProvider", name, config: config ?? {} });
+					if (throwOn.includes("registerProvider")) throw new Error("provider boom");
+				},
+				registerNativeProvider(provider) {
+					modelRuntimeCalls.push({ op: "registerNativeProvider", provider });
+					if (throwOn.includes("registerNativeProvider")) throw new Error("native provider boom");
+				},
+				registerVirtualModel(definition) {
+					modelRuntimeCalls.push({ op: "registerVirtualModel", definition });
+					if (throwOn.includes("registerVirtualModel")) throw new Error("virtual model boom");
+				},
+				async refresh(refreshOptions) {
+					modelRuntimeCalls.push({ op: "refresh", allowNetwork: refreshOptions?.allowNetwork });
+				},
+			};
+			const settingsManager = SettingsManager.inMemory({});
+			const extensionFactories = extensionsIn.map((ext) => ({
+				name: ext.name,
+				factory: (pi) => {
+					for (const flag of ext.flags ?? []) pi.registerFlag(flag.name, { type: flag.type });
+					for (const provider of ext.providers ?? []) pi.registerProvider(provider.name, provider.config ?? {});
+					// Native providers register through pi.registerProvider's object form.
+					for (const provider of ext.nativeProviders ?? []) pi.registerProvider(provider);
+					for (const definition of ext.virtualModels ?? []) pi.registerVirtualModel(definition);
+				},
+			}));
+			const services = await createAgentSessionServices({
+				cwd: optionsIn.cwd,
+				agentDir: optionsIn.agentDir ?? base,
+				modelRuntime,
+				settingsManager,
+				extensionFlagValues: new Map(flagPairs),
+				resourceLoaderOptions: { extensionFactories },
+			});
+			return {
+				result: {
+					diagnostics: services.diagnostics,
+					flagValues: Array.from(services.resourceLoader.getExtensions().runtime.flagValues.entries()),
+					modelRuntimeCalls,
+				},
+			};
+		} finally {
+			process.chdir(realCwd);
+		}
+	}
+
 	if (tool === "agent-session-stats") {
 		// dist/core/agent-session.js — the stats & exports slice
 		// (getSessionStats / getContextUsage / exportToJsonl /

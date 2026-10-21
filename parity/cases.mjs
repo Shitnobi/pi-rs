@@ -11845,3 +11845,397 @@ cases.push(
 		providerTurns: [asshTurn("short report")],
 	}),
 );
+
+// ======================================================= agent-session-runtime
+// The session-replacement runtime (AgentSessionRuntime:
+// switchSession / newSession / fork / importFromJsonl / dispose) over a
+// factory building real AgentSessions. The initial session is
+// <cwd>/pi-parity-asr/sessions/initial.jsonl (written from
+// config.entries); `files` materializes further fixtures under the same
+// base. The interleaved shutdownOrder trace records session events,
+// extension emits, beforeInvalidate/invalidate, sessionStart:<reason>,
+// rebind, and withSession, so replacement ordering is compared exactly.
+const asrt = (name, args) => ({
+	name: "agent-session-runtime/" + name,
+	tool: "agent-session-runtime",
+	args: {
+		...args,
+		config: { systemPrompt: "You are the parity assistant.", ...(args.config ?? {}) },
+	},
+});
+const ASRT_NOW = 1760000000000;
+const asrtIso = (ms) => new Date(ms).toISOString();
+const asrtModel = {
+	id: "m-asrt",
+	name: "Runtime Model",
+	api: "anthropic",
+	provider: "anthropic",
+	baseUrl: "",
+	reasoning: false,
+	input: [],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	contextWindow: 100000,
+	maxTokens: 8192,
+};
+const asrtUsage = (o = {}) => ({
+	input: o.input ?? 0,
+	output: o.output ?? 0,
+	cacheRead: o.cacheRead ?? 0,
+	cacheWrite: o.cacheWrite ?? 0,
+	totalTokens: o.totalTokens ?? 0,
+	cost: {
+		input: o.costInput ?? 0,
+		output: o.costOutput ?? 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		total: (o.costInput ?? 0) + (o.costOutput ?? 0),
+	},
+});
+const asrtHeader = (o = {}) => ({
+	type: "session",
+	id: o.id ?? "s-asrt",
+	version: 3,
+	timestamp: asrtIso(o.ms ?? ASRT_NOW),
+	cwd: o.cwd ?? "/tmp",
+	...(o.parentSession !== undefined ? { parentSession: o.parentSession } : {}),
+});
+const asrtUser = (id, parentId, text, ms) => ({
+	type: "message",
+	id,
+	parentId,
+	timestamp: asrtIso(ms),
+	message: { role: "user", content: [{ type: "text", text }], timestamp: ms },
+});
+const asrtAsst = (id, parentId, text, ms) => ({
+	type: "message",
+	id,
+	parentId,
+	timestamp: asrtIso(ms),
+	message: {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "anthropic",
+		provider: "anthropic",
+		model: "m-asrt",
+		usage: asrtUsage(),
+		stopReason: "stop",
+		timestamp: ms,
+	},
+});
+const asrtSeed = () => [
+	asrtHeader(),
+	asrtUser("u1", "s-asrt", "hello there", ASRT_NOW - 9000),
+	asrtAsst("a1", "u1", "hi back", ASRT_NOW - 8000),
+	asrtUser("u2", "a1", "please fork", ASRT_NOW - 7000),
+];
+const asrtJsonl = (entries) => entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+cases.push(
+	// Harness validation.
+	asrt("missing-args", {}),
+	asrt("missing-script", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+	}),
+	asrt("missing-entries", {
+		nowMs: ASRT_NOW,
+		config: { systemPrompt: "x", entries: [] },
+		script: [],
+		providerTurns: [],
+	}),
+	asrt("invalid-handlers", {
+		nowMs: ASRT_NOW,
+		config: { entries: asrtSeed() },
+		script: [],
+		providerTurns: [],
+		extensionHandlers: { session_shutdown: "yes" },
+	}),
+	asrt("invalid-files", {
+		nowMs: ASRT_NOW,
+		config: { entries: asrtSeed() },
+		script: [],
+		providerTurns: [],
+		files: { "sessions/x.jsonl": 5 },
+	}),
+	// Script-op validation (each throws into its results slot).
+	asrt("op-validation", {
+		nowMs: ASRT_NOW,
+		config: { entries: asrtSeed() },
+		script: [null, {}, ["x"], { op: "bogus" }, { op: "switchSession" }, { op: "fork" }, { op: "prompt" }, { op: "setRetryAttempt" }],
+		providerTurns: [],
+	}),
+	// Switch to an existing session file: state loads, the old session is
+	// torn down (shutdown emit -> beforeInvalidate -> invalidate), the new
+	// runtime is created (sessionStart:resume) and rebound.
+	asrt("switch-existing", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		files: {
+			"sessions/other.jsonl": asrtJsonl([
+				asrtHeader({ id: "s-other", ms: ASRT_NOW - 20000 }),
+				asrtUser("ou1", "s-other", "other hello", ASRT_NOW - 19000),
+				asrtAsst("oa1", "ou1", "other reply", ASRT_NOW - 18000),
+			]),
+		},
+		script: [
+			{ op: "switchSession", path: "pi-parity-asr/sessions/other.jsonl" },
+			{ op: "getSessionId" },
+		],
+		providerTurns: [],
+		extensionHandlers: { session_shutdown: true },
+	}),
+	// Switch with a before-switch handler present (non-cancelling) and a
+	// withSession callback: emit precedes the shutdown trace, withSession
+	// runs after rebind.
+	asrt("switch-with-session", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		files: {
+			"sessions/other.jsonl": asrtJsonl([
+				asrtHeader({ id: "s-other", ms: ASRT_NOW - 20000 }),
+				asrtUser("ou1", "s-other", "other hello", ASRT_NOW - 19000),
+			]),
+		},
+		script: [{ op: "switchSession", path: "pi-parity-asr/sessions/other.jsonl", withSession: true }],
+		providerTurns: [],
+		extensionHandlers: { session_before_switch: true, session_shutdown: true },
+	}),
+	// A cancelling session_before_switch handler intercepts the switch:
+	// no teardown, no new session, state unchanged.
+	asrt("switch-cancelled", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		files: {
+			"sessions/other.jsonl": asrtJsonl([asrtHeader({ id: "s-other", ms: ASRT_NOW - 20000 })]),
+		},
+		script: [{ op: "switchSession", path: "pi-parity-asr/sessions/other.jsonl" }],
+		providerTurns: [],
+		extensionHandlers: { session_before_switch: { cancel: true } },
+	}),
+	// A stored session cwd that does not exist throws the byte-exact
+	// MissingSessionCwdError before teardown; a cwdOverride bypasses it.
+	asrt("switch-missing-cwd", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		files: {
+			"sessions/badcwd.jsonl": asrtJsonl([
+				asrtHeader({ id: "s-bad", cwd: "/definitely-missing-asrt", ms: ASRT_NOW - 20000 }),
+				asrtUser("bu1", "s-bad", "bad cwd", ASRT_NOW - 19000),
+			]),
+		},
+		script: [
+			{ op: "switchSession", path: "pi-parity-asr/sessions/badcwd.jsonl" },
+			{ op: "switchSession", path: "pi-parity-asr/sessions/badcwd.jsonl", cwdOverride: "/tmp" },
+		],
+		providerTurns: [],
+	}),
+	// Switching while an auto-retry is pending: the teardown abort fires
+	// auto_retry_end before session_shutdown.
+	asrt("switch-retry-pending", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		files: {
+			"sessions/other.jsonl": asrtJsonl([asrtHeader({ id: "s-other", ms: ASRT_NOW - 20000 })]),
+		},
+		script: [
+			{ op: "setRetryAttempt", n: 2 },
+			{ op: "switchSession", path: "pi-parity-asr/sessions/other.jsonl" },
+		],
+		providerTurns: [],
+		extensionHandlers: { session_shutdown: true },
+	}),
+	// /new: a fresh persisted session (new uuid + pinned timestamp), the
+	// withSession callback runs after rebind.
+	asrt("new-session", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		script: [{ op: "newSession", withSession: true }, { op: "getSessionId" }],
+		providerTurns: [],
+		extensionHandlers: { session_shutdown: true },
+	}),
+	// /new with a parent session: the new header records parentSession.
+	asrt("new-session-parent", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		script: [{ op: "newSession", parentSession: "/tmp/pi-parity-asr/sessions/initial.jsonl" }],
+		providerTurns: [],
+		extensionHandlers: { session_shutdown: true },
+	}),
+	// Fork before a user entry: selectedText is the user text, the branch
+	// is re-chained to that entry's parent, and a before-fork handler is
+	// emitted first.
+	asrt("fork-before", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		script: [{ op: "fork", entryId: "u2" }],
+		providerTurns: [],
+		extensionHandlers: { session_before_fork: true, session_shutdown: true },
+	}),
+	// Fork at an entry: no selectedText, the branch keeps the entry.
+	asrt("fork-at", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		script: [{ op: "fork", entryId: "u2", position: "at" }],
+		providerTurns: [],
+		extensionHandlers: { session_shutdown: true },
+	}),
+	// Forking an unknown id or a non-user entry (position before) throws
+	// before any teardown.
+	asrt("fork-invalid", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		script: [{ op: "fork", entryId: "nope" }, { op: "fork", entryId: "a1" }],
+		providerTurns: [],
+	}),
+	// A cancelling session_before_fork handler intercepts the fork.
+	asrt("fork-cancelled", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		script: [{ op: "fork", entryId: "u2" }],
+		providerTurns: [],
+		extensionHandlers: { session_before_fork: { cancel: true } },
+	}),
+	// importFromJsonl round-trip: the source is copied into the session
+	// dir, switched to, and a second import of the same source collides
+	// with the stored copy and takes a -1 suffix.
+	asrt("import-round-trip", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		files: {
+			"imports/remote.jsonl": asrtJsonl([
+				asrtHeader({ id: "s-remote", ms: ASRT_NOW - 30000 }),
+				asrtUser("ru1", "s-remote", "remote hello", ASRT_NOW - 29000),
+			]),
+		},
+		script: [
+			{ op: "importFromJsonl", path: "pi-parity-asr/imports/remote.jsonl" },
+			{ op: "getSessionId" },
+			{ op: "importFromJsonl", path: "pi-parity-asr/imports/remote.jsonl" },
+		],
+		providerTurns: [],
+		extensionHandlers: { session_before_switch: true, session_shutdown: true },
+	}),
+	// Importing a missing file throws the byte-exact
+	// SessionImportFileNotFoundError (resolved absolute path).
+	asrt("import-missing-file", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		script: [{ op: "importFromJsonl", path: "pi-parity-asr/imports/nope.jsonl" }],
+		providerTurns: [],
+	}),
+	// dispose: shutdown emit -> beforeInvalidate -> invalidate, session
+	// state intact afterwards.
+	asrt("dispose", {
+		nowMs: ASRT_NOW,
+		config: { model: asrtModel, entries: asrtSeed() },
+		script: [{ op: "dispose" }, { op: "getSessionId" }],
+		providerTurns: [],
+		extensionHandlers: { session_shutdown: true },
+	}),
+);
+
+// ======================================================= agent-session-services
+// createAgentSessionServices: pending provider/native/virtual-model
+// registration drain, refresh, and applyExtensionFlagValues over a
+// recording fake ModelRuntime and inline extension factories. Diagnostics
+// are compared byte-exact (unknown options, string-flag-requires-value,
+// registration errors attributed to the inline extension path).
+const assv = (name, args) => ({
+	name: "agent-session-services/" + name,
+	tool: "agent-session-services",
+	args,
+});
+cases.push(
+	// Harness validation.
+	assv("missing-args", {}),
+	assv("missing-cwd", { options: {} }),
+	assv("invalid-flag-values", {
+		options: { cwd: "/tmp/pi-parity-assv", extensionFlagValues: [["x", 5]] },
+	}),
+	assv("invalid-extension", {
+		options: { cwd: "/tmp/pi-parity-assv" },
+		extensions: [{ name: "ext-a", flags: [{ name: "f", type: "number" }] }],
+	}),
+	// Happy path: registrations drain in order (providers, native
+	// providers, virtual models), refresh runs with allowNetwork false,
+	// and flag values land in the runtime map (boolean flags coerce the
+	// provided value to true).
+	assv("happy-path", {
+		options: {
+			cwd: "/tmp/pi-parity-assv",
+			agentDir: "/tmp/pi-parity-assv",
+			extensionFlagValues: [
+				["flagB", false],
+				["flagS", "a value"],
+			],
+		},
+		extensions: [
+			{
+				name: "ext-a",
+				flags: [
+					{ name: "flagB", type: "boolean" },
+					{ name: "flagS", type: "string" },
+				],
+				providers: [{ name: "p1", config: { baseUrl: "https://p1.example" } }],
+				nativeProviders: [{ name: "np1", type: "native" }],
+				virtualModels: [{ id: "vm1", provider: "p1" }],
+			},
+		],
+	}),
+	// No extensions and no flags: only the refresh call is recorded.
+	assv("empty", {
+		options: { cwd: "/tmp/pi-parity-assv", agentDir: "/tmp/pi-parity-assv" },
+	}),
+	// Flag validation: a boolean value for a string flag requires a value;
+	// unregistered names collect into the unknown-options diagnostic
+	// (pluralized).
+	assv("invalid-flags", {
+		options: {
+			cwd: "/tmp/pi-parity-assv",
+			agentDir: "/tmp/pi-parity-assv",
+			extensionFlagValues: [
+				["x", true],
+				["flagS", true],
+				["also", false],
+			],
+		},
+		extensions: [
+			{
+				name: "ext-a",
+				flags: [
+					{ name: "flagS", type: "string" },
+					{ name: "flagB", type: "boolean" },
+				],
+			},
+		],
+	}),
+	// A single unknown option stays singular.
+	assv("unknown-flag-single", {
+		options: {
+			cwd: "/tmp/pi-parity-assv",
+			agentDir: "/tmp/pi-parity-assv",
+			extensionFlagValues: [["x", true]],
+		},
+	}),
+	// Registration drain with every registration throwing: each error is
+	// attributed to the inline extension path, refresh still runs, and the
+	// pending lists are drained.
+	assv("registration-errors", {
+		options: { cwd: "/tmp/pi-parity-assv", agentDir: "/tmp/pi-parity-assv" },
+		extensions: [
+			{
+				name: "ext-a",
+				providers: [
+					{ name: "p1", config: {} },
+					{ name: "p2", config: { baseUrl: "https://p2.example" } },
+				],
+				nativeProviders: [{ name: "np1" }],
+				virtualModels: [{ id: "vm1" }],
+			},
+			{
+				name: "ext-b",
+				providers: [{ name: "p3", config: {} }],
+			},
+		],
+		modelRuntime: { throwOn: ["registerProvider", "registerNativeProvider", "registerVirtualModel"] },
+	}),
+);

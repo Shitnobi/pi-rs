@@ -148,6 +148,35 @@ impl AgentSession {
         if let Some(handle) = self.state.retry_abort.lock().expect("retry abort slot").as_ref() {
             handle.abort();
         }
+        // Harness seam (see `pending_retry_listener`): fire the fake
+        // pending-retry abort listener synchronously, like the TS
+        // `AbortController` listener the parity harness installs.
+        let listener = self
+            .state
+            .pending_retry_listener
+            .lock()
+            .expect("pending retry listener")
+            .take();
+        if let Some(listener) = listener {
+            listener();
+        }
+    }
+
+    /// Harness seam: install a fake in-flight auto-retry. The TS parity
+    /// harness any-casts `session._retryAttempt = n;
+    /// session._retryAbortController = new AbortController()` with an
+    /// abort listener running `_finishCancelledRetry()`; the parked retry
+    /// sleep that real flow observes is unreachable from the harness, so
+    /// [`AgentSession::abort_retry`] fires the listener directly and the
+    /// `auto_retry_end` emission reaches listeners through the shared
+    /// tap (`_emit`).
+    pub fn install_pending_retry(&mut self, attempt: f64) {
+        self.state.retry_attempt = attempt;
+        let emit = self.emit_tap();
+        let listener: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            emit(super::events::auto_retry_end_event(false, attempt, Some("Retry cancelled")));
+        });
+        *self.state.pending_retry_listener.lock().expect("pending retry listener") = Some(listener);
     }
 
     /// TS `get isRetrying` — whether auto-retry is currently in progress.

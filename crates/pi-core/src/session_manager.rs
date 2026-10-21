@@ -309,7 +309,7 @@ fn normalize_posix(path: &str) -> String {
 }
 
 /// TS `resolvePath(input)` (base `process.cwd()` → `AMBIENT_CWD`).
-fn resolve_ambient(input: &str) -> String {
+pub fn resolve_ambient(input: &str) -> String {
     resolve_path(input, AMBIENT_CWD, &PathInputOptions::default())
 }
 

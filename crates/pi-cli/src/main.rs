@@ -31,6 +31,8 @@ mod session_compaction_harness;
 mod session_model_harness;
 mod session_bash_harness;
 mod session_tree_harness;
+mod session_runtime_harness;
+mod session_services_harness;
 mod session_stats_harness;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -226,6 +228,12 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         }
         "agent-session-stats" => {
             return session_stats_harness::run_agent_session_stats_harness(&input, cwd)
+        }
+        "agent-session-runtime" => {
+            return session_runtime_harness::run_agent_session_runtime_harness(&input, cwd)
+        }
+        "agent-session-services" => {
+            return session_services_harness::run_agent_session_services_harness(&input, cwd)
         }
         "agent-session-compaction" => {
             return session_compaction_harness::run_agent_session_compaction_harness(&input)

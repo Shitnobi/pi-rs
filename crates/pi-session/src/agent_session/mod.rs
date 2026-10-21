@@ -8,6 +8,8 @@
 
 pub mod compaction;
 pub mod bash;
+pub mod runtime;
+pub mod services;
 pub mod events;
 pub mod model;
 pub mod event_handler;
@@ -119,6 +121,27 @@ pub trait ModelAuthStore: Send + Sync {
 pub trait ExtensionHost: Send + Sync {
     /// TS `hasHandlers(event)`.
     fn has_handlers(&self, event: &str) -> bool;
+    /// TS `emit({ type: "session_before_switch", ... })` → the
+    /// `SessionBeforeSwitchResult` (`{ cancel? }`). Default: no handlers.
+    fn emit_session_before_switch<'a>(
+        &'a self,
+        _event: Value,
+    ) -> pi_agent::types::BoxFuture<'a, Option<Value>> {
+        Box::pin(async { None })
+    }
+    /// TS `emit({ type: "session_before_fork", ... })` → the
+    /// `SessionBeforeForkResult` (`{ cancel? }`). Default: no handlers.
+    fn emit_session_before_fork<'a>(
+        &'a self,
+        _event: Value,
+    ) -> pi_agent::types::BoxFuture<'a, Option<Value>> {
+        Box::pin(async { None })
+    }
+    /// TS `runner.createCommandContext()` — the base of
+    /// `createReplacedSessionContext`. Default: empty object.
+    fn command_context(&self) -> Value {
+        serde_json::json!({})
+    }
     /// TS `emit(event)` — awaited before public listeners.
     fn emit<'a>(&'a self, event: Value) -> BoxFuture<'a, ()>;
     /// TS `emitMessageEnd(event)` — may return a replacement message.
@@ -380,6 +403,13 @@ struct SessionState {
     /// [`AgentSession::abort_retry_tap`]). `Some` while a retry sleep is
     /// in flight (`isRetrying`).
     retry_abort: Arc<Mutex<Option<pi_agent::host::AbortHandle>>>,
+    /// Harness seam: the runtime-harness fake in-flight auto-retry (the
+    /// TS parity harness any-casts `session._retryAbortController = c`
+    /// with an abort listener running `_finishCancelledRetry()` — the
+    /// parked retry sleep is unreachable from the harness because Rust
+    /// blocks concurrent prompt futures). [`AgentSession::abort_retry`]
+    /// fires it synchronously, mirroring the TS abort listener.
+    pending_retry_listener: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
     /// TS `_scopedModels`.
     scoped_models: Vec<model::ScopedModel>,
     /// The projection-bridge sender the request hook forwards over (see
@@ -495,6 +525,7 @@ impl AgentSession {
                 branch_summary_abort: Arc::new(Mutex::new(None)),
                 summarization_events: Arc::new(Mutex::new(Vec::new())),
                 retry_abort: Arc::new(Mutex::new(None)),
+                pending_retry_listener: Arc::new(Mutex::new(None)),
                 scoped_models: config.scoped_models,
                 projection_bridge,
             },
@@ -867,6 +898,30 @@ impl AgentSession {
                 options: prompt::PromptOptions::default(),
             });
         })
+    }
+
+    /// TS `_extensionRunner` (read at execution time, like the TS).
+    pub(crate) fn extension_host_ref(&self) -> &Arc<dyn ExtensionHost> {
+        &self.extension_host
+    }
+
+    /// TS `createReplacedSessionContext()` — the command-context half; the
+    /// session-bound `sendMessage`/`sendUserMessage` are host-side closures
+    /// in TS (the runtime port records the context only).
+    pub fn create_replaced_session_context(&self) -> Value {
+        self.extension_host.command_context()
+    }
+
+    /// TS `refreshContext()`.
+    pub fn refresh_context(&mut self) {
+        let messages = self
+            .session_manager
+            .build_session_projection()
+            .messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+            .collect();
+        self.agent.set_messages(messages);
     }
 
     // ========================================================================
