@@ -549,6 +549,7 @@ impl AgentSession {
 
     /// The shared `session_before_compact` extension hook. `Err` models a
     /// throw (`"Compaction cancelled"` for cancels).
+    #[allow(clippy::too_many_arguments)]
     async fn emit_session_before_compact(
         &mut self,
         preparation: &Value,
@@ -900,16 +901,16 @@ impl AgentSession {
             entries_after_assistant.iter().any(|entry| field_str(entry, "type") == Some("context_edit"));
         let latest_assistant_edit = entries_after_assistant
             .iter()
-            .filter(|entry| {
+            .rev()
+            .find(|entry| {
                 field_str(entry, "type") == Some("context_edit")
                     && entry.get("targetId").and_then(Value::as_str) == assistant_entry_id.as_deref()
-            })
-            .last();
+            });
         let assistant_retained_for_explicit_recovery = assistant_entry_id.is_none()
             || (!entries_after_assistant.iter().any(|entry| field_str(entry, "type") == Some("compaction"))
                 && latest_assistant_edit
                     .map(|entry| {
-                        entry.get("replacement").map_or(true, |replacement| !replacement.is_null())
+                        entry.get("replacement").is_none_or(|replacement| !replacement.is_null())
                     })
                     .unwrap_or(true));
         let assistant_usage_matches_projection = assistant_is_projected && !has_post_assistant_context_edit;
