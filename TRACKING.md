@@ -1337,7 +1337,44 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       without holding the session mutex (TS abortCompaction is
       callable mid-run); session_before_compact event embeds
       preparation with fileOps serialized as JS Sets ({}).
+- [x] **Tranche 14 — model & thinking.** crates/pi-session/
+      agent_session/model.rs (~690 LOC): setModel (checkAuth
+      gate "No API key for p/id", thinking-level switch,
+      appendModelChange, persist path + scoped enabledModels
+      update), cycleModel/_cycleScopedModel/_cycleAvailableModel
+      (snapshot filtering, modelsAreEqual index −1→0, wrap,
+      ModelCycleResult isScoped), setThinkingLevel (clamp,
+      no-change skip, persist stores requested level,
+      thinking_level_changed + thinking_level_select),
+      cycleThinkingLevel, getAvailableThinkingLevels/
+      supportsThinking, _getThinkingLevelForModelSwitch
+      (explicit > per-model > global default),
+      ModelRouteStore trait, and the full
+      _installAgentRequestProjection (virtual-model routing:
+      lastResponse findLastIndex, userTurn detection,
+      getVirtualModelState, reason retry|user|continuation,
+      VIRTUAL_MODEL_STATE_ENTRY + entry_appended,
+      threshold-compaction re-prepare, routed model/
+      thinkingLevel). pi-agent: AgentEvent::SessionEvent
+      variant, set_model/set_thinking_level/set_prepare_request,
+      PrepareRequestHook → Result (router throw rejects the
+      run). ARCHITECTURE: TS's prepareRequest closure captures
+      `this`; the Rust hook is 'static while the run driver
+      holds &mut self — the hook forwards session accesses
+      (TakeFailed, Canonical, AppendVirtualModelState,
+      ExceedsThreshold, RunThresholdCompaction) over an mpsc
+      bridge serviced by the parked run driver (run_with_bridge
+      select-loop) for 1:1 timing; Canonical first pumps the
+      agent event queue so the projection includes earlier
+      in-run messages and clears turn_end_boundary_continue.
+      Parity harness `agent-session-model` (15 cases; suite
+      2515/2515): fake modelRuntime (snapshot from args.models,
+      scripted resolveModel, configurable checkAuth), settings
+      store recording writes. Divergences: abort signal not
+      threaded to resolveModel; state-entry events flow
+      through the agent event queue — observably identical in
+      all cases.
 - [ ] Remaining agent-session tranches (phase3-agent-session.md):
-      AgentSession slices 14–17 (model, bash,
+      AgentSession slices 15–17 (bash,
       tree, stats) and 18–19 (runtime, services+event-bus),
       extending crates/pi-session.
