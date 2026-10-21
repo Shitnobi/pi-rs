@@ -1120,6 +1120,30 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       providers/all.js import order — NOT filename sort, because '-' < '.'
       would put google-vertex before google). model-runtime 54/54 and
       model-registry 31/31 green again.
-- [ ] Agent-session tranches (tokio, per plan §5.5). Wave-1 spec ready:
-      /home/shinobi/agent-session-wave1-spec.md (tranches 0–2: pi-agent
-      skeleton, message conversion, tool-call pipeline).
+- [~] Agent-session tranches (tokio per plan §5.5 / phase3-agent-session.md
+      §3 — new_current_thread runtime, no tokio::spawn inside the loop):
+      **tranches 0–5 COMPLETE and parity-green.**
+  - Tranche 0 (307f858): pi-agent crate skeleton + `agent-queue`
+    harness entry (steer/followUp queue surface).
+  - Tranches 1–2 (2398a5c): message conversion (`declare_tool_changes`,
+    `default_convert_to_llm`) + tool-call pipeline (`run_tool_call` with
+    before/after hooks).
+  - Tranches 3–4 (f5b19b3): `stream_assistant.rs` (streamAssistantResponse
+    partial-message replacement, thinkingLevel last key) + `loop.rs`
+    (runAgentLoop sequential/parallel, steering re-poll, explicit
+    continuation, length-stopReason failure).
+  - Tranche 5 (f3f7753): full `Agent` class port (`agent.rs`, ~39 KB) —
+    copy-on-assign state, queues, subscribe, prompt/continue/steer/
+    followUp/abort/waitForIdle/reset, runWithLifecycle +
+    handleRunFailure, createLoopConfig, context snapshots. 25 `ag-*`
+    parity cases. Full parity **2491/2491** (parity-full13.txt).
+  - JS-semantics traps recorded in commit messages: first-position key
+    order, undefined-omitted JSON, first-position spread order,
+    Promise.all sequential join, f64 rounding for durationMs.
+- [ ] Remaining agent-session tranches 6–19 (phase3-agent-session.md):
+      file mutation queue, nested tool-call runner, session event
+      handling, tool registry, prompt pipeline, run orchestration,
+      compaction, retry, model/thinking, bash, tree navigation, stats,
+      runtime, services+event-bus. **Before tranche 8:** reconcile the
+      two parallel session-manager ports (crates/pi-session vs
+      crates/pi-core).
