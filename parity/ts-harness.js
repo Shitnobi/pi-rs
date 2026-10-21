@@ -5538,14 +5538,16 @@ async function runModule(tool, args, cwd) {
 		// recorded as promptsSentToAgent). Mirrors the Rust harness
 		// (crates/pi-cli/src/session_prompt_harness.rs).
 		//
-		// Bridges (documented divergences of the Rust tranche-10 port):
-		// `_preparePromptAndToolLoadout` is stubbed to undefined (system-
-		// patch diff is tranche 11); the fake `emitBeforeAgentStart`
-		// returns { systemPromptOptions: clone, messages: [] }; docs-path
-		// bearing auth errors are normalized to "<docs>" on both sides.
-		// The fake _resourceLoader supplies the harness skills/templates
-		// (real skill files are written for non-failing entries; the Rust
-		// side injects the content directly).
+		// Bridges (documented divergences of the Rust port): the fake
+		// `emitBeforeAgentStart` returns { systemPromptOptions: clone,
+		// messages: [] }; docs-path bearing auth errors are normalized to
+		// "<docs>" on both sides. The real `_preparePromptAndToolLoadout`
+		// runs (tranche 11) with the fake _resourceLoader's
+		// `getSystemPrompt` returning `config.systemPrompt` (cases pin a
+		// non-null customPrompt so sections are deterministic). The fake
+		// _resourceLoader supplies the harness skills/templates (real
+		// skill files are written for non-failing entries; the Rust side
+		// injects the content directly).
 		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
 		const { AgentSession } = require(path.join(distDir, "core", "agent-session.js"));
 		const { SessionManager } = require(path.join(distDir, "core", "session-manager.js"));
@@ -5577,6 +5579,9 @@ async function runModule(tool, args, cwd) {
 		const authMode = modelAuthIn.mode ?? "ok";
 		if (authMode !== "ok" && authMode !== "noKey" && authMode !== "oauth") {
 			throw new Error("invalid modelAuth");
+		}
+		if (config.systemPrompt !== undefined && config.systemPrompt !== null) {
+			if (typeof config.systemPrompt !== "string") throw new Error("invalid systemPrompt");
 		}
 		if (
 			!Array.isArray(config.entries) ||
@@ -5688,12 +5693,30 @@ async function runModule(tool, args, cwd) {
 					? { images: { autoResize: settingsIn.imageAutoResize } }
 					: {}),
 			});
-			const resourceLoader = new DefaultResourceLoader({
-				cwd: "/proj",
-				agentDir: "/proj/.pi",
-				settingsManager,
-				noExtensions: true,
-			});
+			// The fake loader must be in place at construction:
+			// _rebuildSystemPrompt reads getSystemPrompt/getSkills/etc.
+			// while the ctor builds the initial tool loadout.
+			const fakeLoader = {
+				getSkills: () => ({ skills, diagnostics: [] }),
+				getPrompts: () => ({ prompts: templates, diagnostics: [] }),
+				getAgentsFiles: () => ({ agentsFiles: [] }),
+				getSystemPrompt: () => config.systemPrompt ?? undefined,
+				getAppendSystemPrompt: () => [],
+				getExtensions: () => ({
+					extensions: [],
+					// The ctor builds a real ExtensionRunner over this
+					// runtime before the fake runner replaces it; the
+					// fields bindCore iterates must exist.
+					runtime: {
+						mcpServers: { setChangeListener: () => {} },
+						pendingProviderRegistrations: [],
+						pendingNativeProviderRegistrations: [],
+						pendingVirtualModelRegistrations: [],
+					},
+					diagnostics: [],
+				}),
+				getThemes: () => ({ themes: [], diagnostics: [] }),
+			};
 			const modelRuntime = {
 				getModel: () => undefined,
 				getPhysicalModel: () => undefined,
@@ -5706,7 +5729,7 @@ async function runModule(tool, args, cwd) {
 				sessionManager,
 				settingsManager,
 				cwd: "/proj",
-				resourceLoader,
+				resourceLoader: fakeLoader,
 				modelRuntime,
 				usesDefaultTools: false,
 				// Empty base-tools override on both sides: the Rust port has
@@ -5774,19 +5797,6 @@ async function runModule(tool, args, cwd) {
 				}),
 			};
 			session._extensionRunner = fakeRunner;
-			const fakeLoader = {
-				getSkills: () => ({ skills, diagnostics: [] }),
-				getPrompts: () => ({ prompts: templates, diagnostics: [] }),
-				getAgentsFiles: () => ({ agentsFiles: [] }),
-				getSystemPrompt: () => undefined,
-				getAppendSystemPrompt: () => [],
-				getExtensions: () => ({ extensions: [], diagnostics: [] }),
-				getThemes: () => ({ themes: [], diagnostics: [] }),
-			};
-			session._resourceLoader = fakeLoader;
-			// Bridge: the Rust tranche-10 prepare_run skips the
-			// system-patch diff (tranche 11 TODO).
-			session._preparePromptAndToolLoadout = () => undefined;
 
 			const sessionEvents = [];
 			const dispositions = [];

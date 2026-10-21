@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 pi-core = { path = "../pi-core" }
 pi-agent = { path = "../pi-agent" }
+pi-providers = { path = "../pi-providers" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 fancy-regex = { workspace = true }

@@ -30,12 +30,13 @@
 //! `_extensionRunner` and `_resourceLoader` are swapped for fakes after
 //! construction. `docsPath`-bearing model/auth error messages are
 //! normalized to `<docs>` on both sides (TS embeds the real
-//! `getDocsPath()`). The TS side stubs `_preparePromptAndToolLoadout`
-//! (system-patch diff — tranche 11) to mirror the reduced Rust
-//! `prepare_run`, and its fake `emitBeforeAgentStart` returns
-//! `{ systemPromptOptions: clone, messages: [] }` (no handler messages).
-//! The TS harness writes real skill files; the Rust side reads the
-//! injected `content` directly (`readFails` stands in for ENOENT).
+//! `getDocsPath()`). Both sides run the real `_preparePromptAndToolLoadout`
+//! (system-patch diff): the fake loader's `getSystemPrompt` is
+//! `config.systemPrompt` (cases pin a non-null customPrompt so the
+//! sections are deterministic), and the fake `emitBeforeAgentStart`
+//! returns `{ systemPromptOptions: clone, messages: [] }` (no handler
+//! messages). The TS harness writes real skill files; the Rust side reads
+//! the injected `content` directly (`readFails` stands in for ENOENT).
 //!
 //! Ops and their logged results (`results`): per-op errors surface as
 //! `{ "thrown": msg }` (docs paths normalized).
@@ -234,6 +235,11 @@ pub fn run_agent_session_prompt_harness(args: &Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_DOCS_PATH)
         .to_string();
+    let system_prompt = match config.get("systemPrompt") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(prompt)) => Some(prompt.clone()),
+        Some(_) => return Err("invalid systemPrompt".to_string()),
+    };
     let entries = config
         .get("entries")
         .and_then(Value::as_array)
@@ -462,6 +468,8 @@ pub fn run_agent_session_prompt_harness(args: &Value) -> Result<Value, String> {
         })),
         skills,
         prompt_templates: templates,
+        system_prompt,
+        model_lookup: None,
     });
 
     // Public listener collector (the TS side deep-clones each event at

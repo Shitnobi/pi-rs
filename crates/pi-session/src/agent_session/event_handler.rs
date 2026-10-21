@@ -6,6 +6,7 @@
 //! `agent_settled` emission with deferred actions.
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 
 use serde_json::{json, Map, Value};
 
@@ -39,7 +40,9 @@ impl AgentSession {
         // An abort requested while the run was starting, e.g. during
         // before_agent_start, stops it here. agent_start is awaited before
         // the first request.
-        if matches!(event, SessionAgentEvent::AgentStart) && self.state.agent_run_abort_requested {
+        if matches!(event, SessionAgentEvent::AgentStart)
+            && self.state.agent_run_abort_requested.load(Ordering::SeqCst)
+        {
             self.agent.abort();
         }
         // Record the calls a tool made through ctx.executeTool() and their
@@ -175,7 +178,7 @@ impl AgentSession {
 
     /// TS `_willRetryAfterAgentEnd(event)`.
     fn will_retry_after_agent_end(&mut self, messages: &[MsgId]) -> bool {
-        if self.state.agent_run_abort_requested {
+        if self.state.agent_run_abort_requested.load(std::sync::atomic::Ordering::SeqCst) {
             return false;
         }
         let settings = self.settings.retry_settings();
@@ -284,7 +287,7 @@ impl AgentSession {
 
     /// TS `_refreshFinalizedContext` — refresh the public finalized
     /// transcript from the canonical session projection.
-    fn refresh_finalized_context(&mut self) {
+    pub(super) fn refresh_finalized_context(&mut self) {
         let projection = self.session_manager.build_session_projection();
         // Entries targeted by a context edit project fresh message objects
         // (TS); unedited message entries project the stored message object
@@ -329,10 +332,10 @@ impl AgentSession {
     /// `agent_settled`, deferred settled actions, idle resolution.
     pub async fn emit_agent_settled(&mut self) -> Result<(), String> {
         // TODO(tranche 13): this._cacheWarmer?.onAgentSettled();
-        self.state.is_agent_run_active = false;
+        self.state.is_agent_run_active.store(false, std::sync::atomic::Ordering::SeqCst);
         self.state.is_emitting_agent_settled = true;
         // TS try/finally: the flag resets even when a listener throws.
-        let aborted = self.state.agent_run_abort_requested;
+        let aborted = self.state.agent_run_abort_requested.load(std::sync::atomic::Ordering::SeqCst);
         let settled = super::events::agent_settled_event(aborted);
         self.extension_host.emit(settled).await;
         self.emit(super::events::agent_settled_event(aborted));
@@ -507,18 +510,50 @@ impl AgentSession {
     /// TS `_dispatchTurnEndBoundary(message, toolResults)` — the prologue
     /// the events slice owns (activity outcome + persisted-entry lookup);
     /// the boundary emission and draft commits are tranche 11.
-    async fn dispatch_turn_end_boundary(&mut self, message: MsgId, _tool_results: &[MsgId]) -> bool {
+    async fn dispatch_turn_end_boundary(&mut self, message: MsgId, tool_results: &[MsgId]) -> bool {
         self.state.last_activity_outcome = match str_field(&self.state.arena[message], "stopReason") {
             Some("aborted") => "aborted".to_string(),
             Some("error") => "error".to_string(),
             _ => "completed".to_string(),
         };
-        let _message_entry_id = self.find_persisted_message_entry_id(message);
-        if !self.extension_host.has_handlers("turn_end") {
+        let message_entry_id = self.find_persisted_message_entry_id(message);
+        if self.extension_host.boundary_handlers("turn_end") == 0 {
             return false;
         }
-        // TODO(tranche 11): emitBoundary + _commitBoundaryDrafts +
-        // continuation validation.
-        false
+        let Some(message_entry_id) = message_entry_id else {
+            self.extension_host.emit_error(json!({
+                "extensionPath": "<boundary>",
+                "event": "turn_end",
+                "error": "turn_end could not resolve the persisted assistant entry ID",
+            }));
+            return false;
+        };
+        let tool_result_entry_ids: Vec<Value> = tool_results
+            .iter()
+            .filter_map(|&result| self.find_persisted_message_entry_id(result))
+            .map(|id| json!(id))
+            .collect();
+        let mut base = Map::new();
+        base.insert("type".to_string(), json!("turn_end"));
+        base.insert("turnIndex".to_string(), pi_core::ai::js_number(self.state.turn_index));
+        base.insert("message".to_string(), self.state.arena[message].clone());
+        base.insert(
+            "toolResults".to_string(),
+            Value::Array(tool_results.iter().map(|&r| self.state.arena[r].clone()).collect()),
+        );
+        base.insert("messageEntryId".to_string(), json!(message_entry_id));
+        base.insert("toolResultEntryIds".to_string(), Value::Array(tool_result_entry_ids));
+        base.insert("outcome".to_string(), json!(self.state.last_activity_outcome.clone()));
+        let boundary = self.emit_boundary(Value::Object(base), "turn_end").await;
+        // Divergence (module docs): dispatched post-loop, so a turn_end
+        // `continue` cannot restart the loop; drafts still commit in order.
+        let _ = self.commit_boundary_drafts(&boundary.entries);
+        if boundary.continue_
+            && !self.build_boundary_context(&[], "turn_end").map(|c| c.can_continue).unwrap_or(false)
+        {
+            self.report_invalid_boundary_continuation("turn_end");
+            return false;
+        }
+        boundary.continue_
     }
 }

@@ -2234,6 +2234,12 @@ impl SessionManager {
         }
     }
 
+    /// The manager's generators — shared with preview managers so entry
+    /// ids draw from the same sequence (TS: one global uuid source).
+    pub fn generators(&self) -> &Generators {
+        &self.gen
+    }
+
     pub fn get_header(&self) -> Option<&Value> {
         self.file_entries.iter().find(|e| entry_type(e) == "session")
     }

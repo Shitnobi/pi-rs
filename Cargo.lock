@@ -511,6 +511,7 @@ dependencies = [
  "fancy-regex",
  "pi-agent",
  "pi-core",
+ "pi-providers",
  "serde",
  "serde_json",
  "tokio",

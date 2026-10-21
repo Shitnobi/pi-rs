@@ -87,7 +87,15 @@ const astBase = (extra = {}) => ({
 const asp = (name, args) => ({
 	name: "agent-session-prompt/" + name,
 	tool: "agent-session-prompt",
-	args,
+	args: {
+		...args,
+		// Every asp case pins a custom system prompt: the real
+		// _preparePromptAndToolLoadout runs on both sides (tranche 11),
+		// and a non-null customPrompt makes the system-patch sections
+		// deterministic (the default preamble/docs sections embed host
+		// paths).
+		config: { systemPrompt: "You are the parity assistant.", ...(args.config ?? {}) },
+	},
 });
 const ASP_NOW = 1747000000000;
 const aspHeader = () => [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }];

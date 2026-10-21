@@ -9,9 +9,12 @@
 pub mod events;
 pub mod event_handler;
 pub mod prompt;
+pub mod run;
+pub mod system_prompt;
 pub mod tools;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -60,6 +63,8 @@ pub trait ExtensionHost: Send + Sync {
     fn emit_message_end<'a>(&'a self, event: Value) -> BoxFuture<'a, Option<Value>>;
     /// TS `emitError(error)`.
     fn emit_error(&self, error: Value);
+    /// TS `runner.invalidate(message)` (dispose; default: no-op).
+    fn invalidate(&self, _message: &str) {}
     /// TS `runner.getCommand(name) !== undefined` (prompt slice).
     fn get_command(&self, _name: &str) -> bool {
         false
@@ -79,12 +84,36 @@ pub trait ExtensionHost: Send + Sync {
     ) -> pi_agent::types::BoxFuture<'a, prompt::InputAction> {
         Box::pin(async { prompt::InputAction::Continue })
     }
-    /// TS `invalidate(message)`.
-    fn invalidate(&self, message: &str);
     /// TS `runner.getAllRegisteredTools()` — the tools-slice seam (plan §4).
     /// Default: none (the events-slice fakes register no tools).
     fn get_all_registered_tools(&self) -> Vec<tools::RegisteredTool> {
         Vec::new()
+    }
+    /// TS `runner.emitBeforeAgentStart(trigger, systemPromptOptions)` →
+    /// `(handlerMessages, systemPromptOptions)` (the options Value the
+    /// handlers may have edited, `forceSystemPrompt` included). Default:
+    /// passthrough.
+    fn emit_before_agent_start<'a>(
+        &'a self,
+        _trigger: Value,
+        options: Value,
+    ) -> pi_agent::types::BoxFuture<'a, (Vec<Value>, Value)> {
+        Box::pin(async move { (Vec::new(), options) })
+    }
+    /// TS `snapshotEventHandlers(type).length` for boundary events —
+    /// the handler count driving [`AgentSession::emit_boundary`].
+    fn boundary_handlers(&self, _event_type: &str) -> usize {
+        0
+    }
+    /// One boundary handler invocation (registration order). `None` =
+    /// the handler returned `undefined`; `Some(value)` is the TS
+    /// `BoundaryResult` (`{entries?, continue?}`).
+    fn emit_boundary_handler<'a>(
+        &'a self,
+        _index: usize,
+        _event: Value,
+    ) -> pi_agent::types::BoxFuture<'a, Option<Value>> {
+        Box::pin(async { None })
     }
 }
 
@@ -132,6 +161,13 @@ pub struct AgentSessionConfig {
     pub skills: Vec<prompt::SkillSpec>,
     /// TS `resourceLoader.getPrompts().prompts`.
     pub prompt_templates: Vec<pi_core::prompt_templates::PromptTemplate>,
+    /// TS `resourceLoader.getSystemPrompt()` (custom prompt; the default
+    /// preamble/docs sections render host paths, so parity cases always
+    /// pin one — see [`system_prompt`] docs).
+    pub system_prompt: Option<String>,
+    /// TS `_modelRuntime.getModel(provider, modelId)` — the `_recordSelection`
+    /// seam (tranche 14 ports the full runtime).
+    pub model_lookup: Option<Arc<dyn Fn(&str, &str) -> Option<Value> + Send + Sync>>,
 }
 
 /// A deferred `agent_settled` action (TS `_deferredSettledActions` holds
@@ -160,10 +196,10 @@ pub type SessionEventListener = Box<dyn FnMut(&Value) + Send>;
 struct SessionState {
     /// TS `_eventListeners`.
     listeners: Vec<(usize, SessionEventListener)>,
-    /// TS `_isAgentRunActive`.
-    is_agent_run_active: bool,
-    /// TS `_agentRunAbortRequested`.
-    agent_run_abort_requested: bool,
+    /// TS `_isAgentRunActive` (shared — see [`AgentSession::shared`]).
+    is_agent_run_active: Arc<AtomicBool>,
+    /// TS `_agentRunAbortRequested` (shared).
+    agent_run_abort_requested: Arc<AtomicBool>,
     /// TS `_steeringMessages` — pending steering texts for UI display.
     steering_messages: Vec<String>,
     /// TS `_followUpMessages`.
@@ -205,6 +241,10 @@ struct SessionState {
     deferred_log: Vec<String>,
     /// TS `_isEmittingAgentSettled`.
     is_emitting_agent_settled: bool,
+    /// TS `_isBeforeSettle` (shared — see [`AgentSession::abort_tap`]).
+    is_before_settle: Arc<AtomicBool>,
+    /// TS `_abortDuringBeforeSettle` (shared).
+    abort_during_before_settle: Arc<AtomicBool>,
     /// Tools slice state (TS `_toolRegistry` & friends; [`tools`]).
     tools: tools::ToolsState,
     /// Bridge state: the message currently streaming (TS: the one mutated
@@ -237,6 +277,10 @@ pub struct AgentSession {
     skills: Vec<prompt::SkillSpec>,
     /// TS `resourceLoader.getPrompts().prompts`.
     prompt_templates: Vec<pi_core::prompt_templates::PromptTemplate>,
+    /// TS `_modelRuntime.getModel` (record_selection seam).
+    model_lookup: Option<Arc<dyn Fn(&str, &str) -> Option<Value> + Send + Sync>>,
+    /// Host paths the default docs section renders (system_prompt docs).
+    doc_paths: system_prompt::DocPaths,
     /// The agent→session event queue (the subscription only pushes;
     /// [`prompt`] pumps it at run checkpoints — see its module docs).
     agent_event_queue: Arc<Mutex<Vec<pi_agent::AgentEvent>>>,
@@ -267,11 +311,15 @@ impl AgentSession {
             model_auth: config.model_auth,
             skills: config.skills,
             prompt_templates: config.prompt_templates,
+            model_lookup: config.model_lookup,
+            doc_paths: system_prompt::DocPaths::default(),
             agent_event_queue: Arc::clone(&agent_event_queue),
             state: SessionState {
                 listeners: Vec::new(),
-                is_agent_run_active: false,
-                agent_run_abort_requested: false,
+                is_agent_run_active: Arc::new(AtomicBool::new(false)),
+                agent_run_abort_requested: Arc::new(AtomicBool::new(false)),
+                is_before_settle: Arc::new(AtomicBool::new(false)),
+                abort_during_before_settle: Arc::new(AtomicBool::new(false)),
                 steering_messages: Vec::new(),
                 follow_up_messages: Vec::new(),
                 pending_next_turn_messages: Vec::new(),
@@ -401,13 +449,13 @@ impl AgentSession {
 
     /// TS `get isStreaming`.
     pub fn is_streaming(&self) -> bool {
-        self.state.is_agent_run_active
+        self.state.is_agent_run_active.load(Ordering::SeqCst)
     }
 
     /// TS `get isIdle` (`!_isAgentRunActive && !isCompacting`;
     /// compaction controllers are tranche 13).
     pub fn is_idle(&self) -> bool {
-        !self.state.is_agent_run_active
+        !self.state.is_agent_run_active.load(Ordering::SeqCst)
     }
 
     /// TS `waitForIdle()` — a `'static` future so callers can hold it
@@ -576,7 +624,7 @@ impl AgentSession {
 
     /// Harness seam: TS any-cast `_isAgentRunActive = value`.
     pub fn set_agent_run_active(&mut self, value: bool) {
-        self.state.is_agent_run_active = value;
+        self.state.is_agent_run_active.store(value, Ordering::SeqCst);
     }
 
     /// Harness seam: TS any-cast `_retryAttempt = value`.
@@ -587,7 +635,29 @@ impl AgentSession {
     /// Harness seam: TS `abort()` sets `_agentRunAbortRequested` (the rest
     /// of abort() is tranche 11+).
     pub fn request_abort(&mut self) {
-        self.state.agent_run_abort_requested = true;
+        self.state.agent_run_abort_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Harness seam: TS `abort()`'s synchronous half as a shareable
+    /// closure — the TS parity harness fires `void session.abort()` from
+    /// extension-handler context; the Rust harness fakes reach the same
+    /// flags through this tap (retry/compaction/branch-summary/bash
+    /// aborts arrive with their tranches).
+    pub fn abort_tap(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let active = Arc::clone(&self.state.is_agent_run_active);
+        let abort_requested = Arc::clone(&self.state.agent_run_abort_requested);
+        let is_before_settle = Arc::clone(&self.state.is_before_settle);
+        let abort_during_before_settle = Arc::clone(&self.state.abort_during_before_settle);
+        let agent = self.agent.clone();
+        Arc::new(move || {
+            if active.load(Ordering::SeqCst) {
+                abort_requested.store(true, Ordering::SeqCst);
+            }
+            if is_before_settle.load(Ordering::SeqCst) {
+                abort_during_before_settle.store(true, Ordering::SeqCst);
+            }
+            agent.abort();
+        })
     }
 
     /// Harness seam: TS any-cast `_deferredSettledActions.push(...)`.

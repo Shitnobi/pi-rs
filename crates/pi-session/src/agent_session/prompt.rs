@@ -418,7 +418,7 @@ impl AgentSession {
     }
 
     /// TS `_normalizePromptImages` — the processImage seam.
-    async fn normalize_prompt_images(&self, images: Option<&[Value]>) -> (Vec<Value>, Vec<String>) {
+    pub(super) async fn normalize_prompt_images(&self, images: Option<&[Value]>) -> (Vec<Value>, Vec<String>) {
         let Some(images) = images else { return (Vec::new(), Vec::new()) };
         let auto_resize = self.settings.image_auto_resize();
         let mut normalized_images = Vec::new();
@@ -436,127 +436,7 @@ impl AgentSession {
         (normalized_images, hints)
     }
 
-    // ========================================================================
-    // Run driver (reduced `_startRun` slice)
-    // ========================================================================
-
-    /// TS `_startRun(trigger, onStarted?)` — reduced: no compaction,
-    /// before_agent_start emission, or prompt/tool-loadout system patch
-    /// (tranche 11/13 TODOs).
-    pub async fn start_run(
-        &mut self,
-        trigger: RunTrigger,
-        on_started: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
-    ) -> Result<(), String> {
-        self.state.is_agent_run_active = true;
-        self.state.agent_run_abort_requested = false;
-        let messages = match self.prepare_run(&trigger).await {
-            Ok(messages) => messages,
-            Err(error) => {
-                self.state.is_agent_run_active = false;
-                self.flush_pending_custom_messages();
-                self.resolve_idle_wait_if_idle();
-                return Err(error);
-            }
-        };
-        self.flush_pending_custom_messages();
-        if let Some(callback) = &on_started {
-            callback();
-        }
-        // TODO(tranche 12): `_failedResponse = undefined`; (tranche 11)
-        // `_recordSelection()`, `_pendingToolNames.clear()`,
-        // `_runSystemPromptOptions`.
-        let result = self.drive_run(messages).await;
-        // TS `finally`.
-        // TODO(tranche 12): `if (_agentRunAbortRequested) _finishCancelledRetry()`.
-        self.flush_pending_custom_messages();
-        self.emit_agent_settled().await?;
-        result
-    }
-
-    /// The `_startRun` try body: run the agent, then re-dispatch undelivered
-    /// queue entries (`agent.continue()` while messages remain queued).
-    async fn drive_run(&mut self, messages: Vec<Value>) -> Result<(), String> {
-        let outcome = async {
-            self.agent.prompt(messages)?.await?;
-            self.pump_agent_events().await;
-            while !self.state.agent_run_abort_requested {
-                if self.handle_post_agent_run().await {
-                    if self.state.agent_run_abort_requested {
-                        break;
-                    }
-                    self.agent.continue_run()?.await?;
-                    self.pump_agent_events().await;
-                    continue;
-                }
-                if self.state.agent_run_abort_requested || !self.run_before_settle_boundary().await {
-                    break;
-                }
-                if self.state.agent_run_abort_requested {
-                    break;
-                }
-                self.agent.continue_run()?.await?;
-                self.pump_agent_events().await;
-            }
-            Ok(())
-        }
-        .await;
-        self.pump_agent_events().await;
-        outcome
-    }
-
-    /// TS `_prepareRun(trigger)` — reduced (see module docs).
-    async fn prepare_run(&mut self, trigger: &RunTrigger) -> Result<Vec<Value>, String> {
-        // TODO(tranche 13): pre-run compaction check.
-        // TODO(tranche 11): `emitBeforeAgentStart` + handler messages +
-        // `_preparePromptAndToolLoadout` system patch.
-        let mut messages = Vec::new();
-        match trigger {
-            RunTrigger::Custom { message } => messages.push(message.clone()),
-            RunTrigger::User { prompt, images } => {
-                let (normalized_images, hints) =
-                    self.normalize_prompt_images(images.as_deref()).await;
-                let text = if hints.is_empty() {
-                    prompt.clone()
-                } else {
-                    format!("{}\n\n{}", prompt, hints.join("\n"))
-                };
-                let mut content = vec![json!({ "type": "text", "text": text })];
-                content.extend(normalized_images);
-                messages.push(json!({
-                    "role": "user",
-                    "content": content,
-                    "timestamp": pi_core::ai::js_number(self.clock.date_now_ms()),
-                }));
-            }
-        }
-        messages.append(&mut self.state.pending_next_turn_messages);
-        Ok(messages)
-    }
-
-    /// TS `_handlePostAgentRun()` — reduced: retry (tranche 12) and
-    /// compaction (tranche 13) TODOs.
-    async fn handle_post_agent_run(&mut self) -> bool {
-        let message = self.state.last_assistant_message.take();
-        self.state.last_assistant_tool_results.clear();
-        if self.state.agent_run_abort_requested {
-            // TODO(tranche 12): `_finishCancelledRetry()`.
-            return false;
-        }
-        if message.is_none() {
-            return self.agent.has_queued_messages();
-        }
-        // TODO(tranche 12): retryable-error routing; (tranche 13)
-        // `_checkCompaction`.
-        !self.state.agent_run_abort_requested && self.agent.has_queued_messages()
-    }
-
-    /// TS `_runBeforeSettleBoundary()` — reduced: no
-    /// `agent_before_settle` handlers in this slice.
-    async fn run_before_settle_boundary(&mut self) -> bool {
-        // TODO(tranche 11): boundary emission + draft commits.
-        self.agent.has_queued_messages()
-    }
+    // Run driver (`_startRun` and friends) lives in [`super::run`].
 
     // ========================================================================
     // Agent-event pump (the `_unsubscribeAgent` subscription)

@@ -43,6 +43,8 @@ use serde_json::{json, Map, Value};
 
 use pi_agent::types::{AgentTool, AgentToolResult, AgentToolUpdateCallback, BoxFuture};
 use pi_core::ai::{get_current_system_message, js_number};
+
+use super::system_prompt::{build_system_prompt_sections, diff_system_prompt_sections};
 use pi_core::js_string::is_js_whitespace_or_terminator;
 use pi_core::mcp_servers::{create_tool_name_matcher, is_mcp_tool_name, ToolNameMatcher};
 use pi_core::prompt_templates::SourceInfo;
@@ -335,9 +337,11 @@ pub(crate) struct ToolsState {
     pub tool_prompt_guidelines: Vec<(String, Vec<String>)>,
     /// TS `_baseSystemPromptOptions`.
     pub base_system_prompt_options: NormalizedSystemPromptOptions,
-    /// TS `_runSystemPromptOptions` (the forced-prompt projection reads
-    /// `forceSystemPrompt`; run pipeline assignment is tranche 10/11).
-    pub run_system_prompt_options: Option<NormalizedSystemPromptOptions>,
+    /// TS `_runSystemPromptOptions` — a raw Value (camelCase) once the
+    /// run pipeline (tranche 11) assigns handler-edited options.
+    pub run_system_prompt_options: Option<Value>,
+    /// TS `resourceLoader.getSystemPrompt()` (config seam).
+    pub resource_custom_prompt: Option<String>,
 }
 
 impl ToolsState {
@@ -372,7 +376,7 @@ impl ToolsState {
             tool_prompt_snippets: Vec::new(),
             tool_prompt_guidelines: Vec::new(),
             base_system_prompt_options: NormalizedSystemPromptOptions {
-                custom_prompt: None,
+                custom_prompt: config.system_prompt.clone(),
                 force_system_prompt: None,
                 selected_tools: Vec::new(),
                 hidden_tools: Vec::new(),
@@ -386,6 +390,7 @@ impl ToolsState {
                 skills: Vec::new(),
             },
             run_system_prompt_options: None,
+            resource_custom_prompt: config.system_prompt.clone(),
         }
     }
 
@@ -720,7 +725,7 @@ impl AgentSession {
         }
         // Resource-loader reads (empty here; module docs).
         self.state.tools.base_system_prompt_options = NormalizedSystemPromptOptions {
-            custom_prompt: None,
+            custom_prompt: self.state.tools.resource_custom_prompt.clone(),
             force_system_prompt: None,
             selected_tools: valid_tool_names,
             hidden_tools: self.state.tools.hidden_declarations.clone(),
@@ -1024,7 +1029,10 @@ impl AgentSession {
             .tools
             .run_system_prompt_options
             .as_ref()
-            .and_then(|o| o.force_system_prompt.clone());
+            .and_then(|o| o.get("forceSystemPrompt"))
+            .filter(|v| !v.is_null())
+            .and_then(Value::as_str)
+            .map(String::from);
         let Some(forced) = forced else { return transformed };
         let current = get_current_system_message(&transformed);
         let mut head = Map::new();
@@ -1053,10 +1061,12 @@ impl AgentSession {
     /// / `undefined`.
     pub fn set_forced_prompt(&mut self, text: Option<String>) {
         self.state.tools.run_system_prompt_options = text.map(|force_system_prompt| {
-            NormalizedSystemPromptOptions {
-                force_system_prompt: Some(force_system_prompt),
-                ..self.state.tools.base_system_prompt_options.clone()
-            }
+            let mut options = self.base_system_prompt_options_value();
+            options
+                .as_object_mut()
+                .expect("base options are an object")
+                .insert("forceSystemPrompt".to_string(), json!(force_system_prompt));
+            options
         });
     }
 
@@ -1073,5 +1083,50 @@ impl AgentSession {
     /// TS `_pendingToolNames` (insertion order).
     pub fn pending_tool_names(&self) -> &[String] {
         &self.state.tools.pending_tool_names
+    }
+}
+
+impl AgentSession {
+    /// `_baseSystemPromptOptions` as the raw JSON the run slice and
+    /// handlers pass around.
+    pub(crate) fn base_system_prompt_options_value(&self) -> Value {
+        serde_json::to_value(&self.state.tools.base_system_prompt_options)
+            .expect("base options serialize")
+    }
+
+    /// TS `_preparePromptAndToolLoadout(options, messages?)` — applies the
+    /// loadout, syncs `hiddenTools`, and diffs the system-prompt sections
+    /// against the current system message. Mutates `options` in place
+    /// (selectedTools/hiddenTools), returning the system patch message.
+    pub(crate) fn prepare_prompt_and_tool_loadout(
+        &mut self,
+        options: &mut Value,
+    ) -> Option<Value> {
+        let selected: Vec<String> = options
+            .get("selectedTools")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+            .unwrap_or_default();
+        let applied = self.apply_tool_loadout(&selected);
+        let names: Vec<Value> = applied.iter().map(|t| json!(t.name())).collect();
+        if let Some(object) = options.as_object_mut() {
+            object.insert("selectedTools".to_string(), Value::Array(names));
+            object.insert(
+                "hiddenTools".to_string(),
+                json!(self.state.tools.hidden_declarations.clone()),
+            );
+        }
+        let messages = self.agent.messages();
+        let previous = get_current_system_message(&messages)
+            .and_then(|m| m.get("sections").and_then(Value::as_object).cloned())
+            .unwrap_or_default();
+        let current = build_system_prompt_sections(options, &self.doc_paths).ok()?;
+        let sections = diff_system_prompt_sections(&previous, &current)?;
+        Some(json!({
+            "role": "system",
+            "content": "",
+            "sections": sections,
+            "timestamp": js_number(self.clock.date_now_ms()),
+        }))
     }
 }
