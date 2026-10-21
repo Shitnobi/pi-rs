@@ -1309,7 +1309,35 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       overflow-recovery path — tranche 13; case noted in cases.mjs
       for re-adding there); full _installAgentRequestProjection
       virtual-model "retry" reason (tranche 14).
+- [x] **Tranche 13 — compaction.** crates/pi-session/
+      agent_session/compaction.rs (new): the async compact()
+      driver (split-turn vs plain summarization via the injected
+      streamFn seam, summary + formatFileOperations append,
+      "First kept entry has no UUID" throw), _checkCompaction
+      decision tree (overflow-retry/overflow-complete/threshold
+      with stale pre-compaction usage checks, projection
+      bookkeeping, _modelForMessage same-model gate,
+      is_recoverable_length port), _runAutoCompaction +
+      manual compact() (session_before_compact extension
+      cancel/custom-result, appendCompaction, savedCompactionEntry
+      lookup, session_compact emit, byte-exact compaction_end
+      error messages, _emitSessionCompactFailed, abort
+      controllers + abortCompaction), _overflowRecoveryAttempted
+      one-shot + resets in event handling, pre-prompt
+      _checkCompaction(lastAssistant, false) in prepare_run.
+      Parity harness `agent-session-compaction` (16 cases; suite
+      2500/2500): scenario-driven (overflow-retry,
+      overflow-complete, threshold, manual, already-compacted,
+      too-small), summarizer driven by the same providerTurns
+      script, sleepMode immediate/pending for abort-mid-compaction.
+      Re-added the tranche-12-deferred context-overflow-not-retried
+      case. Harness determinism fixes: summarizer uuid_v7 never
+      consults the parity uuid pin (TS uses random uuidv7) →
+      constant "summarization-session"; abortCompaction taps
+      without holding the session mutex (TS abortCompaction is
+      callable mid-run); session_before_compact event embeds
+      preparation with fileOps serialized as JS Sets ({}).
 - [ ] Remaining agent-session tranches (phase3-agent-session.md):
-      AgentSession slices 13–17 (compaction,
-      model, bash, tree, stats) and 18–19 (runtime, services+event-bus),
+      AgentSession slices 14–17 (model, bash,
+      tree, stats) and 18–19 (runtime, services+event-bus),
       extending crates/pi-session.
