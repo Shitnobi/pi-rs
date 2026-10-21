@@ -17,7 +17,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Map, Value};
@@ -31,7 +31,8 @@ use pi_providers::pi_ai::transcript::{
 use crate::agent_surface::AgentQueues;
 use crate::host::{AbortHandle, Clock};
 use crate::r#loop::{
-    run_agent_loop, run_agent_loop_continue, tool_declarations, AgentEventSink, LoopConfig,
+    run_agent_loop, run_agent_loop_continue, run_agent_loop_resume, tool_declarations,
+    AgentEventSink, LoopConfig, TransformContext,
     LoopStreamFn, MessagePollHook,
 };
 use crate::types::{AgentEvent, AgentTool, BoxFuture, QueueMode, ToolExecutionMode};
@@ -150,6 +151,14 @@ struct AgentInner {
     tool_execution: ToolExecutionMode,
     clock: Arc<dyn Clock>,
     next_listener_id: AtomicUsize,
+    /// TS has no equivalent: `abort()` with no active run is a no-op there,
+    /// because the session re-aborts on the `agent_start` event before the
+    /// first request. The Rust session pumps events after the run, so it
+    /// arms the next run's signal instead (`abort_next_run`).
+    pending_abort: AtomicBool,
+    /// TS `agent.transformContext` — installed per run by the session
+    /// (forced-prompt projection).
+    context_transform: Mutex<Option<TransformContext>>,
 }
 
 /// Stateful wrapper around the low-level agent loop (TS `class Agent`).
@@ -166,6 +175,9 @@ enum RunKind {
     Prompt { messages: Vec<Value> },
     /// `runAgentLoopContinue(snapshot, …)`.
     Continue,
+    /// An in-loop continuation (TS `finishTurn` returning `continue`):
+    /// `turn_start` but no `agent_start`, no entry guards.
+    Resume,
 }
 
 /// Emit sink forwarding loop events into `Agent#processEvents` (TS
@@ -220,6 +232,8 @@ impl Agent {
                 tool_execution: options.tool_execution,
                 clock: options.clock,
                 next_listener_id: AtomicUsize::new(0),
+                pending_abort: AtomicBool::new(false),
+                context_transform: Mutex::new(None),
             }),
         }
     }
@@ -391,6 +405,17 @@ impl Agent {
         }
     }
 
+    /// Arm the next run's abort signal (see `AgentInner::pending_abort`).
+    pub fn abort_next_run(&self) {
+        self.inner.pending_abort.store(true, Ordering::SeqCst);
+    }
+
+    /// TS `agent.transformContext = fn` — the session installs its
+    /// forced-prompt projection per run.
+    pub fn set_context_transform(&self, transform: Option<TransformContext>) {
+        *self.inner.context_transform.lock().expect("context transform") = transform;
+    }
+
     /// TS `waitForIdle()` — resolves after `agent_end` listeners settle
     /// (`finishRun` resolves the run promise).
     pub async fn wait_for_idle(&self) {
@@ -485,6 +510,17 @@ impl Agent {
         Ok(self.start_run(RunKind::Continue, false))
     }
 
+    /// An in-loop continuation (TS `finishTurn` returning `continue`): no
+    /// `agent_start`, no entry guards, no queue drain.
+    pub fn resume_run(&self) -> Result<AgentRun, String> {
+        if self.has_active_run() {
+            return Err(
+                "Agent is already processing. Wait for completion before continuing.".to_string(),
+            );
+        }
+        Ok(self.start_run(RunKind::Resume, true))
+    }
+
     /// TS `runWithLifecycle` — the synchronous prefix (install active run,
     /// isStreaming on, streaming/error cleared) plus the remainder as an
     /// owned future: executor → `handleRunFailure` on error → `finishRun`.
@@ -496,6 +532,9 @@ impl Agent {
             state.error_message = None;
         }
         let abort = AbortHandle::new();
+        if self.inner.pending_abort.swap(false, Ordering::SeqCst) {
+            abort.abort();
+        }
         *self.inner.active_run.lock().expect("active run") =
             Some(ActiveRun { abort: abort.clone() });
 
@@ -513,6 +552,11 @@ impl Agent {
                 }
                 RunKind::Continue => {
                     run_agent_loop_continue(context, &config, &sink, Some(&abort), stream_fn.as_ref())
+                        .await
+                        .map(|_| ())
+                }
+                RunKind::Resume => {
+                    run_agent_loop_resume(context, &config, &sink, Some(&abort), stream_fn.as_ref())
                         .await
                         .map(|_| ())
                 }
@@ -570,6 +614,7 @@ impl Agent {
             get_steering_messages: Some(get_steering_messages),
             get_follow_up_messages: Some(get_follow_up_messages),
             clock: Arc::clone(&self.inner.clock),
+            transform_context: self.inner.context_transform.lock().expect("context transform").clone(),
             ..LoopConfig::default()
         }
     }

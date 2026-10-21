@@ -131,7 +131,7 @@ impl AgentSession {
     /// TS `prompt(text, options?)`.
     pub async fn prompt(&mut self, text: &str, options: PromptOptions) -> Result<(), String> {
         if self.state.is_emitting_agent_settled {
-            self.state.deferred_settled_actions.push(DeferredSettledAction::Prompt {
+            self.state.deferred_settled_actions.lock().expect("deferred actions").push(DeferredSettledAction::Prompt {
                 text: text.to_string(),
                 options,
             });

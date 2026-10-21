@@ -968,11 +968,34 @@ impl AgentSession {
     /// (`_installHiddenDeclarationsProjection`, then
     /// `_installAgentForcedPromptProjection`).
     pub async fn transform_context(&self, messages: Vec<Value>) -> Vec<Value> {
-        // Hidden declarations: filter toolsAdded/toolsRemoved on system
-        // messages across the whole transcript.
         let hidden = self.state.tools.hidden_declarations.clone();
-        let mut transformed = messages;
-        if !hidden.is_empty() {
+        let forced = self
+            .state
+            .tools
+            .run_system_prompt_options
+            .as_ref()
+            .and_then(|o| o.get("forceSystemPrompt"))
+            .filter(|v| !v.is_null())
+            .and_then(Value::as_str)
+            .map(String::from);
+        apply_request_projections(messages, &hidden, forced.as_deref(), self.clock.date_now_ms())
+    }
+}
+
+/// The chained request projections TS installs as `agent.transformContext`
+/// (`_installHiddenDeclarationsProjection`, then
+/// `_installAgentForcedPromptProjection`), as a pure function so the
+/// per-run hook installed on the agent (TS applies them live at request
+/// time) can share the implementation with
+/// [`AgentSession::transform_context`].
+pub(super) fn apply_request_projections(
+    messages: Vec<Value>,
+    hidden: &[String],
+    forced: Option<&str>,
+    now_ms: f64,
+) -> Vec<Value> {
+    let mut transformed = messages;
+    if !hidden.is_empty() {
             transformed = transformed
                 .into_iter()
                 .map(|message| {
@@ -1024,15 +1047,6 @@ impl AgentSession {
         }
         // Forced prompt: collapse the system messages into one head holding
         // the forced text and the current tools.
-        let forced = self
-            .state
-            .tools
-            .run_system_prompt_options
-            .as_ref()
-            .and_then(|o| o.get("forceSystemPrompt"))
-            .filter(|v| !v.is_null())
-            .and_then(Value::as_str)
-            .map(String::from);
         let Some(forced) = forced else { return transformed };
         let current = get_current_system_message(&transformed);
         let mut head = Map::new();
@@ -1046,13 +1060,14 @@ impl AgentSession {
         let timestamp = current
             .as_ref()
             .and_then(|c| c.get("timestamp").cloned())
-            .unwrap_or_else(|| js_number(self.clock.date_now_ms()));
+            .unwrap_or_else(|| js_number(now_ms));
         head.insert("timestamp".to_string(), timestamp);
         let mut out = vec![Value::Object(head)];
         out.extend(transformed.into_iter().filter(|m| m.get("role").and_then(Value::as_str) != Some("system")));
         out
-    }
+}
 
+impl AgentSession {
     // ========================================================================
     // Harness seams (TS parity harness reaches privates via any-cast)
     // ========================================================================

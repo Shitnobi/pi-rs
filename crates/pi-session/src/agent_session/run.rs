@@ -5,9 +5,12 @@
 //! `_finishCancelledRetry`, and `abort()`.
 //!
 //! **Documented divergences:** (1) the turn_end boundary dispatches at
-//! TurnEnd event-pump time (post-loop) — a `continue` from a turn_end
-//! handler cannot restart the loop mid-run; continuation is exercised
-//! through the agent_before_settle boundary. (2) `_pendingBashMessages`
+//! TurnEnd event-pump time (post-loop); a `continue` from a turn_end
+//! handler re-enters the agent loop through
+//! [`AgentSession::resume_turn_end_continuation`] (a resume run that emits
+//! `turn_start` but no `agent_start`, and whose run-final `agent_end` is
+//! suppressed while a continuation is pending — see
+//! `handle_agent_event`). (2) `_pendingBashMessages`
 //! flush calls are tranche-15 TODOs (the queue itself is unported, so the
 //! flush is a no-op). (3) `_runBeforeSettleBoundary`'s emitBoundary loop
 //! lives here, driven by [`ExtensionHost::boundary_handlers`] /
@@ -19,7 +22,6 @@ use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
-use pi_agent::conversion::default_convert_to_llm;
 use pi_core::ai::js_number;
 use pi_core::compaction::estimate_projected_context_tokens;
 use pi_core::session_manager::SessionManager;
@@ -76,15 +78,30 @@ impl AgentSession {
     /// queue entries (`agent.continue()` while messages remain queued).
     pub(super) async fn drive_run(&mut self, messages: Vec<Value>) -> Result<(), String> {
         let outcome = async {
+            // TS installs `agent.transformContext` at construction and reads
+            // the forced prompt / hidden declarations live at request time;
+            // the Rust agent takes the projection as a per-run hook.
+            self.install_request_projection();
+            // An abort requested while the run was starting (e.g. during
+            // before_agent_start) reaches the agent before its first request
+            // (TS re-aborts on the agent_start event, which the Rust session
+            // only pumps after the run).
+            if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
+                self.agent.abort_next_run();
+            }
+            self.state.turn_end_boundary_continue = false;
             self.agent.prompt(messages)?.await?;
             self.pump_agent_events().await;
+            self.resume_turn_end_continuation().await;
             while !self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
                 if self.handle_post_agent_run().await {
                     if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
                         break;
                     }
+                    self.state.turn_end_boundary_continue = false;
                     self.agent.continue_run()?.await?;
                     self.pump_agent_events().await;
+                    self.resume_turn_end_continuation().await;
                     continue;
                 }
                 let boundary_continue = self.run_before_settle_boundary().await;
@@ -96,14 +113,71 @@ impl AgentSession {
                 if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
                     break;
                 }
+                self.state.turn_end_boundary_continue = false;
                 self.agent.continue_run()?.await?;
                 self.pump_agent_events().await;
+                self.resume_turn_end_continuation().await;
             }
             Ok(())
         }
         .await;
         self.pump_agent_events().await;
         outcome
+    }
+
+    /// TS's in-loop turn_end continuation: a `finishTurn` boundary
+    /// `continue` decision restarts the agent loop within the same run
+    /// (the Rust session dispatches the boundary at event-pump time, so it
+    /// re-enters with a resume run that emits `turn_start` but no
+    /// `agent_start`).
+    async fn resume_turn_end_continuation(&mut self) {
+        while self.state.turn_end_boundary_continue {
+            self.state.turn_end_boundary_continue = false;
+            // TS aborts the active run's controller from the boundary; the
+            // abort survives into the continued turn (stream errors become
+            // stopReason "aborted").
+            if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
+                self.agent.abort_next_run();
+            }
+            let run = match self.agent.resume_run() {
+                Ok(run) => run,
+                Err(_) => break,
+            };
+            if run.await.is_err() {
+                break;
+            }
+            self.pump_agent_events().await;
+        }
+    }
+
+    /// Install the session's request projections on the agent for this run
+    /// (TS `agent.transformContext`).
+    fn install_request_projection(&mut self) {
+        let forced = self
+            .state
+            .tools
+            .run_system_prompt_options
+            .as_ref()
+            .and_then(|o| o.get("forceSystemPrompt"))
+            .filter(|v| !v.is_null())
+            .and_then(Value::as_str)
+            .map(String::from);
+        let hidden = self.state.tools.hidden_declarations.clone();
+        if forced.is_none() && hidden.is_empty() {
+            self.agent.set_context_transform(None);
+            return;
+        }
+        let clock = Arc::clone(&self.clock);
+        self.agent.set_context_transform(Some(pi_agent::TransformContext::Custom(Arc::new(
+            move |messages: &[Value]| {
+                super::tools::apply_request_projections(
+                    messages.to_vec(),
+                    &hidden,
+                    forced.as_deref(),
+                    clock.date_now_ms(),
+                )
+            },
+        ))));
     }
 
     /// TS `_prepareRun(trigger)`.
@@ -120,8 +194,13 @@ impl AgentSession {
         let base_options = self.base_system_prompt_options_value();
         let trigger_json = trigger.to_json();
         let host = Arc::clone(&self.extension_host);
-        let (handler_messages, mut options) =
+        let (handler_messages, mut options, set_active_tools_requests) =
             host.emit_before_agent_start(trigger_json, base_options).await;
+        // TS `ctx.setActiveTools(names)` — handlers call it mid-emission;
+        // applied here (documented divergence, see the trait docs).
+        for names in set_active_tools_requests {
+            self.set_active_tools_by_name(names);
+        }
         // Handlers may edit selectedTools or call setActiveTools() (the
         // live loadout). An explicit edit wins; otherwise the live loadout
         // is authoritative.
@@ -319,7 +398,7 @@ impl AgentSession {
                 "custom_message" => manager.append_custom_message_entry(
                     draft.get("customType").and_then(Value::as_str).unwrap_or_default(),
                     draft.get("content").cloned().unwrap_or(Value::Null),
-                    draft.get("display").and_then(Value::as_bool).unwrap_or(false),
+                    draft.get("display").and_then(Value::as_bool),
                     draft.get("details").filter(|d| !d.is_null()).cloned(),
                 ),
                 "context_edit" => manager.append_context_edit(
@@ -341,7 +420,9 @@ impl AgentSession {
                         draft.get("usage").filter(|u| !u.is_null()).cloned(),
                     )
                 }
-                _ => return Err(format!("Unknown boundary draft type: {}", draft.get("type").and_then(Value::as_str).unwrap_or("null"))),
+                // TS has no default arm: unknown types leave `entryId`
+                // undefined and the draft is silently skipped.
+                _ => continue,
             };
             if let Some(entry) = manager.get_entry(&id) {
                 appended.push(entry.clone());
@@ -389,7 +470,11 @@ impl AgentSession {
             .iter()
             .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
             .collect();
-        let llm_messages = default_convert_to_llm(&context_messages);
+        // TS `_buildBoundaryContext` uses the session-side `convertToLlm`
+        // (core/messages.ts): custom/bashExecution/branchSummary/
+        // compactionSummary roles become user messages — unlike the agent
+        // loop's `defaultConvertToLlm`, which drops them.
+        let llm_messages = pi_core::messages::convert_to_llm(&projection.messages);
         let final_role = llm_messages
             .last()
             .and_then(|m| m.get("role").and_then(Value::as_str))

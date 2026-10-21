@@ -25,6 +25,7 @@ mod agent_loop_harness;
 mod session_harness;
 mod session_tools_harness;
 mod session_prompt_harness;
+mod session_run_harness;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -202,6 +203,9 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         }
         "agent-session-prompt" => {
             return session_prompt_harness::run_agent_session_prompt_harness(&input)
+        }
+        "agent-session-run" => {
+            return session_run_harness::run_agent_session_run_harness(&input)
         }
         "tui-utils" => return run_tui_utils_harness(&input),
         "tui-fuzzy" => return run_tui_fuzzy_harness(&input),
@@ -1590,7 +1594,7 @@ fn run_messages_harness(input: &Value) -> Result<Value, String> {
             let custom_type = input["customType"].as_str().ok_or("missing customType")?;
             let content: messages::CustomContent =
                 serde_json::from_value(input["content"].clone()).map_err(|e| e.to_string())?;
-            let display = input["display"].as_bool().ok_or("missing display")?;
+            let display = input.get("display").and_then(Value::as_bool);
             let details = input.get("details").filter(|v| !v.is_null()).cloned();
             let timestamp = input["timestamp"].as_str().ok_or("missing timestamp")?;
             let msg = messages::create_custom_message(custom_type, content, display, details, timestamp);

@@ -130,6 +130,17 @@ const aspMsg = (o = {}) => ({
 	...(o.errorMessage !== undefined ? { errorMessage: o.errorMessage } : {}),
 });
 const aspTurn = (result, events = []) => ({ events, result });
+// agent-session-run: forces the required systemPrompt (and defaults the
+// required tools object) so every case is a valid harness invocation.
+const asr = (name, args) => ({
+	name: "agent-session-run/" + name,
+	tool: "agent-session-run",
+	args: {
+		tools: {},
+		...args,
+		config: { systemPrompt: "You are the parity assistant.", ...(args.config ?? {}) },
+	},
+});
 
 export const cases = [
 	// ---------------------------------------------------------------- read
@@ -2547,6 +2558,183 @@ export const cases = [
 			},
 		],
 		providerTurns: [aspTurn(aspMsg())],
+	}),
+
+	// ------------------------------------------------------ agent-session-run
+	// Tranche 11 part 2: the run orchestration slice (_startRun/_prepareRun/
+	// _handlePostAgentRun/_runBeforeSettleBoundary, boundary drafts, abort)
+	// over a real Agent with a scripted provider. extensionHandlers script
+	// fake before_agent_start / turn_end / agent_before_settle / agent_settled
+	// handlers; the script drives prompt/abort/waitForIdle ops; the result
+	// records sessionEvents, entries, idleTimeline (settled vs waitIdle),
+	// extensionEvents/Errors, and promptsSentToAgent.
+	asr("missing-args", {}),
+	// Happy path: one prompt runs a full turn; the system patch (preamble
+	// from config.systemPrompt + cwd section) is sent to the provider, the
+	// user + assistant messages are persisted, and the session settles.
+	asr("run-happy-path", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		script: [{ op: "prompt", text: "hello there", options: { source: "test" } }],
+		providerTurns: [aspTurn(aspMsg())],
+	}),
+	// A second prompt reuses the same system context: no new system patch
+	// is emitted (cwd and loadout unchanged), so both provider prompts
+	// carry the same system messages.
+	asr("second-prompt-no-patch", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		script: [
+			{ op: "prompt", text: "first prompt" },
+			{ op: "prompt", text: "second prompt" },
+		],
+		providerTurns: [aspTurn(aspMsg()), aspTurn(aspMsg())],
+	}),
+	// before_agent_start: an injected handler message becomes a custom
+	// message alongside the prompt, and a systemPrompt force replaces the
+	// preamble in the run's system patch.
+	asr("before-agent-start-message-system-prompt", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		extensionHandlers: {
+			before_agent_start: [
+				{
+					message: { customType: "note", content: [{ type: "text", text: "handler note" }], display: true },
+				},
+				{ systemPrompt: "Forced system preamble." },
+			],
+		},
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [aspTurn(aspMsg())],
+	}),
+	// Tool loadout edits: setActiveTools updates the live loadout (kept on
+	// the next run when no explicit edit wins), while a selectedTools edit
+	// on the options clone wins for that run only.
+	asr("before-agent-start-tools", {
+		nowMs: ASP_NOW,
+		tools: {
+			read: { name: "read", description: "Read files", parameters: { type: "object" } },
+			bash: { name: "bash", description: "Run commands", parameters: { type: "object" } },
+		},
+		config: { model: aspModel(), entries: aspHeader() },
+		extensionHandlers: {
+			before_agent_start: [{ setActiveTools: ["read"] }, { selectedTools: ["bash"] }],
+		},
+		script: [
+			{ op: "prompt", text: "hi" },
+			{ op: "prompt", text: "again" },
+		],
+		providerTurns: [aspTurn(aspMsg()), aspTurn(aspMsg())],
+	}),
+	// turn_end drafts: custom + custom_message entries are committed
+	// (entry_appended events fire before agent_settled) and the boundary
+	// context seen by handlers reflects the drafted entries.
+	asr("turn-end-drafts", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		extensionHandlers: {
+			turn_end: [
+				{
+					entries: [
+						{ type: "custom", customType: "note", data: { k: 1 } },
+						{
+							type: "custom_message",
+							customType: "ctx",
+							content: [{ type: "text", text: "ctx note" }],
+							display: true,
+							details: { d: 2 },
+						},
+					],
+				},
+			],
+		},
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [aspTurn(aspMsg())],
+	}),
+	// An invalid turn_end draft (context_edit targeting a missing entry)
+	// invalidates the boundary: "Invalid boundary entries:" is reported via
+	// emitError with extensionPath "<boundary>" and nothing is committed.
+	asr("turn-end-invalid-draft", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		extensionHandlers: {
+			turn_end: [
+				{ entries: [{ type: "context_edit", targetId: "nope", replacement: { content: "x" } }] },
+			],
+		},
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [aspTurn(aspMsg())],
+	}),
+	// turn_end continue: a committed custom_message keeps the context
+	// runnable, so the continue request drives an extra provider turn; the
+	// abort in the same handler stops the loop after the boundary.
+	asr("turn-end-continue-abort", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		extensionHandlers: {
+			turn_end: [
+				{
+					entries: [{ type: "custom_message", customType: "ctx", content: [{ type: "text", text: "keep going" }] }],
+					continue: true,
+					abort: true,
+				},
+			],
+		},
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [aspTurn(aspMsg())],
+	}),
+	// agent_before_settle: drafts commit before settling and a continue
+	// request drives an extra provider turn when the context stays
+	// runnable (retry disabled so the scripted exhaustion settles).
+	asr("before-settle-continue-extra-turn", {
+		nowMs: ASP_NOW,
+		config: { settings: { retry: { enabled: false } }, model: aspModel(), entries: aspHeader() },
+		extensionHandlers: {
+			agent_before_settle: [
+				{
+					entries: [{ type: "custom_message", customType: "ctx", content: [{ type: "text", text: "more" }] }],
+					continue: true,
+					// A real handler is stateful and can continue only once;
+					// the static spec needs `once` to model that (an
+					// always-continue handler loops forever in TS too).
+					once: true,
+				},
+			],
+		},
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [aspTurn(aspMsg()), aspTurn(aspMsg())],
+	}),
+	// An abort requested from an agent_before_settle handler marks the
+	// settle as aborted without another run.
+	asr("before-settle-abort", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		extensionHandlers: { agent_before_settle: [{ abort: true }] },
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [aspTurn(aspMsg())],
+	}),
+	// An abort during before_agent_start cancels the run before the agent
+	// is prompted (no provider turn consumed).
+	asr("abort-during-before-agent-start", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		extensionHandlers: { before_agent_start: [{ abort: true }] },
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [],
+	}),
+	// waitForIdle resolves immediately while idle; a prompt fired from an
+	// agent_settled listener is deferred until the settle finishes and then
+	// runs as a fresh turn (a later waitForIdle observes it).
+	asr("wait-for-idle-deferred-prompt", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		extensionHandlers: { agent_settled: { prompt: "deferred follow up" } },
+		script: [
+			{ op: "waitForIdle" },
+			{ op: "prompt", text: "first" },
+			{ op: "waitForIdle" },
+		],
+		providerTurns: [aspTurn(aspMsg()), aspTurn(aspMsg())],
 	}),
 
 	// ------------------------------------------------------------- tui-utils

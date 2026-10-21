@@ -88,15 +88,19 @@ impl ConvertToLlm {
 
 /// TS `config.transformContext` — applied to context messages before
 /// `convertToLlm`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum TransformContext {
     Identity,
     DropSystem,
+    /// A shared hook (TS `agent.transformContext`, e.g. the session's
+    /// forced-prompt projection installed per run).
+    Custom(Arc<dyn Fn(&[Value]) -> Vec<Value> + Send + Sync>),
 }
 
 impl TransformContext {
     pub fn apply(&self, messages: &[Value]) -> Vec<Value> {
         match self {
+            TransformContext::Custom(hook) => hook(messages),
             TransformContext::Identity => messages.to_vec(),
             TransformContext::DropSystem => messages
                 .iter()
@@ -308,6 +312,25 @@ pub async fn run_agent_loop_continue(
     let mut current_context = context;
 
     emit.emit(AgentEvent::AgentStart).await;
+    emit.emit(AgentEvent::TurnStart).await;
+
+    run_loop(&mut current_context, &mut new_messages, config, signal, emit, stream_fn).await?;
+    Ok(new_messages)
+}
+
+/// TS in-loop continuation (a `finishTurn` hook returning `continue`
+/// iterates the loop): emits `turn_start` but no `agent_start`, and has no
+/// entry guards.
+pub async fn run_agent_loop_resume(
+    context: AgentContext,
+    config: &LoopConfig,
+    emit: &dyn AgentEventSink,
+    signal: Option<&AbortHandle>,
+    stream_fn: &LoopStreamFn,
+) -> Result<Vec<Value>, String> {
+    let mut new_messages: Vec<Value> = Vec::new();
+    let mut current_context = context;
+
     emit.emit(AgentEvent::TurnStart).await;
 
     run_loop(&mut current_context, &mut new_messages, config, signal, emit, stream_fn).await?;

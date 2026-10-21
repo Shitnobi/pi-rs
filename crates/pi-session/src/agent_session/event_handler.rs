@@ -37,6 +37,15 @@ impl AgentSession {
     /// TS `_handleAgentEvent` (bound arrow field — shared by subscribe and
     /// reconnect).
     pub async fn handle_agent_event(&mut self, event: &SessionAgentEvent) {
+        // TS: an in-loop `finishTurn` continue keeps the agent loop alive,
+        // so the run never emits the `agent_end` the Rust post-loop pump
+        // would (the resumed run owns the final `agent_end`, matching TS's
+        // loop-exit / `handleRunFailure` emission).
+        if matches!(event, SessionAgentEvent::AgentEnd { .. })
+            && self.state.turn_end_boundary_continue
+        {
+            return;
+        }
         // An abort requested while the run was starting, e.g. during
         // before_agent_start, stops it here. agent_start is awaited before
         // the first request.
@@ -132,7 +141,7 @@ impl AgentSession {
                 entry_id = Some(self.session_manager.append_custom_message_entry(
                     str_field(message, "customType").unwrap_or_default(),
                     message.get("content").cloned().unwrap_or(Value::Null),
-                    message.get("display").and_then(Value::as_bool).unwrap_or(true),
+                    message.get("display").and_then(Value::as_bool),
                     message.get("details").filter(|d| !d.is_null()).cloned(),
                 ));
             } else if matches!(role.as_str(), "system" | "user" | "assistant" | "toolResult") {
@@ -275,7 +284,7 @@ impl AgentSession {
         self.session_manager.append_custom_message_entry(
             str_field(&app_message, "customType").unwrap_or_default(),
             app_message.get("content").cloned().unwrap_or(Value::Null),
-            app_message.get("display").and_then(Value::as_bool).unwrap_or(true),
+            app_message.get("display").and_then(Value::as_bool),
             app_message.get("details").filter(|d| !d.is_null()).cloned(),
         );
         self.refresh_finalized_context();
@@ -341,7 +350,9 @@ impl AgentSession {
         self.emit(super::events::agent_settled_event(aborted));
         self.state.is_emitting_agent_settled = false;
 
-        let deferred = std::mem::take(&mut self.state.deferred_settled_actions);
+        let deferred = std::mem::take(
+            &mut *self.state.deferred_settled_actions.lock().expect("deferred actions"),
+        );
         if !deferred.is_empty() {
             let mut failure: Option<String> = None;
             for action in deferred {
@@ -420,7 +431,15 @@ impl AgentSession {
                 if role_of(&self.state.arena[*message]) == "assistant"
                     && !self.state.boundary_dispatched_messages.remove(message)
                 {
-                    let _ = self.dispatch_turn_end_boundary(*message, tool_results).await;
+                    // TS: an in-loop `finishTurn` continue restarts the
+                    // loop, unless the turn stopped with an error/aborted
+                    // message (the loop returns regardless of the decision)
+                    // or the run failed (`handleRunFailure` bypasses
+                    // `finishTurn`; its message is always error/aborted).
+                    let continued = self.dispatch_turn_end_boundary(*message, tool_results).await;
+                    let stop_reason = str_field(&self.state.arena[*message], "stopReason");
+                    self.state.turn_end_boundary_continue = continued
+                        && !matches!(stop_reason, Some("error") | Some("aborted"));
                 }
                 self.state.turn_index += 1.0;
             }
@@ -545,8 +564,9 @@ impl AgentSession {
         base.insert("toolResultEntryIds".to_string(), Value::Array(tool_result_entry_ids));
         base.insert("outcome".to_string(), json!(self.state.last_activity_outcome.clone()));
         let boundary = self.emit_boundary(Value::Object(base), "turn_end").await;
-        // Divergence (module docs): dispatched post-loop, so a turn_end
-        // `continue` cannot restart the loop; drafts still commit in order.
+        // Dispatched post-loop (module docs): a `continue` re-enters the
+        // loop through `resume_turn_end_continuation`; drafts still commit
+        // in order here, exactly like TS `_dispatchTurnEndBoundary`.
         let _ = self.commit_boundary_drafts(&boundary.entries);
         if boundary.continue_
             && !self.build_boundary_context(&[], "turn_end").map(|c| c.can_continue).unwrap_or(false)

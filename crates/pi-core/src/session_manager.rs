@@ -676,7 +676,7 @@ pub fn session_entry_to_context_messages(entry: &Value) -> Vec<AgentMessage> {
             vec![AgentMessage::Custom(create_custom_message(
                 entry.get("customType").and_then(Value::as_str).unwrap_or_default(),
                 content,
-                entry.get("display").and_then(Value::as_bool).unwrap_or(false),
+                entry.get("display").and_then(Value::as_bool),
                 entry.get("details").cloned(),
                 entry.get("timestamp").and_then(Value::as_str).unwrap_or_default(),
             ))]
@@ -2064,7 +2064,7 @@ impl SessionManager {
         &mut self,
         custom_type: &str,
         content: Value,
-        display: bool,
+        display: Option<bool>,
         details: Option<Value>,
     ) -> String {
         let id = generate_id(&|k| self.by_id.has(k), &self.gen.uuid_v4.clone());
@@ -2072,7 +2072,11 @@ impl SessionManager {
         map.insert("type".to_string(), json!("custom_message"));
         map.insert("customType".to_string(), json!(custom_type));
         map.insert("content".to_string(), content);
-        map.insert("display".to_string(), json!(display));
+        // TS: `display` is `undefined` when the caller omits it, and
+        // `JSON.stringify` drops the key.
+        if let Some(display) = display {
+            map.insert("display".to_string(), json!(display));
+        }
         if let Some(details) = details {
             map.insert("details".to_string(), details);
         }
@@ -3166,7 +3170,7 @@ mod tests {
         let mut manager =
             SessionManager::in_memory("/test", None, Vec::new(), &det_gen()).unwrap();
         manager.append_message(user_msg("one"));
-        let id = manager.append_custom_message_entry("note", json!("a note"), true, None);
+        let id = manager.append_custom_message_entry("note", json!("a note"), Some(true), None);
         let entry = manager.get_entry(&id).unwrap();
         assert_eq!(entry.get("type").and_then(Value::as_str), Some("custom_message"));
         assert_eq!(entry.get("customType").and_then(Value::as_str), Some("note"));

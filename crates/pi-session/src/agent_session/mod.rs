@@ -90,15 +90,19 @@ pub trait ExtensionHost: Send + Sync {
         Vec::new()
     }
     /// TS `runner.emitBeforeAgentStart(trigger, systemPromptOptions)` →
-    /// `(handlerMessages, systemPromptOptions)` (the options Value the
-    /// handlers may have edited, `forceSystemPrompt` included). Default:
-    /// passthrough.
+    /// `(handlerMessages, systemPromptOptions, setActiveToolsRequests)`
+    /// (the options Value the handlers may have edited,
+    /// `forceSystemPrompt` included; the `ctx.setActiveTools(names)`
+    /// calls handlers made, applied by `_prepareRun` after the emission —
+    /// TS applies them mid-handler, which is unobservable through the
+    /// threaded options clone since the live loadout is only read after).
+    /// Default: passthrough.
     fn emit_before_agent_start<'a>(
         &'a self,
         _trigger: Value,
         options: Value,
-    ) -> pi_agent::types::BoxFuture<'a, (Vec<Value>, Value)> {
-        Box::pin(async move { (Vec::new(), options) })
+    ) -> pi_agent::types::BoxFuture<'a, (Vec<Value>, Value, Vec<Vec<String>>)> {
+        Box::pin(async move { (Vec::new(), options, Vec::new()) })
     }
     /// TS `snapshotEventHandlers(type).length` for boundary events —
     /// the handler count driving [`AgentSession::emit_boundary`].
@@ -235,8 +239,13 @@ struct SessionState {
     last_assistant_tool_results: Vec<MsgId>,
     /// TS `_lastActivityOutcome`.
     last_activity_outcome: String,
-    /// TS `_deferredSettledActions`.
-    deferred_settled_actions: Vec<DeferredSettledAction>,
+    /// Whether the last dispatched turn_end boundary requested a
+    /// continuation that TS would honor inside the agent loop (a
+    /// `finishTurn` `continue` decision on a non-error turn).
+    turn_end_boundary_continue: bool,
+    /// TS `_deferredSettledActions` (shared — see
+    /// [`AgentSession::deferred_prompt_tap`]).
+    deferred_settled_actions: Arc<Mutex<Vec<DeferredSettledAction>>>,
     /// Harness-visible log of executed deferred `Log` actions.
     deferred_log: Vec<String>,
     /// TS `_isEmittingAgentSettled`.
@@ -335,7 +344,8 @@ impl AgentSession {
                 last_assistant_message: None,
                 last_assistant_tool_results: Vec::new(),
                 last_activity_outcome: "completed".to_string(),
-                deferred_settled_actions: Vec::new(),
+                turn_end_boundary_continue: false,
+                deferred_settled_actions: Arc::new(Mutex::new(Vec::new())),
                 deferred_log: Vec::new(),
                 is_emitting_agent_settled: false,
                 tools: tools_state,
@@ -578,7 +588,7 @@ impl AgentSession {
             }
         } else if trigger_turn == Some(true) {
             if self.state.is_emitting_agent_settled {
-                self.state.deferred_settled_actions.push(DeferredSettledAction::SendCustomMessage {
+                self.state.deferred_settled_actions.lock().expect("deferred actions").push(DeferredSettledAction::SendCustomMessage {
                     custom_type: custom_type.to_string(),
                     content: app_message.get("content").cloned().unwrap_or(Value::Null),
                     display,
@@ -662,7 +672,21 @@ impl AgentSession {
 
     /// Harness seam: TS any-cast `_deferredSettledActions.push(...)`.
     pub fn push_deferred_log_action(&mut self, tag: &str) {
-        self.state.deferred_settled_actions.push(DeferredSettledAction::Log(tag.to_string()));
+        self.state.deferred_settled_actions.lock().expect("deferred actions").push(DeferredSettledAction::Log(tag.to_string()));
+    }
+
+    /// Harness seam: the TS parity harness fires `void session.prompt(text)`
+    /// from an `agent_settled` listener (a floating promise whose synchronous
+    /// prefix pushes the deferred action); the shared deferred-actions slot
+    /// is the Rust mirror of that reach-in.
+    pub fn deferred_prompt_tap(&self) -> Arc<dyn Fn(&str) + Send + Sync> {
+        let slot = Arc::clone(&self.state.deferred_settled_actions);
+        Arc::new(move |text: &str| {
+            slot.lock().expect("deferred actions").push(DeferredSettledAction::Prompt {
+                text: text.to_string(),
+                options: prompt::PromptOptions::default(),
+            });
+        })
     }
 
     // ========================================================================

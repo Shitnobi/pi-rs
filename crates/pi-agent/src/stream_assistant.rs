@@ -49,7 +49,7 @@ pub async fn stream_assistant_response(
 
     // Apply the context transform if configured (AgentMessage[] → AgentMessage[]).
     let mut messages = context.messages.clone();
-    if let Some(mode) = config.transform_context {
+    if let Some(mode) = &config.transform_context {
         messages = mode.apply(&messages);
     }
 

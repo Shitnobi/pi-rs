@@ -5953,6 +5953,359 @@ async function runModule(tool, args, cwd) {
 		}
 	}
 
+	if (tool === "agent-session-run") {
+		// dist/core/agent-session.js — the run orchestration slice of the
+		// REAL AgentSession (_startRun/_prepareRun/_handlePostAgentRun/
+		// _runBeforeSettleBoundary, boundary drafts, abort) over a real
+		// Agent with a scripted provider. Mirrors the Rust harness
+		// (crates/pi-cli/src/session_run_harness.rs). The fake
+		// _extensionRunner's emitBoundary mirrors the real runner loop
+		// (entries/continue threading, context rebuild, "Invalid boundary
+		// entries:" via emitError with extensionPath "<boundary>" to match
+		// the Rust library port), and emitBeforeAgentStart mirrors the real
+		// loop (message collection + forceSystemPrompt on the options
+		// clone) plus harness script fields (selectedTools edit,
+		// setActiveTools, abort → void session.abort(), agent_settled →
+		// void session.prompt).
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		const { AgentSession } = require(path.join(distDir, "core", "agent-session.js"));
+		const { SessionManager } = require(path.join(distDir, "core", "session-manager.js"));
+		const { SettingsManager } = require(path.join(distDir, "core", "settings-manager.js"));
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		const config = args.config ?? {};
+		if (typeof config !== "object" || config === null || Array.isArray(config)) {
+			throw new Error("invalid config");
+		}
+		const settingsIn = config.settings ?? {};
+		if (typeof settingsIn !== "object" || settingsIn === null || Array.isArray(settingsIn)) {
+			throw new Error("invalid settings");
+		}
+		const retryIn = settingsIn.retry ?? {};
+		if (typeof retryIn !== "object" || retryIn === null || Array.isArray(retryIn)) {
+			throw new Error("invalid settings");
+		}
+		if (settingsIn.imageAutoResize !== undefined && typeof settingsIn.imageAutoResize !== "boolean") {
+			throw new Error("invalid imageAutoResize");
+		}
+		const modelAuthIn = config.modelAuth ?? {};
+		if (typeof modelAuthIn !== "object" || modelAuthIn === null || Array.isArray(modelAuthIn)) {
+			throw new Error("invalid modelAuth");
+		}
+		const authMode = modelAuthIn.mode ?? "ok";
+		if (authMode !== "ok" && authMode !== "noKey" && authMode !== "oauth") {
+			throw new Error("invalid modelAuth");
+		}
+		if (typeof config.systemPrompt !== "string") throw new Error("invalid systemPrompt");
+		if (
+			!Array.isArray(config.entries) ||
+			config.entries.length === 0 ||
+			config.entries[0].type !== "session"
+		) {
+			throw new Error("missing entries");
+		}
+		if (config.model !== undefined && config.model !== null) {
+			if (typeof config.model !== "object" || Array.isArray(config.model)) {
+				throw new Error("invalid model");
+			}
+		}
+		if (typeof args.tools !== "object" || args.tools === null || Array.isArray(args.tools)) {
+			throw new Error("missing tools");
+		}
+		const customToolsIn = config.customTools ?? [];
+		if (!Array.isArray(customToolsIn)) throw new Error("invalid customTools");
+		const modelLookupIn = config.modelLookup ?? [];
+		if (!Array.isArray(modelLookupIn)) throw new Error("invalid modelLookup");
+		const handlersIn = args.extensionHandlers ?? {};
+		if (typeof handlersIn !== "object" || handlersIn === null || Array.isArray(handlersIn)) {
+			throw new Error("invalid extensionHandlers");
+		}
+		const handlerList = (key) => {
+			const list = handlersIn[key] ?? [];
+			if (!Array.isArray(list)) throw new Error("invalid " + key);
+			for (const spec of list) {
+				if (spec === null || typeof spec !== "object" || Array.isArray(spec)) {
+					throw new Error("invalid " + key);
+				}
+			}
+			return list;
+		};
+		const beforeAgentStart = handlerList("before_agent_start");
+		const turnEndHandlers = handlerList("turn_end");
+		const beforeSettleHandlers = handlerList("agent_before_settle");
+		const agentSettled = handlersIn.agent_settled ?? null;
+		if (agentSettled !== null && (typeof agentSettled !== "object" || Array.isArray(agentSettled))) {
+			throw new Error("invalid agent_settled");
+		}
+		if (!Array.isArray(args.script)) throw new Error("missing script");
+		if (!Array.isArray(args.providerTurns)) throw new Error("missing providerTurns");
+
+		const realDateNow = Date.now;
+		Date.now = () => args.nowMs;
+		const RealDate = Date;
+		class PinnedDate extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(args.nowMs);
+				else super(...ctorArgs);
+			}
+		}
+		globalThis.Date = PinnedDate;
+		let uuidI = 0;
+		const nextUuid = () => "uid" + String(++uuidI).padStart(5, "0");
+		try {
+			const sessionManager = SessionManager.inMemory("/proj", undefined, config.entries);
+			const projected = sessionManager.buildSessionProjection().messages;
+			const promptsSentToAgent = [];
+			let providerIdx = 0;
+			const fakeStreamFn = (_model, context, _options) => {
+				const turn = args.providerTurns[providerIdx];
+				if (turn === undefined) throw new Error("provider script exhausted");
+				providerIdx++;
+				promptsSentToAgent.push(JSON.parse(JSON.stringify(context.messages ?? [])));
+				return {
+					async *[Symbol.asyncIterator]() {
+						for (const event of turn.events ?? []) yield event;
+					},
+					result() {
+						return Promise.resolve(turn.result);
+					},
+				};
+			};
+			const agent = new Agent({
+				streamFn: fakeStreamFn,
+				initialState: { messages: projected },
+			});
+			agent.state.model = config.model ?? undefined;
+			const settingsManager = SettingsManager.inMemory({
+				retry: retryIn,
+				...(settingsIn.imageAutoResize !== undefined
+					? { images: { autoResize: settingsIn.imageAutoResize } }
+					: {}),
+			});
+			const fakeLoader = {
+				getSkills: () => ({ skills: [], diagnostics: [] }),
+				getPrompts: () => ({ prompts: [], diagnostics: [] }),
+				getAgentsFiles: () => ({ agentsFiles: [] }),
+				getSystemPrompt: () => config.systemPrompt,
+				getAppendSystemPrompt: () => [],
+				getExtensions: () => ({
+					extensions: [],
+					runtime: {
+						mcpServers: { setChangeListener: () => {} },
+						pendingProviderRegistrations: [],
+						pendingNativeProviderRegistrations: [],
+						pendingVirtualModelRegistrations: [],
+					},
+					diagnostics: [],
+				}),
+				getThemes: () => ({ themes: [], diagnostics: [] }),
+			};
+			const modelLookup = (provider, id) =>
+				modelLookupIn.find((m) => m.provider === provider && m.id === id);
+			const modelRuntime = {
+				getModel: modelLookup,
+				getPhysicalModel: () => undefined,
+				hasConfiguredAuth: () => authMode === "ok",
+				checkAuth: async () => (authMode === "ok" ? {} : undefined),
+				isUsingOAuth: () => authMode === "oauth",
+			};
+			const baseToolsMap = {};
+			for (const [key, spec] of Object.entries(args.tools)) {
+				if (spec === null || typeof spec !== "object" || Array.isArray(spec)) {
+					throw new Error("tools entries must be objects");
+				}
+				baseToolsMap[key] = {
+					name: spec.name,
+					label: spec.label,
+					description: spec.description,
+					parameters: spec.parameters ?? {},
+					execute: () => {
+						throw new Error("agent-session-run harness tool execute must never be called");
+					},
+				};
+			}
+			const customTools = customToolsIn.map((d) => ({ ...d, execute: () => {} }));
+			const session = new AgentSession({
+				agent,
+				sessionManager,
+				settingsManager,
+				cwd: "/proj",
+				resourceLoader: fakeLoader,
+				modelRuntime,
+				customTools,
+				usesDefaultTools: false,
+				baseToolsOverride: baseToolsMap,
+			});
+			const snapEvent = (event) => JSON.parse(JSON.stringify(event));
+			const extensionEvents = [];
+			const extensionErrors = [];
+			let settledFired = false;
+			const fakeRunner = {
+				hasHandlers: (event) =>
+					event === "turn_end"
+						? turnEndHandlers.length > 0
+						: event === "agent_before_settle"
+							? beforeSettleHandlers.length > 0
+							: false,
+				emit: async (event) => {
+					extensionEvents.push(snapEvent(event));
+					if (event.type === "agent_settled" && !settledFired) {
+						settledFired = true;
+						if (agentSettled && typeof agentSettled.prompt === "string") {
+							void session.prompt(agentSettled.prompt);
+						}
+					}
+				},
+				emitMessageEnd: async (event) => {
+					extensionEvents.push(snapEvent(event));
+					return undefined;
+				},
+				emitError: (error) => {
+					extensionErrors.push({
+						extensionPath: error.extensionPath,
+						event: error.event,
+						error: error.error,
+					});
+				},
+				invalidate: () => {},
+				getAllRegisteredTools: () => [],
+				boundaryHandlerCount: (type) =>
+					type === "turn_end" ? turnEndHandlers.length : beforeSettleHandlers.length,
+				emitBoundary: async (baseEvent, buildContext) => {
+					const script =
+						baseEvent.type === "turn_end" ? turnEndHandlers : beforeSettleHandlers;
+					// `once: true` specs model a stateful handler that only
+					// acts on the first boundary emission (a real extension
+					// can keep state; the static spec list cannot).
+					const calls = (boundaryCalls[baseEvent.type] = (boundaryCalls[baseEvent.type] ?? 0) + 1);
+					let entries = [];
+					let shouldContinue = false;
+					let context = await buildContext(entries);
+					let valid = true;
+					for (const spec of script) {
+						if (spec.once === true && calls > 1) continue;
+						const event = { ...baseEvent, entries, continue: shouldContinue, context };
+						extensionEvents.push(snapEvent(event));
+						if (spec.abort === true) void session.abort();
+						if (spec.entries !== undefined) entries = spec.entries;
+						if (spec.continue !== undefined) shouldContinue = spec.continue;
+						try {
+							context = await buildContext(entries);
+							valid = true;
+						} catch (err) {
+							valid = false;
+							fakeRunner.emitError({
+								extensionPath: "<boundary>",
+								event: baseEvent.type,
+								error: `Invalid boundary entries: ${err instanceof Error ? err.message : String(err)}`,
+							});
+						}
+					}
+					return valid
+						? { entries, continue: shouldContinue, context, valid: true }
+						: { entries: [], continue: false, context, valid: false };
+				},
+				emitBeforeAgentStart: async (trigger, options) => {
+					const current = JSON.parse(JSON.stringify(options));
+					const messages = [];
+					const requests = [];
+					for (const spec of beforeAgentStart) {
+						const event = { ...trigger, type: "before_agent_start", systemPromptOptions: current };
+						extensionEvents.push(snapEvent(event));
+						if (spec.abort === true) void session.abort();
+						if (Array.isArray(spec.setActiveTools)) requests.push(spec.setActiveTools);
+						if (spec.selectedTools !== undefined) current.selectedTools = spec.selectedTools;
+						if (spec.systemPrompt !== undefined) current.forceSystemPrompt = spec.systemPrompt;
+						if (spec.message !== undefined) messages.push(spec.message);
+					}
+					for (const names of requests) session.setActiveToolsByName(names);
+					return { messages, systemPromptOptions: current };
+				},
+			};
+			session._extensionRunner = fakeRunner;
+
+			const boundaryCalls = {};
+			const sessionEvents = [];
+			const idleTimeline = [];
+			session.subscribe((event) => {
+				if (event.type === "agent_settled") {
+					idleTimeline.push({ kind: "settled", aborted: event.aborted });
+				}
+				sessionEvents.push(snapEvent(event));
+			});
+			globalThis.__piParityUuidOverride = nextUuid;
+
+			const results = [];
+			for (const op of args.script) {
+				try {
+					if (op === null || typeof op !== "object" || Array.isArray(op)) {
+						throw new Error("ops entries must be objects");
+					}
+					if (typeof op.op !== "string") throw new Error("missing op");
+					let v = null;
+					switch (op.op) {
+						case "prompt": {
+							if (typeof op.text !== "string") throw new Error("missing text");
+							const options = op.options ?? {};
+							if (typeof options !== "object" || options === null || Array.isArray(options)) {
+								throw new Error("invalid options");
+							}
+							if (
+								options.expandPromptTemplates !== undefined &&
+								typeof options.expandPromptTemplates !== "boolean"
+							) {
+								throw new Error("invalid expandPromptTemplates");
+							}
+							if (options.source !== undefined && options.source !== null && typeof options.source !== "string") {
+								throw new Error("invalid source");
+							}
+							if (options.images !== undefined && options.images !== null && !Array.isArray(options.images)) {
+								throw new Error("invalid images");
+							}
+							await session.prompt(op.text, {
+								...(options.expandPromptTemplates !== undefined
+									? { expandPromptTemplates: options.expandPromptTemplates }
+									: {}),
+								...(options.images !== undefined ? { images: options.images } : {}),
+								...(options.streamingBehavior !== undefined
+									? { streamingBehavior: options.streamingBehavior }
+									: {}),
+								...(options.source !== undefined ? { source: options.source } : {}),
+							});
+							break;
+						}
+						case "abort":
+							await session.abort();
+							break;
+						case "waitForIdle":
+							await session.waitForIdle();
+							idleTimeline.push({ kind: "waitIdle" });
+							break;
+						default:
+							throw new Error("unknown agent-session-run op: " + op.op);
+					}
+					results.push(v === undefined ? null : v);
+				} catch (e) {
+					results.push({ thrown: e && e.message !== undefined ? e.message : String(e) });
+				}
+			}
+			return {
+				result: {
+					results,
+					sessionEvents,
+					entries: sessionManager.getEntries(),
+					idleTimeline,
+					extensionEvents,
+					extensionErrors,
+					promptsSentToAgent,
+				},
+			};
+		} finally {
+			globalThis.__piParityUuidOverride = null;
+			Date.now = realDateNow;
+			globalThis.Date = RealDate;
+		}
+	}
+
 	if (tool === "file-mutation-queue") {
 		// dist/core/tools/file-mutation-queue.js — withFileMutationQueue over
 		// scripted fns. Ops run concurrently; each fn marks itself started,

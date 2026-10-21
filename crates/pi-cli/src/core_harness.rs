@@ -2434,7 +2434,7 @@ fn sess_manager_flow(input: &Value, base_s: &str, gen: &pi_core::session_manager
                 "appendCustomMessageEntry" => {
                     let custom_type = opt_str("customType").ok_or("missing customType")?;
                     let content = sop.get("content").filter(|v| !v.is_null()).cloned().ok_or("missing content")?;
-                    let display = sop["display"].as_bool().unwrap_or(false);
+                    let display = sop.get("display").and_then(Value::as_bool);
                     let details = sop.get("details").filter(|v| !v.is_null()).cloned();
                     Ok(json!(mgr.append_custom_message_entry(custom_type, content, display, details)))
                 }

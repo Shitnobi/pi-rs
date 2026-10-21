@@ -77,7 +77,10 @@ pub struct BashExecutionMessage {
 pub struct CustomMessage {
     pub custom_type: String,
     pub content: CustomContent,
-    pub display: bool,
+    /// `boolean | undefined` — omitted when not set (TS serializes
+    /// `undefined` fields away).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
     pub timestamp: Option<i64>,
@@ -338,7 +341,7 @@ pub fn create_compaction_summary_message(
 pub fn create_custom_message(
     custom_type: &str,
     content: CustomContent,
-    display: bool,
+    display: Option<bool>,
     details: Option<Value>,
     timestamp: &str,
 ) -> CustomMessage {
@@ -445,7 +448,7 @@ mod tests {
         let custom = AgentMessage::Custom(CustomMessage {
             custom_type: "myExtension".to_string(),
             content: CustomContent::Text("hello".to_string()),
-            display: true,
+            display: Some(true),
             details: None,
             timestamp: Some(43),
         });
@@ -455,7 +458,7 @@ mod tests {
                 data: "abcd".to_string(),
                 mime_type: "image/png".to_string(),
             }]),
-            display: false,
+            display: Some(false),
             details: None,
             timestamp: Some(44),
         });
@@ -542,11 +545,11 @@ mod tests {
         let m = create_custom_message(
             "t",
             CustomContent::Text("x".to_string()),
-            true,
+            Some(true),
             None,
             "2026-01-02T03:04:05Z",
         );
-        assert!(m.display);
+        assert_eq!(m.display, Some(true));
         // Pre-epoch dates are negative milliseconds, like getTime().
         let m = create_compaction_summary_message("s", 1, "1969-12-31T23:59:59Z");
         assert_eq!(m.timestamp, Some(-1000));
