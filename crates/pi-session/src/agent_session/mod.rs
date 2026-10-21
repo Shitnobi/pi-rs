@@ -8,6 +8,7 @@
 
 pub mod events;
 pub mod event_handler;
+pub mod tools;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -43,6 +44,11 @@ pub trait ExtensionHost: Send + Sync {
     fn emit_error(&self, error: Value);
     /// TS `invalidate(message)`.
     fn invalidate(&self, message: &str);
+    /// TS `runner.getAllRegisteredTools()` — the tools-slice seam (plan §4).
+    /// Default: none (the events-slice fakes register no tools).
+    fn get_all_registered_tools(&self) -> Vec<tools::RegisteredTool> {
+        Vec::new()
+    }
 }
 
 /// Stand-in for the `NestedToolCallRunner` field (`_nestedToolCalls`):
@@ -66,6 +72,23 @@ pub struct AgentSessionConfig {
     pub clock: Arc<dyn Clock>,
     pub nested_tool_calls: Option<Arc<dyn NestedCallsStore>>,
     pub cwd: String,
+    /// TS `customTools` (ToolDefinitions; see [`tools`] for the
+    /// prepareLoadout data-spec stand-in).
+    pub custom_tools: Vec<tools::ToolDefinition>,
+    /// TS `initialActiveToolNames`.
+    pub initial_active_tool_names: Option<Vec<String>>,
+    /// TS `usesDefaultTools`.
+    pub uses_default_tools: bool,
+    /// TS `defaultToolModifiers`.
+    pub default_tool_modifiers: Vec<String>,
+    /// TS `allowedToolNames` (`None` = the flag was absent).
+    pub allowed_tool_names: Option<Vec<String>>,
+    /// TS `excludedToolNames`.
+    pub excluded_tool_names: Option<Vec<String>>,
+    /// TS `baseToolsOverride` (key → AgentTool). The default builtin
+    /// definitions are unported (see [`tools`] module docs), so production
+    /// callers must pass an override until Phase 4+.
+    pub base_tools_override: Option<Vec<(String, Arc<dyn pi_agent::AgentTool>)>>,
 }
 
 /// A deferred `agent_settled` action (TS `_deferredSettledActions` holds
@@ -129,6 +152,8 @@ struct SessionState {
     deferred_log: Vec<String>,
     /// TS `_isEmittingAgentSettled`.
     is_emitting_agent_settled: bool,
+    /// Tools slice state (TS `_toolRegistry` & friends; [`tools`]).
+    tools: tools::ToolsState,
 }
 
 /// TS `class AgentSession` — the events slice.
@@ -162,7 +187,8 @@ impl AgentSession {
     /// 9–11); the event handler is driven through
     /// [`AgentSession::handle_agent_event`].
     pub fn new(config: AgentSessionConfig) -> AgentSession {
-        AgentSession {
+        let tools_state = tools::ToolsState::new(&config);
+        let mut session = AgentSession {
             agent: config.agent,
             session_manager: config.session_manager,
             settings: config.settings,
@@ -192,11 +218,22 @@ impl AgentSession {
                 deferred_settled_actions: Vec::new(),
                 deferred_log: Vec::new(),
                 is_emitting_agent_settled: false,
+                tools: tools_state,
             },
             idle_resolvers: Mutex::new(Vec::new()),
             next_listener_id: 0,
             _unsubscribe_agent: None,
+        };
+        // TS constructor: `_installHiddenDeclarationsProjection` +
+        // `_installAgentForcedPromptProjection` are stateful here (see
+        // `tools::AgentSession::transform_context`), then `_buildRuntime`
+        // runs and the default-tools restore follows.
+        session.build_runtime(config.initial_active_tool_names.clone(), true);
+        if session.state.tools.uses_default_tools {
+            let modifiers = session.state.tools.default_tool_modifiers.clone();
+            session.restore_tools_from_transcript(&modifiers);
         }
+        session
     }
 
     // ========================================================================

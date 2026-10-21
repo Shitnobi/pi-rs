@@ -74,6 +74,16 @@ import { latexCases } from "./waved/latex-cases.mjs";
 import { markdownRenderCases } from "./waved/markdown-render-cases.mjs";
 import { regressionCases } from "./regressions/index.mjs";
 
+const astBase = (extra = {}) => ({
+	nowMs: 1747000000000,
+	baseTools: {
+		read: { name: "read", description: "Read files", parameters: { type: "object" } },
+		bash: { name: "bash", description: "Run commands", parameters: { type: "object" } },
+	},
+	entries: [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }],
+	...extra,
+});
+
 export const cases = [
 	// ---------------------------------------------------------------- read
 	{ name: "read/missing", tool: "read", args: { path: "nope.txt" } },
@@ -2070,6 +2080,219 @@ export const cases = [
 				{ op: "agentEvent", event: { type: "message_end", messageIndex: 0 } },
 			],
 		},
+	},
+
+
+	// --------------------------------------------------- agent-session-tools
+	// Differential parity for the tools slice of AgentSession (TS
+	// dist/core/agent-session.js ↔ crates/pi-session). Conventions:
+	// `baseTools` is required (the builtin tool definitions are Phase 4+);
+	// extensionTools are invisible to the constructor-time refresh (the TS
+	// constructor builds a real, empty ExtensionRunner, the fake is swapped
+	// after); tool execution and streamFn are never reached.
+	{
+		name: "agent-session-tools/missing-args",
+		tool: "agent-session-tools",
+		args: {},
+	},
+	{
+		name: "agent-session-tools/default-loadout",
+		tool: "agent-session-tools",
+		args: astBase({
+			ops: [{ op: "getAllTools" }, { op: "getCallableToolNames" }],
+		}),
+	},
+	{
+		name: "agent-session-tools/custom-tools-and-snippets",
+		tool: "agent-session-tools",
+		args: astBase({
+			customTools: [
+				{
+					name: "snip",
+					description: "Snippet tool",
+					parameters: { type: "object", properties: { a: { type: "string" } } },
+					promptSnippet: "  snip:   does\n\nstuff  ",
+					promptGuidelines: [" keep snippy ", "", "keep snippy", "keep snippy"],
+				},
+				{
+					name: "quiet",
+					description: "No snippet",
+					parameters: {},
+					promptSnippet: "   ",
+				},
+			],
+			ops: [{ op: "getAllTools" }, { op: "setActiveTools", names: ["read", "snip", "quiet", "nope"] }],
+		}),
+	},
+	{
+		name: "agent-session-tools/allowlist-filtering",
+		tool: "agent-session-tools",
+		args: astBase({
+			config: { allowedToolNames: ["read"] },
+			extensionTools: [
+				{
+					definition: { name: "mcp__docs__search", description: "docs", parameters: {}, exposure: "deferred" },
+					sourceInfo: { path: "<ext:docs>", source: "temporary", scope: "temporary", origin: "top-level" },
+				},
+				{
+					definition: { name: "tool_search", description: "search tools", parameters: {}, exposure: "codemode", defaultActive: false },
+					sourceInfo: { path: "<ext:tools>", source: "temporary", scope: "temporary", origin: "top-level" },
+				},
+			],
+			ops: [
+				{ op: "refreshRegistry" },
+				{ op: "getAllTools" },
+				{ op: "setActiveTools", names: ["mcp__docs__search"] },
+				{ op: "getCallableToolNames" },
+			],
+		}),
+	},
+	{
+		name: "agent-session-tools/empty-allowlist-filters-mcp",
+		tool: "agent-session-tools",
+		args: astBase({
+			config: { allowedToolNames: [] },
+			extensionTools: [
+				{
+					definition: { name: "mcp__docs__search", description: "docs", parameters: {}, exposure: "deferred" },
+					sourceInfo: { path: "<ext:docs>", source: "temporary", scope: "temporary", origin: "top-level" },
+				},
+			],
+			ops: [{ op: "refreshRegistry", includeAllExtensionTools: true }, { op: "getAllTools" }],
+		}),
+	},
+	{
+		name: "agent-session-tools/excluded-tools",
+		tool: "agent-session-tools",
+		args: astBase({
+			config: { excludedToolNames: ["bash"] },
+			ops: [{ op: "getAllTools" }, { op: "refreshRegistry" }],
+		}),
+	},
+	{
+		name: "agent-session-tools/extension-merge-and-exposures",
+		tool: "agent-session-tools",
+		args: astBase({
+			extensionTools: [
+				{
+					definition: { name: "auto_ext", description: "auto", parameters: {} },
+					sourceInfo: { path: "<ext:a>", source: "temporary", scope: "temporary", origin: "top-level" },
+				},
+				{
+					definition: { name: "off_ext", description: "off", parameters: {}, defaultActive: false },
+					sourceInfo: { path: "<ext:a>", source: "temporary", scope: "temporary", origin: "top-level" },
+				},
+				{
+					definition: { name: "model_only", description: "mo", parameters: {}, exposure: "model-only" },
+					sourceInfo: { path: "<ext:a>", source: "temporary", scope: "temporary", origin: "top-level" },
+				},
+				{
+					definition: { name: "code_ext", description: "code", parameters: {}, exposure: "codemode" },
+					sourceInfo: { path: "<ext:a>", source: "temporary", scope: "temporary", origin: "top-level" },
+				},
+			],
+			ops: [
+				{ op: "refreshRegistry", includeAllExtensionTools: true },
+				{ op: "getAllTools" },
+				{ op: "getCallableToolNames" },
+				{ op: "setActiveTools", names: ["off_ext", "code_ext"] },
+				{ op: "refreshRegistry", activeToolNames: ["read"] },
+			],
+		}),
+	},
+	{
+		name: "agent-session-tools/restore-from-transcript",
+		tool: "agent-session-tools",
+		args: astBase({
+			config: { usesDefaultTools: true, defaultToolModifiers: ["-bash", "+write"] },
+			baseTools: {
+				read: { name: "read", description: "Read files", parameters: {} },
+				bash: { name: "bash", description: "Run commands", parameters: {} },
+				write: { name: "write", description: "Write files", parameters: {} },
+			},
+			entries: [
+				{ type: "session", id: "s-root", version: 3, cwd: "/proj" },
+				{
+					type: "message",
+					id: "m-sys",
+					message: {
+						role: "system",
+						content: "base prompt",
+						toolsAdded: [{ name: "read" }, { name: "bash" }],
+						timestamp: 100,
+					},
+				},
+			],
+			extensionTools: [
+				{
+					definition: { name: "late_ext", description: "late", parameters: {} },
+					sourceInfo: { path: "<ext:late>", source: "temporary", scope: "temporary", origin: "top-level" },
+				},
+			],
+			ops: [
+				{ op: "restoreFromTranscript", modifiers: [] },
+				{ op: "refreshRegistry", includeAllExtensionTools: true },
+			],
+		}),
+	},
+	{
+		name: "agent-session-tools/hidden-declarations-projection",
+		tool: "agent-session-tools",
+		args: astBase({
+			customTools: [
+				{
+					name: "steerer",
+					description: "Steers",
+					parameters: {},
+					prepareLoadout: {
+						kind: "changes",
+						descriptions: { read: "Read files (steered)" },
+						hiddenDeclarations: ["grep"],
+					},
+				},
+			],
+			messages: [
+				{ role: "system", content: "base", toolsAdded: [{ name: "read" }, { name: "grep" }], timestamp: 1 },
+				{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 2 },
+				{ role: "system", content: "", toolsRemoved: [{ name: "grep" }], timestamp: 3 },
+			],
+			ops: [
+				{ op: "setActiveTools", names: ["read", "grep", "steerer"] },
+				{ op: "transformContext", messageIndices: [0, 1, 2] },
+				{ op: "transformContext", messageIndices: [1] },
+			],
+		}),
+	},
+	{
+		name: "agent-session-tools/forced-prompt-projection",
+		tool: "agent-session-tools",
+		args: astBase({
+			messages: [
+				{ role: "system", content: "base", toolsAdded: [{ name: "read" }], timestamp: 7 },
+				{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 8 },
+			],
+			ops: [
+				{ op: "setForcedPrompt", text: "FORCED PROMPT" },
+				{ op: "transformContext", messageIndices: [0, 1] },
+				{ op: "setForcedPrompt", text: null },
+				{ op: "transformContext", messageIndices: [0, 1] },
+			],
+		}),
+	},
+	{
+		name: "agent-session-tools/prepare-loadout-throw",
+		tool: "agent-session-tools",
+		args: astBase({
+			customTools: [
+				{
+					name: "thrower",
+					description: "Throws",
+					parameters: {},
+					prepareLoadout: { kind: "throw", message: "boom" },
+				},
+			],
+			ops: [{ op: "setActiveTools", names: ["read", "thrower"] }],
+		}),
 	},
 
 	// ------------------------------------------------------------- tui-utils

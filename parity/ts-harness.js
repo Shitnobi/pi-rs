@@ -5271,6 +5271,263 @@ async function runModule(tool, args, cwd) {
 		}
 	}
 
+
+	if (tool === "agent-session-tools") {
+		// dist/core/agent-session.js — the tools slice of the REAL
+		// AgentSession: _refreshToolRegistry, _applyToolLoadout (incl.
+		// prepareLoadout hooks), exposure/allowlist algebra,
+		// _rebuildSystemPrompt glue, _restoreToolsFromTranscript, the
+		// hidden-declarations + forced-prompt projections, and the
+		// constructor's _buildRuntime. Mirrors the Rust harness
+		// (crates/pi-cli/src/session_tools_harness.rs, pi-session port).
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		const { AgentSession } = require(path.join(distDir, "core", "agent-session.js"));
+		const { SessionManager } = require(path.join(distDir, "core", "session-manager.js"));
+		const { SettingsManager } = require(path.join(distDir, "core", "settings-manager.js"));
+		const { DefaultResourceLoader } = require(path.join(distDir, "core", "resource-loader.js"));
+		// Validation order mirrors the Rust entry exactly.
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		const config = args.config ?? {};
+		if (typeof config !== "object" || config === null || Array.isArray(config)) {
+			throw new Error("invalid config");
+		}
+		if (typeof args.baseTools !== "object" || args.baseTools === null || Array.isArray(args.baseTools)) {
+			throw new Error("missing baseTools");
+		}
+		const customToolsIn = args.customTools ?? [];
+		if (!Array.isArray(customToolsIn)) throw new Error("invalid customTools");
+		const extensionToolsIn = args.extensionTools ?? [];
+		if (!Array.isArray(extensionToolsIn)) throw new Error("invalid extensionTools");
+		if (
+			!Array.isArray(args.entries) ||
+			args.entries.length === 0 ||
+			args.entries[0].type !== "session"
+		) {
+			throw new Error("missing entries");
+		}
+		const messages = args.messages ?? [];
+		if (!Array.isArray(messages)) throw new Error("invalid messages");
+		if (!Array.isArray(args.ops)) throw new Error("missing ops");
+
+		const EXPOSURES = ["direct", "model-only", "codemode", "deferred", "hidden"];
+		const buildDefinition = (d) => {
+			if (d === null || typeof d !== "object" || Array.isArray(d)) {
+				throw new Error("customTools entries must be objects");
+			}
+			if (d.exposure !== undefined && !EXPOSURES.includes(d.exposure)) {
+				throw new Error("invalid exposure");
+			}
+			if (
+				d.prepareLoadout !== undefined &&
+				d.prepareLoadout?.kind !== "changes" &&
+				d.prepareLoadout?.kind !== "throw"
+			) {
+				throw new Error("invalid prepareLoadout");
+			}
+			return {
+				name: d.name,
+				label: d.label,
+				description: d.description,
+				parameters: d.parameters ?? {},
+				...(d.promptSnippet !== undefined ? { promptSnippet: d.promptSnippet } : {}),
+				...(d.promptGuidelines !== undefined ? { promptGuidelines: d.promptGuidelines } : {}),
+				...(d.exposure !== undefined ? { exposure: d.exposure } : {}),
+				...(d.namespace !== undefined ? { namespace: d.namespace } : {}),
+				...(d.annotations !== undefined ? { annotations: d.annotations } : {}),
+				...(d.reachesTools !== undefined ? { reachesTools: d.reachesTools } : {}),
+				...(d.defaultActive !== undefined ? { defaultActive: d.defaultActive } : {}),
+				...(d.prepareLoadout !== undefined
+					? {
+							prepareLoadout: (loadout) => {
+								if (d.prepareLoadout.kind === "throw") {
+									throw new Error(d.prepareLoadout.message);
+								}
+								return {
+									...(d.prepareLoadout.descriptions !== undefined
+										? { descriptions: d.prepareLoadout.descriptions }
+										: {}),
+									...(d.prepareLoadout.hiddenDeclarations !== undefined
+										? { hiddenDeclarations: d.prepareLoadout.hiddenDeclarations }
+										: {}),
+								};
+							},
+						}
+					: {}),
+				execute: () => {
+					throw new Error("agent-session-tools harness tool execute must never be called");
+				},
+			};
+		};
+		const customTools = customToolsIn.map(buildDefinition);
+		const extensionToolList = extensionToolsIn.map((t) => {
+			if (t === null || typeof t !== "object" || Array.isArray(t)) {
+				throw new Error("extensionTools entries must be objects");
+			}
+			if (t.definition === undefined) throw new Error("missing definition");
+			if (t.sourceInfo === undefined) throw new Error("missing sourceInfo");
+			return { definition: buildDefinition(t.definition), sourceInfo: t.sourceInfo };
+		});
+		const baseToolsMap = {};
+		for (const [key, spec] of Object.entries(args.baseTools)) {
+			if (spec === null || typeof spec !== "object" || Array.isArray(spec)) {
+				throw new Error("baseTools entries must be objects");
+			}
+			baseToolsMap[key] = {
+				name: spec.name,
+				label: spec.label,
+				description: spec.description,
+				parameters: spec.parameters ?? {},
+				execute: () => {
+					throw new Error("agent-session-tools harness tool execute must never be called");
+				},
+			};
+		}
+
+		const realDateNow = Date.now;
+		Date.now = () => args.nowMs;
+		const RealDate = Date;
+		class PinnedDate extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(args.nowMs);
+				else super(...ctorArgs);
+			}
+		}
+		globalThis.Date = PinnedDate;
+		let uuidI = 0;
+		const nextUuid = () => "uid" + String(++uuidI).padStart(5, "0");
+		try {
+			const agent = new Agent({
+				streamFn: () => {
+					throw new Error("agent-session-tools harness streamFn must never be called");
+				},
+				initialState: { messages: [] },
+			});
+			const sessionManager = SessionManager.inMemory("/proj", undefined, args.entries);
+			const settingsManager = SettingsManager.inMemory({});
+			const resourceLoader = new DefaultResourceLoader({
+				cwd: "/proj",
+				agentDir: "/proj/.pi",
+				settingsManager,
+				noExtensions: true,
+			});
+			const modelRuntime = { getPhysicalModel: () => undefined };
+			const session = new AgentSession({
+				agent,
+				sessionManager,
+				settingsManager,
+				cwd: "/proj",
+				resourceLoader,
+				modelRuntime,
+				customTools,
+				...(config.usesDefaultTools !== undefined ? { usesDefaultTools: config.usesDefaultTools } : {}),
+				...(config.defaultToolModifiers !== undefined
+					? { defaultToolModifiers: config.defaultToolModifiers }
+					: {}),
+				...(config.initialActiveToolNames !== undefined
+					? { initialActiveToolNames: config.initialActiveToolNames }
+					: {}),
+				...(config.allowedToolNames !== undefined ? { allowedToolNames: config.allowedToolNames } : {}),
+				...(config.excludedToolNames !== undefined
+					? { excludedToolNames: config.excludedToolNames }
+					: {}),
+				baseToolsOverride: baseToolsMap,
+			});
+			// Swap in the recording fake runner AFTER construction (the
+			// constructor refreshes against a real, empty ExtensionRunner).
+			const extensionErrors = [];
+			let installed = false;
+			const fakeRunner = {
+				hasHandlers: () => false,
+				emit: async () => {},
+				emitMessageEnd: async () => undefined,
+				emitError: (err) => {
+					extensionErrors.push({
+						extensionPath: err.extensionPath,
+						event: err.event,
+						error: err.error,
+					});
+				},
+				invalidate: () => {},
+				getAllRegisteredTools: () => (installed ? extensionToolList : []),
+			};
+			session._extensionRunner = fakeRunner;
+			installed = true;
+			globalThis.__piParityUuidOverride = nextUuid;
+
+			const results = [];
+			for (const op of args.ops) {
+				if (op === null || typeof op !== "object" || Array.isArray(op)) {
+					throw new Error("ops entries must be objects");
+				}
+				if (typeof op.op !== "string") throw new Error("missing op");
+				let v = null;
+				switch (op.op) {
+					case "refreshRegistry": {
+						const options = {};
+						if (op.activeToolNames !== undefined) options.activeToolNames = op.activeToolNames;
+						if (op.includeAllExtensionTools !== undefined) {
+							options.includeAllExtensionTools = op.includeAllExtensionTools;
+						}
+						session._refreshToolRegistry(Object.keys(options).length > 0 ? options : undefined);
+						break;
+					}
+					case "setActiveTools": {
+						if (!Array.isArray(op.names)) throw new Error("missing names");
+						session.setActiveToolsByName(op.names);
+						break;
+					}
+					case "restoreFromTranscript": {
+						session._restoreToolsFromTranscript(op.modifiers ?? []);
+						break;
+					}
+					case "transformContext": {
+						if (!Array.isArray(op.messageIndices)) throw new Error("missing messageIndices");
+						const input = op.messageIndices.map((i) => {
+							if (typeof i !== "number" || !Number.isInteger(i) || i < 0 || i >= messages.length) {
+								throw new Error("invalid messageIndex");
+							}
+							return messages[i];
+						});
+						v = await session.agent.transformContext(input, undefined);
+						break;
+					}
+					case "setForcedPrompt": {
+						if (op.text === undefined) throw new Error("missing text");
+						if (op.text !== null && typeof op.text !== "string") throw new Error("invalid text");
+						session._runSystemPromptOptions = op.text === null ? undefined : { forceSystemPrompt: op.text };
+						break;
+					}
+					case "getAllTools":
+						v = session.getAllTools();
+						break;
+					case "getCallableToolNames":
+						v = session.getCallableToolNames();
+						break;
+					default:
+						throw new Error("unknown agent-session-tools op: " + op.op);
+				}
+				results.push(v === undefined ? null : v);
+			}
+			return {
+				result: {
+					activeTools: session.getActiveToolNames(),
+					declaredTools: agent.state.tools.map((t) => ({
+						name: t.name,
+						description: t.description,
+						parameters: t.parameters,
+					})),
+					hiddenDeclarations: [...session._hiddenDeclarations],
+					systemPromptOptions: session._baseSystemPromptOptions,
+					results,
+					extensionErrors,
+				},
+			};
+		} finally {
+			globalThis.__piParityUuidOverride = null;
+			Date.now = realDateNow;
+			globalThis.Date = RealDate;
+		}
+	}
 	if (tool === "file-mutation-queue") {
 		// dist/core/tools/file-mutation-queue.js — withFileMutationQueue over
 		// scripted fns. Ops run concurrently; each fn marks itself started,

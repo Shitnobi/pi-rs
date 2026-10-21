@@ -385,6 +385,13 @@ pub fn run_agent_session_events_harness(args: &Value) -> Result<Value, String> {
         clock: Arc::clone(&clock),
         nested_tool_calls: Some(nested_store as Arc<dyn NestedCallsStore>),
         cwd: HARNESS_CWD.to_string(),
+        custom_tools: Vec::new(),
+        initial_active_tool_names: None,
+        uses_default_tools: false,
+        default_tool_modifiers: Vec::new(),
+        allowed_tool_names: None,
+        excluded_tool_names: None,
+        base_tools_override: None,
     });
 
     // Seed the identity arena with the pool in order (pool index == MsgId),

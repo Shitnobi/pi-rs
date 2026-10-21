@@ -1210,7 +1210,25 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       after construction) vs the Rust facade; Date pinned via Date.now
       override + PinnedDate class so new Date().toISOString() matches
       the fixed clock. Full parity 2435/2435.
+- [x] Tranche 9 — AgentSession tool registry & loadout (tools.rs,
+      ~1071 LOC in crates/pi-session/src/agent_session/): ToolExposure
+      algebra (_isAllowedTool/_allowlistFiltersMcp, _isActivatable,
+      _isDeclarable, _isActivatedOnRegistration), _applyToolLoadout
+      with prepareLoadout hooks (spec-based PrepareLoadoutSpec since
+      ExtensionRunner is Phase 4+; hook throw → emitError), _refreshToolRegistry
+      (base + extension + custom merges over ordered Vec maps preserving
+      TS Map insertion order), _rebuildSystemPrompt (NormalizedSystemPromptOptions),
+      _restoreToolsFromTranscript, hidden-declarations + forced-prompt
+      projections (stateful AgentSession::transform_context), constructor
+      _buildRuntime slice (createAllToolDefinitions unported →
+      baseToolsOverride required; default active [read,bash,edit,write]).
+      ExtensionHost trait gained get_all_registered_tools(). Parity
+      harness `agent-session-tools` (11 cases; suite 2446/2446):
+      both harnesses gate the fake extension host behind an `installed`
+      flag AND gate emit_error recording the same way — construction-time
+      prepareLoadout throws hit the real (empty) runner in TS and are
+      invisible; the Rust fake must mirror that or double-record.
 - [ ] Remaining agent-session tranches (phase3-agent-session.md):
-      AgentSession slices 9–17 (tools, prompt, run, retry, compaction,
+      AgentSession slices 10–17 (prompt, run, retry, compaction,
       model, bash, tree, stats) and 18–19 (runtime, services+event-bus),
       extending crates/pi-session.
