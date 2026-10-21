@@ -8210,6 +8210,103 @@ export const cases = [
 
 	return [...defCases, ...pmCases, ...ntcCases, ...ogCases, ...sessCases];
 })(),
+
+...(() => {
+	// ========================================================================
+	// agent-queue — pi-agent-core (packages/agent) `Agent` queue surface:
+	// steer/followUp queues, queue modes, peek/clear/hasQueued. Protocol
+	// mirrors crates/pi-cli/src/agent_harness.rs and the ts-harness.js
+	// agent-queue entry: the TS side drives a real Agent (dummy streamFn,
+	// never called), the Rust side the AgentQueues port. Messages carry
+	// literal numeric timestamps; no normalization needed.
+	// ========================================================================
+	const aq = (name, args) => ({ tool: "agent-queue", name: "aq-" + name, args });
+	const aqMsg = (text, ts) => ({ role: "user", content: [{ type: "text", text }], timestamp: ts });
+
+	const c = [];
+	c.push(aq("defaults", { ops: [
+		{ op: "getSteeringMode" },
+		{ op: "getFollowUpMode" },
+		{ op: "hasQueued" },
+		{ op: "peek" },
+	]}));
+	c.push(aq("steer-one-at-a-time-peek-first-only", { ops: [
+		{ op: "steer", message: aqMsg("a", 1) },
+		{ op: "steer", message: aqMsg("b", 2) },
+		{ op: "hasQueued" },
+		{ op: "peek" },
+		{ op: "peek" },
+	]}));
+	c.push(aq("steer-all-mode-peek-all", {
+		steeringMode: "all",
+		ops: [
+			{ op: "steer", message: aqMsg("a", 1) },
+			{ op: "steer", message: aqMsg("b", 2) },
+			{ op: "peek" },
+			{ op: "getSteeringMode" },
+		],
+	}));
+	c.push(aq("set-steering-mode-mid-run", { ops: [
+		{ op: "steer", message: aqMsg("a", 1) },
+		{ op: "steer", message: aqMsg("b", 2) },
+		{ op: "peek" },
+		{ op: "setSteeringMode", mode: "all" },
+		{ op: "peek" },
+		{ op: "getSteeringMode" },
+		{ op: "setSteeringMode", mode: "one-at-a-time" },
+		{ op: "peek" },
+	]}));
+	c.push(aq("follow-up-shadowed-by-steering", { ops: [
+		{ op: "steer", message: aqMsg("s", 1) },
+		{ op: "followUp", message: aqMsg("f", 2) },
+		{ op: "peek" },
+		{ op: "clearSteering" },
+		{ op: "peek" },
+	]}));
+	c.push(aq("follow-up-mode-all", {
+		followUpMode: "all",
+		ops: [
+			{ op: "followUp", message: aqMsg("f1", 1) },
+			{ op: "followUp", message: aqMsg("f2", 2) },
+			{ op: "peek" },
+			{ op: "getFollowUpMode" },
+		],
+	}));
+	c.push(aq("clear-variants", { ops: [
+		{ op: "steer", message: aqMsg("s", 1) },
+		{ op: "followUp", message: aqMsg("f", 2) },
+		{ op: "clearSteering" },
+		{ op: "hasQueued" },
+		{ op: "peek" },
+		{ op: "clearAll" },
+		{ op: "hasQueued" },
+		{ op: "peek" },
+	]}));
+	c.push(aq("mixed-with-initial-state", {
+		initialState: {
+			messages: [{ role: "system", content: [{ type: "text", text: "sys" }], timestamp: 0 }],
+		},
+		ops: [
+			{ op: "getSteeringMode" },
+			{ op: "steer", message: aqMsg("a", 1) },
+			{ op: "followUp", message: aqMsg("f", 2) },
+			{ op: "setFollowUpMode", mode: "all" },
+			{ op: "peek" },
+			{ op: "clearFollowUp" },
+			{ op: "peek" },
+			{ op: "hasQueued" },
+		],
+	}));
+	// Protocol-misuse cases: in-band {error} with byte-identical messages.
+	c.push(aq("err-unknown-op", { ops: [{ op: "bogus" }] }));
+	c.push(aq("err-missing-ops", {}));
+	c.push(aq("err-bad-steering-mode", { steeringMode: "sometimes", ops: [] }));
+	c.push(aq("err-bad-set-mode", { ops: [{ op: "setSteeringMode", mode: "many" }] }));
+	c.push(aq("err-missing-message", { ops: [{ op: "followUp" }] }));
+	c.push(aq("err-missing-mode", { ops: [{ op: "setFollowUpMode" }] }));
+
+	return c.filter(Boolean);
+})(),
 ];
 
 // config-value sub-case builder (hoisted; used by the cases above).

@@ -47,6 +47,9 @@
  *   fixture load (paths `<base>`-normalized, arrays order-insensitive)
  * - "skills": core/skills.js loadFromDir/load (same fixture style) +
  *   formatForPrompt over inline skill objects
+ * - "agent-queue": packages/agent Agent queue surface (steer/followUp
+ *   queues, modes, peek/clear) driven against a real Agent with a
+ *   never-called dummy streamFn
  */
 const path = require("path");
 const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
@@ -3970,6 +3973,104 @@ async function runModule(tool, args, cwd) {
 			process.stderr.write = savedErr;
 			process.exit = savedExit;
 		}
+	}
+
+	if (tool === "agent-queue") {
+		// packages/agent/dist/agent.js (pi-agent-core) — the queue surface of
+		// `class Agent`: steering/follow-up queues, queue modes, peek/clear.
+		// Mirrors crates/pi-cli/src/agent_harness.rs (AgentQueues port). A
+		// real Agent is constructed with a never-invoked dummy streamFn; the
+		// initialState seed is not observable through the queue surface.
+		// Messages carry literal numeric timestamps — no normalization.
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		const modeOf = (v, what) => {
+			if (v === undefined || v === null) return undefined;
+			if (v !== "all" && v !== "one-at-a-time") {
+				throw new Error(what + ' must be "all" or "one-at-a-time"');
+			}
+			return v;
+		};
+		if (!Array.isArray(args.ops)) throw new Error("missing ops");
+		const steeringMode = modeOf(args.steeringMode, "steeringMode");
+		const followUpMode = modeOf(args.followUpMode, "followUpMode");
+		let initialState;
+		if (args.initialState !== undefined && args.initialState !== null) {
+			if (typeof args.initialState !== "object" || Array.isArray(args.initialState)) {
+				throw new Error("initialState must be an object");
+			}
+			if (args.initialState.messages !== undefined && !Array.isArray(args.initialState.messages)) {
+				throw new Error("initialState.messages must be an array");
+			}
+			if (args.initialState.tools !== undefined && !Array.isArray(args.initialState.tools)) {
+				throw new Error("initialState.tools must be an array");
+			}
+			// Tools have no JSON representation (AgentTool instances); only
+			// the message seed reaches the Agent, and it is unobservable here.
+			initialState = { messages: args.initialState.messages ?? [] };
+		}
+		const agent = new Agent({
+			streamFn: () => {
+				throw new Error("agent-queue harness streamFn must never be called");
+			},
+			initialState,
+			...(steeringMode !== undefined ? { steeringMode } : {}),
+			...(followUpMode !== undefined ? { followUpMode } : {}),
+		});
+		const results = [];
+		for (const op of args.ops) {
+			if (op === null || typeof op !== "object" || Array.isArray(op)) {
+				throw new Error("ops entries must be objects");
+			}
+			if (typeof op.op !== "string") throw new Error("missing op");
+			let v;
+			switch (op.op) {
+				case "steer":
+				case "followUp": {
+					if (op.message === undefined) throw new Error("missing message");
+					if (op.op === "steer") agent.steer(op.message);
+					else agent.followUp(op.message);
+					v = null;
+					break;
+				}
+				case "setSteeringMode":
+				case "setFollowUpMode": {
+					if (op.mode === undefined || op.mode === null) throw new Error("missing mode");
+					const mode = modeOf(op.mode, "mode");
+					if (op.op === "setSteeringMode") agent.steeringMode = mode;
+					else agent.followUpMode = mode;
+					v = null;
+					break;
+				}
+				case "getSteeringMode":
+					v = agent.steeringMode;
+					break;
+				case "getFollowUpMode":
+					v = agent.followUpMode;
+					break;
+				case "clearSteering":
+					agent.clearSteeringQueue();
+					v = null;
+					break;
+				case "clearFollowUp":
+					agent.clearFollowUpQueue();
+					v = null;
+					break;
+				case "clearAll":
+					agent.clearAllQueues();
+					v = null;
+					break;
+				case "hasQueued":
+					v = agent.hasQueuedMessages();
+					break;
+				case "peek":
+					v = agent.peekQueuedMessages();
+					break;
+				default:
+					throw new Error("unknown agent-queue op: " + op.op);
+			}
+			results.push(v === undefined ? null : v);
+		}
+		return { result: { results } };
 	}
 
 	return undefined;

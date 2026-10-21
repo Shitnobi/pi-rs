@@ -20,6 +20,7 @@ mod auth_harness;
 mod composer_harness;
 mod runtime_harness;
 mod core_harness;
+mod agent_harness;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -176,6 +177,9 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "compaction-utils" => return run_compaction_utils_harness(&input),
         "compaction" => return run_compaction_harness(&input),
         "nested-calls" => return run_nested_calls_harness(&input),
+        "agent-queue" => {
+            return agent_harness::run_agent_queue_harness(&input, std::path::Path::new(cwd))
+        }
         "tui-utils" => return run_tui_utils_harness(&input),
         "tui-fuzzy" => return run_tui_fuzzy_harness(&input),
         "tui-word-navigation" => return run_tui_word_navigation_harness(&input),

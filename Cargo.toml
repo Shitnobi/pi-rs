@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/pi-core", "crates/pi-tools",
-    "crates/pi-providers", "crates/pi-cli", "crates/pi-photon", "crates/pi-session", "crates/pi-tui"]
+    "crates/pi-providers", "crates/pi-cli", "crates/pi-photon", "crates/pi-session", "crates/pi-tui",
+    "crates/pi-agent"]
 
 [workspace.package]
 version = "0.1.0"
