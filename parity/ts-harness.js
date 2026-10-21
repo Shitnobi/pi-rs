@@ -56,6 +56,14 @@
  * - "run-tool-call": packages/agent agent-loop runToolCall with scripted
  *   tools (update/return/throw steps), scripted prepareArguments,
  *   before/after hooks, and a pinned performance.now clock
+ * - "stream-assistant": packages/agent agent-loop runAgentLoop driving
+ *   streamAssistantResponse over a single scripted provider turn (events
+ *   from `script`, final message from `result`; Date.now pinned to nowMs)
+ * - "agent-loop": packages/agent agent-loop runAgentLoop over multiple
+ *   scripted provider turns with scripted tools (update/return/throw/
+ *   steer/followUp/abort steps), hook scripts (steering/followUp/
+ *   finishTurn/prepareRequest/prepareNextTurn), before/after hooks, and
+ *   pinned Date.now + performance.now clocks
  */
 const path = require("path");
 const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
@@ -4304,6 +4312,359 @@ async function runModule(tool, args, cwd) {
 		return { result: { outcome, updates } };
 	}
 
+	if (tool === "stream-assistant") {
+		// packages/agent/dist/agent-loop.js — runAgentLoop driving the
+		// (private) streamAssistantResponse over a SINGLE scripted provider
+		// turn: events yielded from `script`, final message from `result`
+		// (result() is authoritative; the done/error payloads are ignored).
+		// The fake streamFn records {apiKey, model, messages} per call —
+		// messages is the normalized TranscriptContext after transformContext
+		// + convertToLlm. Date.now is pinned to nowMs (declareToolChanges
+		// system-message timestamps). Mirrors the Rust harness entry; the
+		// shared wire protocol is documented in agent-t34-protocol.md.
+		const { runAgentLoop } = require(path.join(distDir, "..", "..", "agent", "dist", "agent-loop.js"));
+		// Validation order per the shared protocol spec (byte-exact errors).
+		if (!Array.isArray(args.script)) throw new Error("missing script");
+		if (args.result === undefined) throw new Error("missing result");
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		if (args.prompts !== undefined && !Array.isArray(args.prompts)) throw new Error("prompts must be an array");
+		if (args.contextMessages !== undefined && !Array.isArray(args.contextMessages)) {
+			throw new Error("contextMessages must be an array");
+		}
+		if (args.transformContext !== undefined && args.transformContext !== "identity" && args.transformContext !== "dropSystem") {
+			throw new Error('transformContext must be "identity" or "dropSystem"');
+		}
+		if (args.convertToLlm !== undefined && args.convertToLlm !== "default" && args.convertToLlm !== "dropAssistant") {
+			throw new Error('convertToLlm must be "default" or "dropAssistant"');
+		}
+		const prompts = args.prompts ?? [];
+		const contextMessages = args.contextMessages ?? [];
+
+		// Default model (protocol spec, exact JSON / key order).
+		const model = {
+			id: "unknown",
+			name: "unknown",
+			api: "unknown",
+			provider: "unknown",
+			baseUrl: "",
+			reasoning: false,
+			input: [],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 0,
+			maxTokens: 0,
+		};
+
+		// getApiKey pops the next scripted entry per call (exhausted → undefined).
+		let getApiKeyIdx = 0;
+		const getApiKey = Array.isArray(args.getApiKeyScript)
+			? async () => args.getApiKeyScript[getApiKeyIdx++]
+			: undefined;
+
+		const config = {
+			model,
+			reasoning: args.reasoning,
+			convertToLlm:
+				args.convertToLlm === "dropAssistant"
+					? (messages) => messages.filter((m) => m.role === "system" || m.role === "user" || m.role === "toolResult")
+					: (messages) =>
+							messages.filter((m) => m.role === "system" || m.role === "user" || m.role === "assistant" || m.role === "toolResult"),
+			...(args.transformContext === "dropSystem"
+				? { transformContext: (messages) => messages.filter((m) => m.role !== "system") }
+				: {}),
+			...(args.apiKey !== undefined ? { apiKey: args.apiKey } : {}),
+			...(getApiKey !== undefined ? { getApiKey } : {}),
+		};
+
+		const events = [];
+		const streamCalls = [];
+		const fakeStreamFn = (m, context, options) => {
+			streamCalls.push({ apiKey: options?.apiKey ?? null, model: m, messages: context.messages });
+			return {
+				async *[Symbol.asyncIterator]() {
+					for (const event of args.script) yield event;
+				},
+				result() {
+					return Promise.resolve(args.result);
+				},
+			};
+		};
+
+		const realDateNow = Date.now;
+		Date.now = () => args.nowMs;
+		let newMessages;
+		try {
+			newMessages = await runAgentLoop(
+				prompts,
+				{ messages: contextMessages, tools: [] },
+				config,
+				async (event) => {
+					events.push(event);
+				},
+				undefined,
+				fakeStreamFn,
+			);
+		} finally {
+			Date.now = realDateNow;
+		}
+		return { result: { events, newMessages, streamCalls } };
+	}
+
+	if (tool === "agent-loop") {
+		// packages/agent/dist/agent-loop.js — runAgentLoop over multiple
+		// scripted provider turns (fake provider pops providerTurns[i] per
+		// stream call; exhaustion throws "provider script exhausted", which
+		// propagates out of runAgentLoop as the in-band error). Tools are the
+		// run-tool-call ScriptedTool shape plus steer/followUp/abort execute
+		// steps; hooks are scripted (steering/followUp/finishTurn/
+		// prepareRequest/prepareNextTurn) and before/afterToolCall reuse the
+		// run-tool-call shims. Date.now + performance.now are pinned.
+		// Mirrors the Rust harness entry (agent_loop_harness.rs); shared wire
+		// protocol documented in agent-t34-protocol.md.
+		const { runAgentLoop } = require(path.join(distDir, "..", "..", "agent", "dist", "agent-loop.js"));
+		// Validation order per the shared protocol spec (byte-exact errors).
+		if (!Array.isArray(args.prompts)) throw new Error("missing prompts");
+		if (!Array.isArray(args.providerTurns)) throw new Error("missing providerTurns");
+		if (args.tools !== undefined && !Array.isArray(args.tools)) throw new Error("tools must be an array");
+		if (args.toolExecution !== undefined && args.toolExecution !== "parallel" && args.toolExecution !== "sequential") {
+			throw new Error('toolExecution must be "parallel" or "sequential"');
+		}
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		if (args.contextMessages !== undefined && !Array.isArray(args.contextMessages)) {
+			throw new Error("contextMessages must be an array");
+		}
+		if (args.transformContext !== undefined && args.transformContext !== "identity" && args.transformContext !== "dropSystem") {
+			throw new Error('transformContext must be "identity" or "dropSystem"');
+		}
+		if (args.convertToLlm !== undefined && args.convertToLlm !== "default" && args.convertToLlm !== "dropAssistant") {
+			throw new Error('convertToLlm must be "default" or "dropAssistant"');
+		}
+		// Tool/step shape errors (the complete list; the Rust side mirrors
+		// exactly these two):
+		// - "tools entries must be objects": a tools entry that is null, an
+		//   array, or not an object
+		// - "missing tool name": a tools entry whose `name` is not a string
+		if (args.tools !== undefined) {
+			for (const t of args.tools) {
+				if (t === null || typeof t !== "object" || Array.isArray(t)) throw new Error("tools entries must be objects");
+				if (typeof t.name !== "string") throw new Error("missing tool name");
+			}
+		}
+		const prompts = args.prompts;
+		const contextMessages = args.contextMessages ?? [];
+		const perfSeq = (Array.isArray(args.perfSeq) ? args.perfSeq : []).filter((v) => typeof v === "number");
+
+		// Default model (protocol spec, exact JSON / key order).
+		const model = {
+			id: "unknown",
+			name: "unknown",
+			api: "unknown",
+			provider: "unknown",
+			baseUrl: "",
+			reasoning: false,
+			input: [],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 0,
+			maxTokens: 0,
+		};
+
+		// Pinned clocks: Date.now → nowMs (system/toolResult message
+		// timestamps), performance.now → the scripted monotonic clock
+		// (starts at perfSeq[0] or 0; execute steps may set perfNow).
+		let perfValue = perfSeq.length > 0 ? perfSeq[0] : 0;
+		const realPerfNow = performance.now.bind(performance);
+		const realDateNow = Date.now;
+		performance.now = () => perfValue;
+		Date.now = () => args.nowMs;
+
+		// Run-owned abort controller: the `abort` execute step fires it.
+		const controller = new AbortController();
+
+		// Harness steering/follow-up buffers drained FIRST by the
+		// getSteeringMessages/getFollowUpMessages hooks (mid-run injection
+		// via tool execute steps), concatenated before the scripted entry.
+		const steerBuffer = [];
+		const followUpBuffer = [];
+		let steeringIdx = 0;
+		let followUpIdx = 0;
+		let finishIdx = 0;
+		let prepareRequestIdx = 0;
+		let prepareNextTurnIdx = 0;
+		let getApiKeyIdx = 0;
+
+		// Scripted tool: the run-tool-call ScriptedTool shape plus the
+		// steer/followUp/abort step kinds. Step processing order: perfNow,
+		// then steer/followUp/abort, then update, then (last step)
+		// throw/return.
+		const makeTool = (spec) => {
+			const name = typeof spec.name === "string" ? spec.name : "";
+			const tool = {
+				name,
+				description: typeof spec.description === "string" ? spec.description : "",
+				label: typeof spec.label === "string" ? spec.label : name,
+				parameters: spec.parameters === undefined ? null : spec.parameters,
+				execute: async (_toolCallId, _args, _signal, onUpdate) => {
+					const script = spec.execute && Array.isArray(spec.execute.script) ? spec.execute.script : [];
+					for (let i = 0; i < script.length; i++) {
+						const step = script[i];
+						const last = i === script.length - 1;
+						if (typeof step.perfNow === "number") perfValue = step.perfNow;
+						if (step.steer !== undefined) steerBuffer.push(step.steer);
+						if (step.followUp !== undefined) followUpBuffer.push(step.followUp);
+						if (step.abort === true) controller.abort();
+						if (step.update !== undefined) onUpdate(parityParseToolResult(step.update));
+						if (last) {
+							if (typeof step.throw === "string") throw new Error(step.throw);
+							if (step.return !== undefined) return parityParseToolResult(step.return);
+						}
+					}
+					return parityParseToolResult(undefined);
+				},
+			};
+			if (spec.executionMode !== undefined) tool.executionMode = spec.executionMode;
+			if (spec.prepareArguments !== undefined) {
+				tool.prepareArguments = (callArgs) => {
+					const prep = spec.prepareArguments;
+					if (prep && prep.mode === "script" && Array.isArray(prep.script)) {
+						for (const pair of prep.script) {
+							if (pair && parityJsonEq(pair.in, callArgs)) return pair.out;
+						}
+					}
+					return callArgs;
+				};
+			}
+			return tool;
+		};
+
+		// Update-script context entries: {messages?, tools?} → AgentContext
+		// (messages defaults to [], tools are ScriptedToolJson specs mapped
+		// through makeTool, defaulting to []). The Rust side mirrors this
+		// mapping exactly.
+		const mapUpdateContext = (c) => ({
+			messages: c && Array.isArray(c.messages) ? c.messages : [],
+			tools: (c && Array.isArray(c.tools) ? c.tools : []).map(makeTool),
+		});
+
+		const getApiKey = Array.isArray(args.getApiKeyScript)
+			? async () => args.getApiKeyScript[getApiKeyIdx++]
+			: undefined;
+		// Absent field → hook undefined (the loop treats that as no poll);
+		// present → each poll pops script[i] ?? [] after draining the
+		// harness buffer.
+		const getSteeringMessages =
+			args.steeringScript !== undefined
+				? async () => {
+						const drained = steerBuffer.splice(0, steerBuffer.length);
+						const scripted = args.steeringScript[steeringIdx++] ?? [];
+						return [...drained, ...scripted];
+					}
+				: undefined;
+		const getFollowUpMessages =
+			args.followUpScript !== undefined
+				? async () => {
+						const drained = followUpBuffer.splice(0, followUpBuffer.length);
+						const scripted = args.followUpScript[followUpIdx++] ?? [];
+						return [...drained, ...scripted];
+					}
+				: undefined;
+		// Each call pops decisions[i] ?? null; null → undefined (normal
+		// scheduling).
+		const finishTurn =
+			args.finishTurnDecisions !== undefined
+				? async () => {
+						const decision = args.finishTurnDecisions[finishIdx++] ?? null;
+						return decision === null ? undefined : { action: decision };
+					}
+				: undefined;
+		// Each call pops script[i] ?? null; entry fields map 1:1 onto the
+		// AgentRequestUpdate (undefined fields keep current values).
+		const prepareRequest =
+			args.prepareRequestScript !== undefined
+				? async () => {
+						const entry = args.prepareRequestScript[prepareRequestIdx++] ?? null;
+						if (entry === null || entry === undefined) return undefined;
+						const out = {};
+						if (entry.context !== undefined) out.context = mapUpdateContext(entry.context);
+						if (entry.model !== undefined) out.model = entry.model;
+						if (entry.thinkingLevel !== undefined) out.thinkingLevel = entry.thinkingLevel;
+						return out;
+					}
+				: undefined;
+		// Each call pops script[i] ?? null; entry fields map 1:1 onto the
+		// AgentLoopTurnUpdate (undefined fields keep current values).
+		const prepareNextTurn =
+			args.prepareNextTurnScript !== undefined
+				? async () => {
+						const entry = args.prepareNextTurnScript[prepareNextTurnIdx++] ?? null;
+						if (entry === null || entry === undefined) return undefined;
+						const out = {};
+						if (entry.context !== undefined) out.context = mapUpdateContext(entry.context);
+						if (entry.messages !== undefined) out.messages = entry.messages;
+						if (entry.model !== undefined) out.model = entry.model;
+						if (entry.thinkingLevel !== undefined) out.thinkingLevel = entry.thinkingLevel;
+						return out;
+					}
+				: undefined;
+
+		const config = {
+			model,
+			reasoning: args.reasoning,
+			toolExecution: args.toolExecution ?? "parallel",
+			convertToLlm:
+				args.convertToLlm === "dropAssistant"
+					? (messages) => messages.filter((m) => m.role === "system" || m.role === "user" || m.role === "toolResult")
+					: (messages) =>
+							messages.filter((m) => m.role === "system" || m.role === "user" || m.role === "assistant" || m.role === "toolResult"),
+			...(args.transformContext === "dropSystem"
+				? { transformContext: (messages) => messages.filter((m) => m.role !== "system") }
+				: {}),
+			...(args.apiKey !== undefined ? { apiKey: args.apiKey } : {}),
+			...(getApiKey !== undefined ? { getApiKey } : {}),
+			...(getSteeringMessages !== undefined ? { getSteeringMessages } : {}),
+			...(getFollowUpMessages !== undefined ? { getFollowUpMessages } : {}),
+			...(finishTurn !== undefined ? { finishTurn } : {}),
+			...(prepareRequest !== undefined ? { prepareRequest } : {}),
+			...(prepareNextTurn !== undefined ? { prepareNextTurn } : {}),
+			...(args.beforeToolCall !== undefined ? { beforeToolCall: parityMakeBefore(args.beforeToolCall) } : {}),
+			...(args.afterToolCall !== undefined ? { afterToolCall: parityMakeAfter(args.afterToolCall) } : {}),
+		};
+
+		const events = [];
+		const streamCalls = [];
+		let providerIdx = 0;
+		const fakeStreamFn = (m, context, options) => {
+			const turn = args.providerTurns[providerIdx];
+			if (turn === undefined) throw new Error("provider script exhausted");
+			providerIdx++;
+			streamCalls.push({ apiKey: options?.apiKey ?? null, model: m, messages: context.messages });
+			return {
+				async *[Symbol.asyncIterator]() {
+					for (const event of turn.events ?? []) yield event;
+				},
+				result() {
+					return Promise.resolve(turn.result);
+				},
+			};
+		};
+
+		let newMessages;
+		try {
+			newMessages = await runAgentLoop(
+				prompts,
+				{ messages: contextMessages, tools: (args.tools ?? []).map(makeTool) },
+				config,
+				async (event) => {
+					events.push(event);
+				},
+				controller.signal,
+				fakeStreamFn,
+			);
+		} finally {
+			performance.now = realPerfNow;
+			Date.now = realDateNow;
+		}
+		return { result: { events, newMessages, streamCalls } };
+	}
+
 	return undefined;
 }
 
@@ -4425,6 +4786,70 @@ function parityOptBool(obj, key, err) {
 	if (v === undefined || v === null) return undefined;
 	if (typeof v !== "boolean") throw new Error(err);
 	return v;
+}
+
+/** JSON deep equality (object key order insensitive), mirroring the
+ * serde_json Value equality of the Rust ScriptedTool pair match. Shared by
+ * the run-tool-call and agent-loop scripted-tool entries. */
+function parityCanonJson(v) {
+	if (v === null || typeof v !== "object") return v;
+	if (Array.isArray(v)) return v.map(parityCanonJson);
+	const o = {};
+	for (const k of Object.keys(v).sort()) o[k] = parityCanonJson(v[k]);
+	return o;
+}
+
+function parityJsonEq(a, b) {
+	return JSON.stringify(parityCanonJson(a)) === JSON.stringify(parityCanonJson(b));
+}
+
+/** JSON spec → AgentToolResult, mirroring the Rust parse_tool_result:
+ * content defaults to [], details is always present (null when absent),
+ * structuredContent/usage drop null, isError/terminate keep booleans only.
+ * Shared by the run-tool-call and agent-loop entries. */
+function parityParseToolResult(value) {
+	const v = value === undefined || value === null ? {} : value;
+	const out = {
+		content: Array.isArray(v.content) ? v.content : [],
+		details: v.details === undefined || v.details === null ? null : v.details,
+	};
+	if (v.structuredContent !== undefined && v.structuredContent !== null) out.structuredContent = v.structuredContent;
+	if (v.usage !== undefined && v.usage !== null) out.usage = v.usage;
+	if (typeof v.isError === "boolean") out.isError = v.isError;
+	if (typeof v.terminate === "boolean") out.terminate = v.terminate;
+	return out;
+}
+
+/** beforeToolCall hook shim mirroring the Rust parse_before: a "throw"
+ * string rejects; block/reason/terminate keep only their well-typed values
+ * (null is treated as absent, exactly like the Rust filters). */
+function parityMakeBefore(rawSpec) {
+	const spec = rawSpec === undefined || rawSpec === null ? {} : rawSpec;
+	return async () => {
+		if (typeof spec.throw === "string") throw new Error(spec.throw);
+		const out = {};
+		if (typeof spec.block === "boolean") out.block = spec.block;
+		if (typeof spec.reason === "string") out.reason = spec.reason;
+		if (typeof spec.terminate === "boolean") out.terminate = spec.terminate;
+		return out;
+	};
+}
+
+/** afterToolCall hook shim mirroring the Rust parse_after (same value
+ * filters as parityMakeBefore plus the result-override fields). */
+function parityMakeAfter(rawSpec) {
+	const spec = rawSpec === undefined || rawSpec === null ? {} : rawSpec;
+	return async () => {
+		if (typeof spec.throw === "string") throw new Error(spec.throw);
+		const out = {};
+		if (spec.content !== undefined && spec.content !== null) out.content = Array.isArray(spec.content) ? spec.content : [];
+		if (spec.details !== undefined && spec.details !== null) out.details = spec.details;
+		if (spec.structuredContent !== undefined && spec.structuredContent !== null) out.structuredContent = spec.structuredContent;
+		if (spec.usage !== undefined && spec.usage !== null) out.usage = spec.usage;
+		if (typeof spec.isError === "boolean") out.isError = spec.isError;
+		if (typeof spec.terminate === "boolean") out.terminate = spec.terminate;
+		return out;
+	};
 }
 
 let input = "";

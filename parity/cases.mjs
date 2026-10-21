@@ -8656,6 +8656,462 @@ export const cases = [
 
 	return c.filter(Boolean);
 })(),
+
+...(() => {
+	// ========================================================================
+	// stream-assistant — pi-agent-core runAgentLoop driving
+	// streamAssistantResponse over a single scripted provider turn (events
+	// from `script`, final message from `result`; result() is authoritative,
+	// so the done/error payload fields are junk on purpose). Date.now is
+	// pinned to nowMs. Mirrors the Rust harness entry; the shared wire
+	// protocol is documented in agent-t34-protocol.md. Messages carry
+	// literal numeric timestamps.
+	// ========================================================================
+	const sa = (name, args) => ({ tool: "stream-assistant", name: "sa-" + name, args });
+	const NOW = 1780000000000;
+	const saUser = (text, timestamp) => ({ role: "user", content: [{ type: "text", text }], timestamp });
+	const saSystem = (text, timestamp) => ({ role: "system", content: text, timestamp });
+	// Structurally valid AssistantMessage with overridable fields.
+	const saMsg = (o = {}) => ({
+		role: "assistant",
+		content: o.content ?? [{ type: "text", text: "final" }],
+		api: o.api ?? "unknown",
+		provider: o.provider ?? "unknown",
+		model: o.model ?? "unknown",
+		usage: o.usage ?? {
+			input: 3,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 8,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: o.stopReason ?? "stop",
+		...(o.errorMessage !== undefined ? { errorMessage: o.errorMessage } : {}),
+		timestamp: o.timestamp ?? 4400,
+	});
+	const saText = (text) => [{ type: "text", text }];
+	const saBase = (script, result, extra = {}) => ({ script, result, nowMs: NOW, ...extra });
+
+	const c = [];
+	// Plain done: no partial at all — message_start emitted at finalization
+	// with a copy of the final message. Full event sequence pinned.
+	c.push(sa("plain-done", saBase([{ type: "done", reason: "stop", message: { junk: "ignored" } }], saMsg())));
+	// start + text_delta×2 + done: message_start with a copy of the first
+	// partial, one message_update per delta (assistantMessageEvent = the
+	// raw event JSON, message = {...partial}), message_end with the final.
+	c.push(sa("start-deltas-done", saBase(
+		[
+			{ type: "start", partial: saMsg({ content: saText("He") }) },
+			{ type: "text_delta", contentIndex: 0, delta: "ll", partial: saMsg({ content: saText("Hell") }) },
+			{ type: "text_delta", contentIndex: 0, delta: "o", partial: saMsg({ content: saText("Hello") }) },
+			{ type: "done", reason: "stop", message: { junk: true } },
+		],
+		saMsg({ content: saText("Hello") }),
+		{ prompts: [saUser("hi", 1000)] },
+	)));
+	// start + text_end + done: text_end also replaces the last partial and
+	// emits message_update.
+	c.push(sa("start-text-end-done", saBase(
+		[
+			{ type: "start", partial: saMsg({ content: saText("Hel") }) },
+			{ type: "text_end", contentIndex: 0, content: "Hello", partial: saMsg({ content: saText("Hello") }) },
+			{ type: "done", reason: "stop", message: null },
+		],
+		saMsg({ content: saText("Hello") }),
+	)));
+	// thinking_start/thinking_delta path.
+	c.push(sa("thinking-deltas", saBase(
+		[
+			{ type: "start", partial: saMsg({ content: [] }) },
+			{ type: "thinking_start", contentIndex: 0, partial: saMsg({ content: [{ type: "thinking", text: "hmm" }] }) },
+			{ type: "thinking_delta", contentIndex: 0, delta: "…", partial: saMsg({ content: [{ type: "thinking", text: "hmm…" }] }) },
+			{ type: "done", reason: "stop", message: null },
+		],
+		saMsg({ content: [{ type: "thinking", text: "hmm…" }, { type: "text", text: "done" }] }),
+	)));
+	// toolcall_start/toolcall_end path with no tools in the context — the
+	// events are still emitted; the final result has no tool calls so the
+	// loop ends after the single turn.
+	c.push(sa("toolcall-events", saBase(
+		[
+			{ type: "start", partial: saMsg({ content: [] }) },
+			{ type: "toolcall_start", contentIndex: 0, partial: saMsg({ content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "x" } }] }) },
+			{ type: "toolcall_end", contentIndex: 0, toolCall: { id: "call-1", name: "read", arguments: { path: "x" } }, partial: saMsg({ content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "x" } }] }) },
+			{ type: "done", reason: "stop", message: null },
+		],
+		saMsg(),
+	)));
+	// Stream ends without a terminal event: the same finalization runs
+	// after the for-await loop (message_start at finalization, then
+	// message_end) — no done/error event needed at all.
+	c.push(sa("empty-script-no-terminal", saBase([], saMsg())));
+	// Error event path: result stopReason "error" — the loop hard-exits
+	// right after message_end (turn_end, agent_end; no further polling
+	// output). The event's own error payload is ignored junk.
+	c.push(sa("error-event", saBase(
+		[{ type: "error", reason: "error", error: { junk: "ignored" } }],
+		saMsg({ stopReason: "error", errorMessage: "boom" }),
+	)));
+	// dropSystem transformContext: streamCalls.messages lacks the system
+	// message (the user message survives).
+	c.push(sa("drop-system", {
+		script: [{ type: "done", reason: "stop", message: null }],
+		result: saMsg(),
+		nowMs: NOW,
+		transformContext: "dropSystem",
+		contextMessages: [saSystem("be gone", 100), saUser("hi", 200)],
+	}));
+	// dropAssistant convertToLlm: streamCalls.messages lacks the assistant
+	// context message.
+	c.push(sa("drop-assistant", {
+		script: [{ type: "done", reason: "stop", message: null }],
+		result: saMsg(),
+		nowMs: NOW,
+		convertToLlm: "dropAssistant",
+		contextMessages: [saUser("hi", 200), saMsg({ content: saText("earlier"), timestamp: 300 })],
+	}));
+	// reasoning "medium": the final message carries thinkingLevel "medium"
+	// as the LAST key (Object.assign after result()).
+	c.push(sa("reasoning-medium", {
+		script: [{ type: "done", reason: "stop", message: null }],
+		result: saMsg(),
+		nowMs: NOW,
+		reasoning: "medium",
+	}));
+	// getApiKeyScript ["dynamic-key"]: the dynamic key wins.
+	c.push(sa("api-key-dynamic", {
+		script: [{ type: "done", reason: "stop", message: null }],
+		result: saMsg(),
+		nowMs: NOW,
+		getApiKeyScript: ["dynamic-key"],
+	}));
+	// Static apiKey with no getApiKeyScript.
+	c.push(sa("api-key-static", {
+		script: [{ type: "done", reason: "stop", message: null }],
+		result: saMsg(),
+		nowMs: NOW,
+		apiKey: "static-key",
+	}));
+	// Empty dynamic key falls through to the static one (|| semantics).
+	c.push(sa("api-key-empty-falls-to-static", {
+		script: [{ type: "done", reason: "stop", message: null }],
+		result: saMsg(),
+		nowMs: NOW,
+		getApiKeyScript: [""],
+		apiKey: "static-key",
+	}));
+	// Protocol-misuse cases: in-band {error} with byte-identical messages.
+	c.push(sa("err-missing-script", { result: saMsg(), nowMs: NOW }));
+	c.push(sa("err-missing-result", { script: [], nowMs: NOW }));
+	c.push(sa("err-missing-now-ms", { script: [], result: saMsg() }));
+	c.push(sa("err-bad-transform-context", {
+		script: [],
+		result: saMsg(),
+		nowMs: NOW,
+		transformContext: "dropEverything",
+	}));
+
+	return c.filter(Boolean);
+})(),
+
+...(() => {
+	// ========================================================================
+	// agent-loop — pi-agent-core runAgentLoop over multiple scripted
+	// provider turns with scripted tools (steer/followUp/abort steps),
+	// hook scripts (steering/followUp/finishTurn/prepareRequest/
+	// prepareNextTurn), before/after hooks, and pinned Date.now +
+	// performance.now clocks. Mirrors the Rust harness entry
+	// (agent_loop_harness.rs). Messages carry literal numeric timestamps.
+	// ========================================================================
+	const al = (name, args) => ({ tool: "agent-loop", name: "al-" + name, args });
+	const NOW = 1780000000000;
+	const alUser = (text, timestamp) => ({ role: "user", content: [{ type: "text", text }], timestamp });
+	const alMsg = (o = {}) => ({
+		role: "assistant",
+		content: o.content ?? [{ type: "text", text: "done" }],
+		api: o.api ?? "unknown",
+		provider: o.provider ?? "unknown",
+		model: o.model ?? "unknown",
+		usage: o.usage ?? {
+			input: 3,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 8,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: o.stopReason ?? "stop",
+		...(o.errorMessage !== undefined ? { errorMessage: o.errorMessage } : {}),
+		timestamp: o.timestamp ?? 4400,
+	});
+	const alToolCall = (id, name, callArgs) => ({ type: "toolCall", id, name, arguments: callArgs });
+	const alParams = () => ({
+		type: "object",
+		properties: { path: { type: "string" } },
+		required: ["path"],
+		additionalProperties: false,
+	});
+	const alTool = (name, extra = {}) => ({
+		name,
+		description: "Tool " + name,
+		parameters: alParams(),
+		label: name,
+		...extra,
+	});
+	const alTurn = (result, events = []) => ({ events, result });
+	const alModel = (id) => ({
+		id,
+		name: id,
+		api: "unknown",
+		provider: "unknown",
+		baseUrl: "",
+		reasoning: false,
+		input: [],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 0,
+		maxTokens: 0,
+	});
+	const alOk = (text = "ok") => ({ content: [{ type: "text", text }], details: {} });
+
+	const c = [];
+	// Baseline: single turn, no tools, stopReason "stop".
+	c.push(al("single-turn-stop", {
+		prompts: [alUser("hi", 1000)],
+		providerTurns: [alTurn(alMsg())],
+		nowMs: NOW,
+	}));
+	// Tool call happy path (parallel): the tool-loadout system message is
+	// declared before the prompt; the tool executes (durationMs from the
+	// scripted clock); a second provider turn ends the run.
+	c.push(al("tool-call-happy-parallel", {
+		prompts: [alUser("read x", 1000)],
+		tools: [alTool("read", { execute: { script: [{ perfNow: 1050, return: alOk() }] } })],
+		providerTurns: [
+			alTurn(alMsg({ content: [alToolCall("call-1", "read", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+			alTurn(alMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// Sequential toolExecution with two tool calls in one message: the
+	// observable order is start/end/message per tool, in source order.
+	c.push(al("sequential-tool-execution", {
+		prompts: [alUser("read both", 1000)],
+		toolExecution: "sequential",
+		tools: [alTool("read", { execute: { script: [{ perfNow: 1050, return: alOk("one") }] } })],
+		providerTurns: [
+			alTurn(alMsg({
+				content: [alToolCall("call-1", "read", { path: "a" }), alToolCall("call-2", "read", { path: "b" })],
+				stopReason: "toolUse",
+				timestamp: 2000,
+			})),
+			alTurn(alMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// A tool with executionMode "sequential" forces sequential execution
+	// even though config.toolExecution is parallel (the default).
+	c.push(al("tool-mode-sequential", {
+		prompts: [alUser("read both", 1000)],
+		tools: [alTool("read", { executionMode: "sequential", execute: { script: [{ perfNow: 1050, return: alOk("one") }] } })],
+		providerTurns: [
+			alTurn(alMsg({
+				content: [alToolCall("call-1", "read", { path: "a" }), alToolCall("call-2", "read", { path: "b" })],
+				stopReason: "toolUse",
+				timestamp: 2000,
+			})),
+			alTurn(alMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// Tool not found: an error tool result ("Tool write not found", no
+	// durationMs); the run continues with a second provider turn.
+	c.push(al("tool-not-found", {
+		prompts: [alUser("write x", 1000)],
+		tools: [alTool("read", { execute: { script: [{ perfNow: 1050, return: alOk() }] } })],
+		providerTurns: [
+			alTurn(alMsg({ content: [alToolCall("call-1", "write", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+			alTurn(alMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// Validation error: the tool call misses the required "path" property —
+	// the validation failure becomes an error tool result.
+	c.push(al("validation-error", {
+		prompts: [alUser("read", 1000)],
+		tools: [alTool("read", { execute: { script: [{ perfNow: 1050, return: alOk() }] } })],
+		providerTurns: [
+			alTurn(alMsg({ content: [alToolCall("call-1", "read", {})], stopReason: "toolUse", timestamp: 2000 })),
+			alTurn(alMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// stopReason "length" with tool calls: every call fails with the
+	// truncated-arguments error (byte-exact text) instead of executing.
+	c.push(al("length-truncated-tool-calls", {
+		prompts: [alUser("read x", 1000)],
+		tools: [alTool("read", { execute: { script: [{ perfNow: 1050, return: alOk() }] } })],
+		providerTurns: [
+			alTurn(alMsg({ content: [alToolCall("call-1", "read", { path: "x" })], stopReason: "length", timestamp: 2000 })),
+			alTurn(alMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// terminate: every tool result sets terminate:true → the run ends after
+	// the batch (streamCalls length 1, no second provider call).
+	c.push(al("terminate-all", {
+		prompts: [alUser("read x", 1000)],
+		tools: [alTool("read", { execute: { script: [{ perfNow: 1050, return: { content: [{ type: "text", text: "stop" }], details: {}, terminate: true } }] } })],
+		providerTurns: [
+			alTurn(alMsg({ content: [alToolCall("call-1", "read", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// One terminate, one not: the batch does not terminate → the run
+	// continues with a second provider turn.
+	c.push(al("terminate-partial", {
+		prompts: [alUser("read both", 1000)],
+		tools: [
+			alTool("read", { execute: { script: [{ perfNow: 1050, return: { content: [{ type: "text", text: "stop" }], details: {}, terminate: true } }] } }),
+		],
+		providerTurns: [
+			alTurn(alMsg({
+				content: [alToolCall("call-1", "read", { path: "a" }), alToolCall("call-2", "read", { path: "b" })],
+				stopReason: "toolUse",
+				timestamp: 2000,
+			})),
+			alTurn(alMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// Steering injected mid-run by a tool execute step (steer buffer drained
+	// first by the getSteeringMessages hook): the message is emitted and
+	// reaches the second provider request.
+	c.push(al("steer-step", {
+		prompts: [alUser("read x", 1000)],
+		steeringScript: [],
+		tools: [alTool("read", { execute: { script: [
+			{ steer: alUser("steered mid-run", 1500) },
+			{ perfNow: 1050, return: alOk() },
+		] } })],
+		providerTurns: [
+			alTurn(alMsg({ content: [alToolCall("call-1", "read", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+			alTurn(alMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// steeringScript [[a,b]]: the first poll returns both messages (the loop
+	// drains all of them before the first request); the next polls return
+	// [] (script exhausted).
+	c.push(al("steering-script-one-shot", {
+		prompts: [alUser("hi", 1000)],
+		steeringScript: [[alUser("steer a", 1500), alUser("steer b", 1600)]],
+		providerTurns: [alTurn(alMsg())],
+		nowMs: NOW,
+	}));
+	// Follow-up: messages returned after the run would stop produce one
+	// extra turn.
+	c.push(al("follow-up-extra-turn", {
+		prompts: [alUser("hi", 1000)],
+		followUpScript: [[alUser("follow up", 1500)]],
+		providerTurns: [alTurn(alMsg()), alTurn(alMsg({ timestamp: 5000 }))],
+		nowMs: NOW,
+	}));
+	// finishTurnDecisions ["end"]: the run ends immediately after the first
+	// turn (no second provider call).
+	c.push(al("finish-turn-end", {
+		prompts: [alUser("hi", 1000)],
+		finishTurnDecisions: ["end"],
+		providerTurns: [alTurn(alMsg())],
+		nowMs: NOW,
+	}));
+	// finishTurnDecisions ["continue"] with nothing queued: one context-only
+	// extra provider call (streamCalls length 2, identical messages).
+	c.push(al("finish-turn-continue", {
+		prompts: [alUser("hi", 1000)],
+		finishTurnDecisions: ["continue"],
+		providerTurns: [alTurn(alMsg()), alTurn(alMsg({ timestamp: 5000 }))],
+		nowMs: NOW,
+	}));
+	// prepareRequestScript: the second request sees the swapped model.
+	c.push(al("prepare-request-model", {
+		prompts: [alUser("read x", 1000)],
+		prepareRequestScript: [{}, { model: alModel("m2") }],
+		tools: [alTool("read", { execute: { script: [{ perfNow: 1050, return: alOk() }] } })],
+		providerTurns: [
+			alTurn(alMsg({ content: [alToolCall("call-1", "read", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+			alTurn(alMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// prepareNextTurnScript: the entry's messages are appended before the
+	// next request and thinkingLevel "high" reaches the final message.
+	c.push(al("prepare-next-turn-messages", {
+		prompts: [alUser("read x", 1000)],
+		prepareNextTurnScript: [{ messages: [alUser("prepared", 1500)], thinkingLevel: "high" }],
+		tools: [alTool("read", { execute: { script: [{ perfNow: 1050, return: alOk() }] } })],
+		providerTurns: [
+			alTurn(alMsg({ content: [alToolCall("call-1", "read", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+			alTurn(alMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// abort step mid-run: the first tool aborts the run's controller during
+	// parallel execution; the remaining thunk finalizes with the
+	// "Operation aborted" error result, and the loop still schedules the
+	// next provider call (an aborted signal only stops tool scheduling).
+	c.push(al("abort-step-mid-run", {
+		prompts: [alUser("read both", 1000)],
+		tools: [
+			alTool("read", { execute: { script: [{ abort: true, perfNow: 1050, return: alOk("first") }] } }),
+		],
+		providerTurns: [
+			alTurn(alMsg({
+				content: [alToolCall("call-1", "read", { path: "a" }), alToolCall("call-2", "read", { path: "b" })],
+				stopReason: "toolUse",
+				timestamp: 2000,
+			})),
+			alTurn(alMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// stopReason "aborted": hard exit right after the assistant message.
+	c.push(al("stop-reason-aborted", {
+		prompts: [alUser("hi", 1000)],
+		providerTurns: [alTurn(alMsg({ stopReason: "aborted", errorMessage: "user aborted" }))],
+		nowMs: NOW,
+	}));
+	// Provider script exhausted: the second stream call throws, which
+	// propagates out of runAgentLoop as the in-band error.
+	c.push(al("provider-script-exhausted", {
+		prompts: [alUser("read x", 1000)],
+		tools: [alTool("read", { execute: { script: [{ perfNow: 1050, return: alOk() }] } })],
+		providerTurns: [
+			alTurn(alMsg({ content: [alToolCall("call-1", "read", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// Protocol-misuse cases: in-band {error} with byte-identical messages.
+	c.push(al("err-missing-prompts", { providerTurns: [], nowMs: NOW }));
+	c.push(al("err-missing-provider-turns", { prompts: [], nowMs: NOW }));
+	c.push(al("err-bad-tool-execution", { prompts: [], providerTurns: [], toolExecution: "concurrent", nowMs: NOW }));
+	c.push(al("err-tools-not-array", { prompts: [], providerTurns: [], tools: "nope", nowMs: NOW }));
+
+	return c.filter(Boolean);
+})(),
 ];
 
 // config-value sub-case builder (hoisted; used by the cases above).

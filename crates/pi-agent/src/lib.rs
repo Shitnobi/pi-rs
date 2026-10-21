@@ -22,6 +22,8 @@ pub mod conversion;
 pub mod host;
 pub mod provider;
 pub mod queue;
+pub mod r#loop;
+pub mod stream_assistant;
 pub mod tool_call;
 pub mod types;
 pub mod validation;
@@ -30,6 +32,11 @@ pub use agent_surface::AgentQueues;
 pub use host::{AbortHandle, Aborted, Clock, FixedClock, Sleeper, TokioSleeper};
 pub use provider::{ScriptedProvider, ScriptedTurn, StreamFn, StreamOutput};
 pub use queue::PendingMessageQueue;
+pub use r#loop::{
+    AgentEventSink, AgentLoopTurnUpdate, AgentRequestUpdate, CompletedTurn, ConvertToLlm,
+    FnSink, LoopConfig, LoopStreamFn, TransformContext,
+};
+pub use stream_assistant::stream_assistant_response;
 pub use types::{
     AgentContext, AgentEvent, AgentTool, AgentToolCallOutcome, AgentToolResult,
     AgentToolUpdateCallback, BoxFuture, QueueMode, ReplayPolicy, ThinkingLevel,

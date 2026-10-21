@@ -48,15 +48,15 @@ pub struct AfterToolCallInput {
 /// `onUpdate` sink for streamed partial results.
 pub type ToolUpdateSink = dyn Fn(AgentToolResult) + Send + Sync;
 
-enum Preparation {
+pub(crate) enum Preparation {
     Prepared { tool_call: Value, tool: Arc<dyn AgentTool>, args: Value },
     Immediate { result: AgentToolResult, is_error: bool },
 }
 
-struct Executed {
-    result: AgentToolResult,
-    is_error: bool,
-    duration_ms: f64,
+pub(crate) struct Executed {
+    pub(crate) result: AgentToolResult,
+    pub(crate) is_error: bool,
+    pub(crate) duration_ms: f64,
 }
 
 /// TS `createErrorToolResult`.
@@ -82,7 +82,7 @@ fn prepare_tool_call_arguments(tool: &dyn AgentTool, tool_call: &Value) -> Value
     }
 }
 
-async fn prepare_tool_call(
+pub(crate) async fn prepare_tool_call(
     context: &AgentContext,
     assistant_message: &Value,
     tool_call: &Value,
@@ -157,7 +157,7 @@ async fn prepare_tool_call(
     Preparation::Prepared { tool_call: tool_call.clone(), tool: tool.clone(), args: validated_args }
 }
 
-async fn execute_prepared_tool_call(
+pub(crate) async fn execute_prepared_tool_call(
     prepared: &Preparation,
     signal: Option<&AbortHandle>,
     on_update: Option<&ToolUpdateSink>,
@@ -205,7 +205,7 @@ async fn execute_prepared_tool_call(
     }
 }
 
-async fn finalize_executed_tool_call(
+pub(crate) async fn finalize_executed_tool_call(
     context: &AgentContext,
     assistant_message: &Value,
     prepared: &Preparation,

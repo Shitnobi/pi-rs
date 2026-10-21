@@ -21,6 +21,7 @@ mod composer_harness;
 mod runtime_harness;
 mod core_harness;
 mod agent_harness;
+mod agent_loop_harness;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -185,6 +186,12 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         }
         "run-tool-call" => {
             return agent_harness::run_run_tool_call_harness(&input, std::path::Path::new(cwd))
+        }
+        "stream-assistant" => {
+            return agent_loop_harness::run_stream_assistant_harness(&input, std::path::Path::new(cwd))
+        }
+        "agent-loop" => {
+            return agent_loop_harness::run_agent_loop_harness(&input, std::path::Path::new(cwd))
         }
         "tui-utils" => return run_tui_utils_harness(&input),
         "tui-fuzzy" => return run_tui_fuzzy_harness(&input),
