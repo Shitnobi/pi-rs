@@ -6552,6 +6552,314 @@ async function runModule(tool, args, cwd) {
 		}
 	}
 
+	if (tool === "agent-session-compaction") {
+		// dist/core/agent-session.js — the compaction slice (_checkCompaction /
+		// _runAutoCompaction / compact / abortCompaction) over a real AgentSession
+		// with a scripted provider. The same providerTurns script drives both the
+		// agent turns and the summarizer model call (agent.streamFunction is the
+		// injected fake). Mirrors the Rust harness
+		// (crates/pi-cli/src/session_compaction_harness.rs). setTimeout is patched
+		// for the duration of the script so the summarizer retry backoff sleep is
+		// observable ("immediate" fast-forwards; "pending" parks until abort).
+		// extensionHandlers configures the fake extension runner:
+		//   { session_before_compact: [{cancel?, compaction?, abortCompaction?}],
+		//     session_compact_failed: [{}] }
+		// hasHandlers consults these lists, so unconfigured hooks stay inert.
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		const { AgentSession } = require(path.join(distDir, "core", "agent-session.js"));
+		const { SessionManager } = require(path.join(distDir, "core", "session-manager.js"));
+		const { SettingsManager } = require(path.join(distDir, "core", "settings-manager.js"));
+		const { getDocsPath } = require(path.join(distDir, "config.js"));
+		// Validation order mirrors the Rust entry exactly.
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		const config = args.config ?? {};
+		if (typeof config !== "object" || config === null || Array.isArray(config)) {
+			throw new Error("invalid config");
+		}
+		const settingsIn = config.settings ?? {};
+		if (typeof settingsIn !== "object" || settingsIn === null || Array.isArray(settingsIn)) {
+			throw new Error("invalid settings");
+		}
+		const retryIn = settingsIn.retry ?? {};
+		if (typeof retryIn !== "object" || retryIn === null || Array.isArray(retryIn)) {
+			throw new Error("invalid settings");
+		}
+		const compactionIn = settingsIn.compaction ?? {};
+		if (typeof compactionIn !== "object" || compactionIn === null || Array.isArray(compactionIn)) {
+			throw new Error("invalid settings");
+		}
+		if (typeof config.systemPrompt !== "string") throw new Error("invalid systemPrompt");
+		if (
+			!Array.isArray(config.entries) ||
+			config.entries.length === 0 ||
+			config.entries[0].type !== "session"
+		) {
+			throw new Error("missing entries");
+		}
+		if (config.model !== undefined && config.model !== null) {
+			if (typeof config.model !== "object" || Array.isArray(config.model)) {
+				throw new Error("invalid model");
+			}
+		}
+		const scenarios = [
+			"overflow-retry",
+			"overflow-complete",
+			"threshold",
+			"manual",
+			"already-compacted",
+			"too-small",
+		];
+		if (typeof args.scenario !== "string" || !scenarios.includes(args.scenario)) {
+			throw new Error("invalid scenario");
+		}
+		const sleepMode = args.sleepMode ?? "immediate";
+		if (sleepMode !== "immediate" && sleepMode !== "pending") throw new Error("invalid sleepMode");
+		if (!Array.isArray(args.script)) throw new Error("missing script");
+		if (!Array.isArray(args.providerTurns)) throw new Error("missing providerTurns");
+		const extensionHandlersIn = args.extensionHandlers ?? {};
+		if (
+			typeof extensionHandlersIn !== "object" ||
+			extensionHandlersIn === null ||
+			Array.isArray(extensionHandlersIn)
+		) {
+			throw new Error("invalid extensionHandlers");
+		}
+
+		const realDocsPath = getDocsPath();
+		const realDateNow = Date.now;
+		Date.now = () => args.nowMs;
+		const RealDate = Date;
+		class PinnedDate extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(args.nowMs);
+				else super(...ctorArgs);
+			}
+		}
+		globalThis.Date = PinnedDate;
+		const realSetTimeout = globalThis.setTimeout;
+		const sleepLog = [];
+		const dummyTimeout = { __piParityDummyTimeout: true };
+		globalThis.setTimeout = (fn, ms, ...rest) => {
+			sleepLog.push({ ms });
+			if (sleepMode === "pending") return dummyTimeout;
+			fn(...rest);
+			return dummyTimeout;
+		};
+		let uuidI = 0;
+		const nextUuid = () => "uid" + String(++uuidI).padStart(5, "0");
+		try {
+			const sessionManager = SessionManager.inMemory("/proj", undefined, config.entries);
+			const projected = sessionManager.buildSessionProjection().messages;
+			const promptsSentToAgent = [];
+			let providerIdx = 0;
+			const fakeStreamFn = (_model, context, _options) => {
+				const turn = args.providerTurns[providerIdx];
+				if (turn === undefined) throw new Error("provider script exhausted");
+				providerIdx++;
+				promptsSentToAgent.push(JSON.parse(JSON.stringify(context.messages ?? [])));
+				return {
+					async *[Symbol.asyncIterator]() {
+						for (const event of turn.events ?? []) yield event;
+					},
+					result() {
+						return Promise.resolve(turn.result);
+					},
+				};
+			};
+			const agent = new Agent({
+				streamFn: fakeStreamFn,
+				initialState: { messages: projected },
+			});
+			agent.state.model = config.model ?? undefined;
+			const settingsManager = SettingsManager.inMemory({ retry: retryIn, compaction: compactionIn });
+			const fakeLoader = {
+				getSkills: () => ({ skills: [], diagnostics: [] }),
+				getPrompts: () => ({ prompts: [], diagnostics: [] }),
+				getAgentsFiles: () => ({ agentsFiles: [] }),
+				getSystemPrompt: () => config.systemPrompt,
+				getAppendSystemPrompt: () => [],
+				getExtensions: () => ({
+					extensions: [],
+					runtime: {
+						mcpServers: { setChangeListener: () => {} },
+						pendingProviderRegistrations: [],
+						pendingNativeProviderRegistrations: [],
+						pendingVirtualModelRegistrations: [],
+					},
+					diagnostics: [],
+				}),
+				getThemes: () => ({ themes: [], diagnostics: [] }),
+			};
+			const modelRuntime = {
+				getModel: () => undefined,
+				getPhysicalModel: () => undefined,
+				hasConfiguredAuth: () => true,
+				checkAuth: async () => ({}),
+				isUsingOAuth: () => false,
+			};
+			const session = new AgentSession({
+				agent,
+				sessionManager,
+				settingsManager,
+				cwd: "/proj",
+				resourceLoader: fakeLoader,
+				modelRuntime,
+				usesDefaultTools: false,
+				baseToolsOverride: {},
+			});
+			const snapEvent = (event) => JSON.parse(JSON.stringify(event));
+			const extensionEvents = [];
+			const extensionErrors = [];
+			const handlerList = (type) =>
+				Array.isArray(extensionHandlersIn[type]) ? extensionHandlersIn[type] : [];
+			const fakeRunner = {
+				hasHandlers: (type) => handlerList(type).length > 0,
+				emit: async (event) => {
+					extensionEvents.push(snapEvent(event));
+					let result;
+					for (const handler of handlerList(event.type)) {
+						if (handler.abortCompaction) session.abortCompaction();
+						if (handler.cancel) result = { ...(result ?? {}), cancel: true };
+						if (handler.compaction !== undefined) {
+							result = { ...(result ?? {}), compaction: handler.compaction };
+						}
+					}
+					return result;
+				},
+				emitMessageEnd: async (event) => {
+					extensionEvents.push(snapEvent(event));
+					return undefined;
+				},
+				emitError: (error) => {
+					extensionErrors.push({
+						extensionPath: error.extensionPath,
+						event: error.event,
+						error: error.error,
+					});
+				},
+				invalidate: () => {},
+				getAllRegisteredTools: () => [],
+				emitBeforeAgentStart: async (_trigger, options) => ({
+					messages: [],
+					systemPromptOptions: JSON.parse(JSON.stringify(options)),
+				}),
+			};
+			session._extensionRunner = fakeRunner;
+
+			const sessionEvents = [];
+			session.subscribe((event) => {
+				sessionEvents.push(snapEvent(event));
+			});
+			globalThis.__piParityUuidOverride = nextUuid;
+
+			const normalize = (message) => String(message).split(realDocsPath).join("<docs>");
+			const pendingPromises = [];
+			const results = [];
+			let compactionResult = null;
+			let error = null;
+			for (const op of args.script) {
+				try {
+					if (op === null || typeof op !== "object" || Array.isArray(op)) {
+						throw new Error("ops entries must be objects");
+					}
+					if (typeof op.op !== "string") throw new Error("missing op");
+					let v = null;
+					switch (op.op) {
+						case "prompt": {
+							if (typeof op.text !== "string") throw new Error("missing text");
+							if (pendingPromises.length > 0) {
+								throw new Error("cannot prompt while a prompt is pending");
+							}
+							await session.prompt(op.text);
+							break;
+						}
+						case "promptStart": {
+							if (typeof op.text !== "string") throw new Error("missing text");
+							pendingPromises.push(session.prompt(op.text));
+							break;
+						}
+						case "waitEvent": {
+							if (typeof op.eventType !== "string") throw new Error("missing eventType");
+							while (!sessionEvents.some((event) => event.type === op.eventType)) {
+								await new Promise((resolve) => setImmediate(resolve));
+							}
+							break;
+						}
+						case "awaitPrompt": {
+							const pending = pendingPromises.shift();
+							if (pending === undefined) throw new Error("no pending prompt");
+							await pending;
+							break;
+						}
+						case "abort": {
+							if (pendingPromises.length > 0) {
+								throw new Error("cannot abort while a prompt is pending");
+							}
+							await session.abort();
+							break;
+						}
+						case "abortTap":
+							void session.abort();
+							break;
+						case "abortCompaction":
+							session.abortCompaction();
+							break;
+						case "compact": {
+							if (pendingPromises.length > 0) {
+								throw new Error("cannot compact while a prompt is pending");
+							}
+							const customInstructions =
+								typeof op.customInstructions === "string" ? op.customInstructions : undefined;
+							try {
+								const result = await session.compact(customInstructions);
+								compactionResult = result;
+								error = null;
+							} catch (e) {
+								compactionResult = null;
+								error = e && e.message !== undefined ? e.message : String(e);
+								throw e;
+							}
+							break;
+						}
+						case "waitForIdle": {
+							if (pendingPromises.length > 0) {
+								throw new Error("cannot waitForIdle while a prompt is pending");
+							}
+							await session.waitForIdle();
+							break;
+						}
+						default:
+							throw new Error("unknown agent-session-compaction op: " + op.op);
+					}
+					results.push(v === undefined ? null : v);
+				} catch (e) {
+					results.push({
+						thrown: normalize(e && e.message !== undefined ? e.message : String(e)),
+					});
+				}
+			}
+			return {
+				result: {
+					results,
+					compactionResult,
+					error: error === null ? null : normalize(error),
+					sessionEvents,
+					entries: sessionManager.getEntries(),
+					extensionEvents,
+					extensionErrors,
+					promptsSentToAgent,
+					sleepLog,
+					isCompactingAtEnd: session.isCompacting,
+				},
+			};
+		} finally {
+			globalThis.__piParityUuidOverride = null;
+			globalThis.setTimeout = realSetTimeout;
+			Date.now = realDateNow;
+			globalThis.Date = RealDate;
+		}
+	}
+
 	if (tool === "file-mutation-queue") {
 		// dist/core/tools/file-mutation-queue.js — withFileMutationQueue over
 		// scripted fns. Ops run concurrently; each fn marks itself started,

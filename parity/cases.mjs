@@ -10257,9 +10257,10 @@ cases.push(
 		script: [{ op: "prompt", text: "hello" }],
 		providerTurns: [asrErrTurn("invalid_api_key")],
 	}),
-	// NOTE: context-overflow is deferred to tranche 13 (compaction): TS routes
-	// it through _checkCompaction's overflow-recovery path (_omitRecoveryAttempt
-	// + _runAutoCompaction), which is not ported yet.
+	// NOTE: context-overflow is covered by
+	// agent-session-compaction/context-overflow-not-retried: TS routes it
+	// through _checkCompaction's overflow-recovery path (_omitRecoveryAttempt
+	// + _runAutoCompaction), ported in tranche 13.
 	asrr("empty-error-message-not-retried", {
 		nowMs: ASP_NOW,
 		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry() } },
@@ -10314,5 +10315,341 @@ cases.push(
 		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry() } },
 		script: [{ op: "bogus" }],
 		providerTurns: [],
+	}),
+);
+
+// ======================================================= agent-session-compaction
+// The compaction slice of AgentSession (manual compact(), _checkCompaction
+// overflow/threshold dispatch, _runAutoCompaction, abortCompaction) over a
+// scripted provider. The same providerTurns script drives agent turns and
+// the summarizer model call. Seeded entries mirror the TS suite's
+// seedCompactableSession: a user/assistant pair with keepRecentTokens low
+// enough that prepareCompaction finds a summarizable range.
+const asc = (name, args) => ({
+	name: "agent-session-compaction/" + name,
+	tool: "agent-session-compaction",
+	args: {
+		...args,
+		config: { systemPrompt: "You are the parity assistant.", ...(args.config ?? {}) },
+	},
+});
+const ASC_NOW = 1747000000000;
+const ascIso = (ms) => new Date(ms).toISOString();
+const ascHeader = () => [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }];
+const ascModel = (o = {}) => ({
+	id: "m-asc",
+	name: "Asc Model",
+	api: "anthropic",
+	provider: "anthropic",
+	baseUrl: "",
+	reasoning: false,
+	input: [],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	contextWindow: o.contextWindow ?? 0,
+	maxTokens: o.maxTokens ?? 0,
+});
+const ascUsage = (o = {}) => ({
+	input: o.input ?? 0,
+	output: o.output ?? 0,
+	cacheRead: o.cacheRead ?? 0,
+	cacheWrite: o.cacheWrite ?? 0,
+	totalTokens: o.totalTokens ?? 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+});
+const ascMsg = (o = {}) => ({
+	role: "assistant",
+	content: o.content ?? [{ type: "text", text: "done" }],
+	api: "anthropic",
+	provider: "anthropic",
+	model: "m-asc",
+	usage: o.usage ?? ascUsage(),
+	stopReason: o.stopReason ?? "stop",
+	...(o.errorMessage !== undefined ? { errorMessage: o.errorMessage } : {}),
+	...(o.timestamp !== undefined ? { timestamp: o.timestamp } : {}),
+});
+const ascTurn = (result, events = []) => ({ events, result });
+const ascCompaction = (o = {}) => ({
+	enabled: o.enabled ?? true,
+	reserveTokens: o.reserveTokens ?? 16384,
+	keepRecentTokens: o.keepRecentTokens ?? 20000,
+});
+const ascUserEntry = (id, parentId, text, ms) => ({
+	type: "message",
+	id,
+	parentId,
+	timestamp: ascIso(ms),
+	message: { role: "user", content: [{ type: "text", text }], timestamp: ms },
+});
+const ascAsstEntry = (id, parentId, message, ms) => ({
+	type: "message",
+	id,
+	parentId,
+	timestamp: ascIso(ms),
+	message,
+});
+// header + user + zero-usage assistant (compactable with keepRecentTokens 1).
+const ascSeed = (o = {}) => [
+	...ascHeader(),
+	ascUserEntry("e-user", "s-root", o.userText ?? "message to compact", ASC_NOW - 2000),
+	ascAsstEntry(
+		"e-asst",
+		"e-user",
+		o.assistant ?? ascMsg({ stopReason: "stop", content: [{ type: "text", text: "assistant response to compact" }], timestamp: ASC_NOW - 1000 }),
+		ASC_NOW - 1000,
+	),
+];
+const ascSummarizerTurn = () =>
+	ascTurn(ascMsg({ content: [{ type: "text", text: "Session summary." }], usage: ascUsage({ input: 7, output: 11, totalTokens: 18 }) }));
+const ascOverflowErr = (ms) =>
+	ascTurn(ascMsg({ stopReason: "error", errorMessage: "prompt is too long", usage: ascUsage(), timestamp: ms }));
+cases.push(
+	asc("missing-args", {}),
+	asc("invalid-scenario", {
+		nowMs: ASC_NOW,
+		config: { model: ascModel(), entries: ascHeader() },
+		scenario: "bogus",
+		script: [],
+		providerTurns: [],
+	}),
+	asc("unknown-op", {
+		nowMs: ASC_NOW,
+		config: { model: ascModel(), entries: ascSeed(), settings: { compaction: ascCompaction({ keepRecentTokens: 1 }) } },
+		scenario: "manual",
+		script: [{ op: "bogus" }],
+		providerTurns: [],
+	}),
+	// Manual happy path: compaction_start reason manual, the summarizer
+	// consumes the first provider turn, the compaction entry is appended,
+	// compactionResult carries summary/firstKeptEntryId/tokensBefore/
+	// estimatedTokensAfter/usage/details, and compaction_end fires.
+	asc("manual-happy", {
+		nowMs: ASC_NOW,
+		config: { model: ascModel(), entries: ascSeed(), settings: { compaction: ascCompaction({ keepRecentTokens: 1 }) } },
+		scenario: "manual",
+		script: [{ op: "compact" }],
+		providerTurns: [ascSummarizerTurn()],
+	}),
+	// customInstructions reach the summarizer prompt ("Additional focus:").
+	asc("manual-custom-instructions", {
+		nowMs: ASC_NOW,
+		config: { model: ascModel(), entries: ascSeed(), settings: { compaction: ascCompaction({ keepRecentTokens: 1 }) } },
+		scenario: "manual",
+		script: [{ op: "compact", customInstructions: "Focus on the migration." }],
+		providerTurns: [ascSummarizerTurn()],
+	}),
+	asc("manual-already-compacted", {
+		nowMs: ASC_NOW,
+		config: {
+			model: ascModel(),
+			entries: [
+				...ascSeed(),
+				{
+					type: "compaction",
+					id: "c-old",
+					parentId: "e-asst",
+					timestamp: ascIso(ASC_NOW - 500),
+					summary: "old summary",
+					firstKeptEntryId: "e-asst",
+					tokensBefore: 10,
+					fromHook: false,
+				},
+			],
+			settings: { compaction: ascCompaction({ keepRecentTokens: 1 }) },
+		},
+		scenario: "already-compacted",
+		script: [{ op: "compact" }],
+		providerTurns: [],
+	}),
+	asc("manual-too-small", {
+		nowMs: ASC_NOW,
+		config: {
+			model: ascModel(),
+			entries: [...ascHeader(), ascUserEntry("e-user", "s-root", "only message", ASC_NOW - 1000)],
+			settings: { compaction: ascCompaction({ keepRecentTokens: 1 }) },
+		},
+		scenario: "too-small",
+		script: [{ op: "compact" }],
+		providerTurns: [],
+	}),
+	// Threshold compaction after a big-context response: usage-backed
+	// context tokens cross window - reserve, compaction_start reason
+	// "threshold", compaction_end willRetry false, no retry turn.
+	asc("threshold-after-big-usage", {
+		nowMs: ASC_NOW,
+		config: {
+			model: ascModel({ contextWindow: 200 }),
+			entries: ascSeed(),
+			settings: { compaction: ascCompaction({ reserveTokens: 50, keepRecentTokens: 1 }) },
+		},
+		scenario: "threshold",
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [
+			ascTurn(ascMsg({ content: [{ type: "text", text: "big response" }], usage: ascUsage({ input: 100, totalTokens: 175 }), timestamp: ASC_NOW })),
+			ascSummarizerTurn(),
+		],
+	}),
+	// Overflow with retry: the failed assistant is omitted via a context_edit
+	// entry, compaction runs, and the retried turn's provider context
+	// (promptsSentToAgent[2]) excludes the omitted failed message.
+	asc("overflow-retry-recovers", {
+		nowMs: ASC_NOW,
+		config: {
+			model: ascModel({ contextWindow: 200 }),
+			entries: ascSeed(),
+			settings: {
+				retry: { enabled: true, maxRetries: 2, baseDelayMs: 50, maxAgentDelayMs: 100 },
+				compaction: ascCompaction({ reserveTokens: 50, keepRecentTokens: 1 }),
+			},
+		},
+		scenario: "overflow-retry",
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [
+			ascOverflowErr(ASC_NOW),
+			ascSummarizerTurn(),
+			ascTurn(ascMsg({ content: [{ type: "text", text: "recovered" }], usage: ascUsage({ input: 5, totalTokens: 9 }), timestamp: ASC_NOW + 5000 })),
+		],
+	}),
+	// Second overflow after one recovery: byte-exact compaction_end
+	// errorMessage and a session_compact_failed extension event, no second
+	// compaction.
+	asc("overflow-recovery-already-attempted", {
+		nowMs: ASC_NOW,
+		config: {
+			model: ascModel({ contextWindow: 200 }),
+			entries: ascSeed(),
+			settings: {
+				retry: { enabled: true, maxRetries: 2, baseDelayMs: 50, maxAgentDelayMs: 100 },
+				compaction: ascCompaction({ reserveTokens: 50, keepRecentTokens: 1 }),
+			},
+		},
+		scenario: "overflow-retry",
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [ascOverflowErr(ASC_NOW), ascSummarizerTurn(), ascOverflowErr(ASC_NOW + 5000)],
+		extensionHandlers: { session_compact_failed: [{}] },
+	}),
+	// Overflow without retry: a completed response whose usage exceeds the
+	// context window compacts but preserves the response (no retry turn).
+	asc("overflow-complete-no-retry", {
+		nowMs: ASC_NOW,
+		config: {
+			model: ascModel({ contextWindow: 200 }),
+			entries: ascSeed(),
+			settings: { compaction: ascCompaction({ reserveTokens: 50, keepRecentTokens: 1 }) },
+		},
+		scenario: "overflow-complete",
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [
+			ascTurn(ascMsg({ content: [{ type: "text", text: "huge response" }], usage: ascUsage({ input: 250, totalTokens: 260 }), timestamp: ASC_NOW })),
+			ascSummarizerTurn(),
+		],
+	}),
+	// session_before_compact {cancel: true}: "Compaction cancelled",
+	// compaction_end aborted true, no errorMessage.
+	asc("extension-cancel", {
+		nowMs: ASC_NOW,
+		config: { model: ascModel(), entries: ascSeed(), settings: { compaction: ascCompaction({ keepRecentTokens: 1 }) } },
+		scenario: "manual",
+		script: [{ op: "compact" }],
+		providerTurns: [],
+		extensionHandlers: { session_before_compact: [{ cancel: true }] },
+	}),
+	// session_before_compact {compaction: {...}}: the extension result is
+	// used verbatim (fromExtension entry, no summarizer provider turn).
+	asc("extension-custom-compaction", {
+		nowMs: ASC_NOW,
+		config: { model: ascModel(), entries: ascSeed(), settings: { compaction: ascCompaction({ keepRecentTokens: 1 }) } },
+		scenario: "manual",
+		script: [{ op: "compact" }],
+		providerTurns: [],
+		extensionHandlers: {
+			session_before_compact: [
+				{
+					compaction: {
+						summary: "summary from extension",
+						firstKeptEntryId: "e-asst",
+						tokensBefore: 42,
+						usage: ascUsage({ input: 10, output: 20, totalTokens: 30 }),
+						details: { source: "extension" },
+					},
+				},
+			],
+		},
+	}),
+	// Abort mid-compaction: the summarizer retry sleep parks (sleepMode
+	// "pending"), abortCompaction cancels it, compaction_end is aborted
+	// with no errorMessage, and no compaction entry is appended.
+	asc("abort-mid-compaction", {
+		nowMs: ASC_NOW,
+		sleepMode: "pending",
+		config: {
+			model: ascModel({ contextWindow: 200 }),
+			entries: ascSeed(),
+			settings: {
+				retry: { enabled: true, maxRetries: 2, baseDelayMs: 100, maxAgentDelayMs: 200 },
+				compaction: ascCompaction({ reserveTokens: 50, keepRecentTokens: 1 }),
+			},
+		},
+		scenario: "overflow-retry",
+		script: [
+			{ op: "promptStart", text: "hello" },
+			{ op: "waitEvent", eventType: "compaction_start" },
+			{ op: "abortCompaction" },
+			{ op: "awaitPrompt" },
+		],
+		providerTurns: [
+			ascOverflowErr(ASC_NOW),
+			ascTurn(ascMsg({ stopReason: "error", errorMessage: "overloaded_error", usage: ascUsage() })),
+		],
+	}),
+	// Stale pre-compaction usage must not retrigger compaction: the kept
+	// assistant predates the compaction entry, so the usage-backed estimate
+	// is skipped even though its input tokens exceed the threshold.
+	asc("stale-usage-no-retrigger", {
+		nowMs: ASC_NOW,
+		config: {
+			model: ascModel({ contextWindow: 1000 }),
+			entries: [
+				ascUserEntry("e-user", "s-root", "message to compact", ASC_NOW - 3000),
+				ascAsstEntry(
+					"e-asst",
+					"e-user",
+					ascMsg({ stopReason: "stop", content: [{ type: "text", text: "kept response" }], usage: ascUsage({ input: 5000, totalTokens: 5000 }), timestamp: ASC_NOW - 2000 }),
+					ASC_NOW - 2000,
+				),
+				{
+					type: "compaction",
+					id: "c-old",
+					parentId: "e-asst",
+					timestamp: ascIso(ASC_NOW - 1000),
+					summary: "old summary",
+					firstKeptEntryId: "e-asst",
+					tokensBefore: 5000,
+					fromHook: false,
+				},
+			],
+			settings: { compaction: ascCompaction({ reserveTokens: 10, keepRecentTokens: 1 }) },
+		},
+		scenario: "threshold",
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [ascTurn(ascMsg({ content: [{ type: "text", text: "small response" }], usage: ascUsage(), timestamp: ASC_NOW }))],
+	}),
+	// Deferred from tranche 12: a context-overflow error is not retried via
+	// the auto-retry path; it routes through _checkCompaction's
+	// overflow-recovery (_omitRecoveryAttempt context_edit entry). With
+	// keepRecentTokens too large to leave a summarizable range,
+	// prepareCompaction returns null, so no compaction events fire.
+	asc("context-overflow-not-retried", {
+		nowMs: ASC_NOW,
+		config: {
+			model: ascModel({ contextWindow: 200 }),
+			entries: ascSeed(),
+			settings: {
+				retry: { enabled: true, maxRetries: 3, baseDelayMs: 50, maxAgentDelayMs: 100 },
+				compaction: ascCompaction({ reserveTokens: 50, keepRecentTokens: 1000000000 }),
+			},
+		},
+		scenario: "overflow-retry",
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [ascOverflowErr(ASC_NOW)],
 	}),
 );

@@ -27,6 +27,7 @@ mod session_tools_harness;
 mod session_prompt_harness;
 mod session_run_harness;
 mod session_retry_harness;
+mod session_compaction_harness;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -210,6 +211,9 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         }
         "agent-session-retry" => {
             return session_retry_harness::run_agent_session_retry_harness(&input)
+        }
+        "agent-session-compaction" => {
+            return session_compaction_harness::run_agent_session_compaction_harness(&input)
         }
         "tui-utils" => return run_tui_utils_harness(&input),
         "tui-fuzzy" => return run_tui_fuzzy_harness(&input),

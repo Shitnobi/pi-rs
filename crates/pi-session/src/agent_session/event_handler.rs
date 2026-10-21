@@ -220,7 +220,7 @@ impl AgentSession {
 
     /// TS `_modelForMessage(message)` — the non-virtual path; virtual-model
     /// routing is tranche 14.
-    fn model_for_message(&self, message: &Value) -> Option<Value> {
+    pub(super) fn model_for_message(&self, message: &Value) -> Option<Value> {
         let model = self.agent.model();
         if model.is_null() {
             return None;

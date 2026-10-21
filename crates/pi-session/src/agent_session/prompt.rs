@@ -229,7 +229,7 @@ impl AgentSession {
         .await
     }
 
-    fn no_model_selected_message(&self) -> String {
+    pub(super) fn no_model_selected_message(&self) -> String {
         match &self.model_auth {
             Some(store) => store.no_model_selected_message(),
             None => "No model selected.".to_string(),

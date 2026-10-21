@@ -4015,3 +4015,11 @@ mod tests {
         assert_eq!(MAX_SESSION_HEADER_SCAN_BYTES, 1024 * 1024);
     }
 }
+
+impl Generators {
+    /// The uuidv7 generator (shared; the compaction driver draws session
+    /// routing ids from the same counter as entry ids).
+    pub fn uuid_v7_gen(&self) -> UuidGen {
+        Arc::clone(&self.uuid_v7)
+    }
+}

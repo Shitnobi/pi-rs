@@ -61,7 +61,7 @@ pub fn auto_retry_start_event(
 impl AgentSession {
     /// TS `_omitRecoveryAttempt(message, toolResults = [])` — `Err` models
     /// the projected-message guard throw.
-    fn omit_recovery_attempt(&mut self, message: MsgId, tool_results: &[MsgId]) -> Result<(), String> {
+    pub(super) fn omit_recovery_attempt(&mut self, message: MsgId, tool_results: &[MsgId]) -> Result<(), String> {
         let mut targets = vec![message];
         targets.extend_from_slice(tool_results);
         let mut target_ids = Vec::with_capacity(targets.len());

@@ -182,7 +182,12 @@ impl AgentSession {
 
     /// TS `_prepareRun(trigger)`.
     pub(super) async fn prepare_run(&mut self, trigger: &RunTrigger) -> Result<Vec<Value>, String> {
-        // TODO(tranche 13): pre-run compaction check (`_checkCompaction`).
+        // Check if we need to compact before sending (catches aborted responses).
+        // The starting message is sent below, so do not call agent.continue() here.
+        if let Some(last_assistant) = self.find_last_assistant_message() {
+            self.check_compaction(last_assistant, false, &[]).await?;
+        }
+
         let selected_tools_before: Vec<Value> = self
             .state
             .tools
@@ -280,7 +285,7 @@ impl AgentSession {
     /// propagates out of `prompt()` after the run's finally.
     pub(super) async fn handle_post_agent_run(&mut self) -> Result<bool, String> {
         let message = self.state.last_assistant_message.take();
-        self.state.last_assistant_tool_results.clear();
+        let tool_results = std::mem::take(&mut self.state.last_assistant_tool_results);
         if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
             self.finish_cancelled_retry();
             return Ok(false);
@@ -318,7 +323,12 @@ impl AgentSession {
             self.state.retry_attempt = 0.0;
         }
 
-        // TODO(tranche 13): `_checkCompaction`.
+        if self.check_compaction(message, true, &tool_results).await? {
+            return Ok(!self.state.agent_run_abort_requested.load(Ordering::SeqCst));
+        }
+
+        // The low-level loop drains both queues before agent_end. Messages queued by
+        // agent_end handlers require a fresh run before pre-settlement handlers fire.
         Ok(!self.state.agent_run_abort_requested.load(Ordering::SeqCst)
             && self.agent.has_queued_messages())
     }
@@ -618,7 +628,7 @@ impl AgentSession {
             self.state.agent_run_abort_requested.store(true, Ordering::SeqCst);
         }
         self.abort_retry();
-        // TODO(tranche 13): this.abortCompaction();
+        self.abort_compaction();
         // TODO(tranche 16): this.abortBranchSummary();
         // TODO(tranche 15): this.abortBash();
         if self.state.is_before_settle.load(Ordering::SeqCst) {

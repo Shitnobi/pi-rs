@@ -6,6 +6,7 @@
 //! runtime, cache warmer, and resource loader arrive in tranches 9–19
 //! (marked `TODO(tranche N)`).
 
+pub mod compaction;
 pub mod events;
 pub mod event_handler;
 pub mod prompt;
@@ -23,6 +24,8 @@ use serde_json::{json, Map, Value};
 
 use pi_agent::types::BoxFuture;
 use pi_agent::{Agent, Clock};
+use pi_agent::host::AbortHandle;
+use pi_core::compaction::{default_compaction_settings, CompactionSettings};
 use pi_core::session_manager::SessionManager;
 use pi_core::settings_manager::RetrySettings;
 pub use events::{MsgId, SessionAgentEvent};
@@ -36,13 +39,34 @@ pub trait SessionSettingsStore: Send + Sync {
     fn image_auto_resize(&self) -> bool {
         true
     }
+    /// TS `settingsManager.getCompactionSettings(model?)`.
+    fn compaction_settings(&self, _model: Option<(&str, &str)>) -> CompactionSettings {
+        default_compaction_settings()
+    }
+    /// TS `settingsManager.setCompactionEnabled(enabled)` (default no-op;
+    /// the harness stores implement it when a case exercises the setter).
+    fn set_compaction_enabled(&self, _enabled: bool) {}
 }
 
 /// TS `_modelRuntime` auth surface the prompt pipeline validates against
 /// (`hasConfiguredAuth` / `checkAuth` / `isUsingOAuth`) plus the
 /// docs-path-bearing error messages (`auth-guidance.ts` — the paths make
 /// the texts environment-dependent, so the harness injects them).
+/// TS `_modelRuntime.getAuth(model)` result (`{ auth: { baseUrl?,
+/// apiKey?, headers? }, env? }` — the slice the summarizer consumes).
+pub struct RequestAuth {
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub headers: Option<Value>,
+    pub env: Option<Value>,
+}
+
 pub trait ModelAuthStore: Send + Sync {
+    /// TS `getAuth(model, { signal })` — `None` models an absent result or
+    /// a throw (the TS catch returns the bare model).
+    fn get_auth(&self, _model: &Value) -> Option<RequestAuth> {
+        None
+    }
     fn has_configured_auth(&self, provider: &str) -> bool;
     /// TS `(await checkAuth(provider)) !== undefined`.
     fn check_auth(&self, provider: &str) -> bool;
@@ -103,6 +127,15 @@ pub trait ExtensionHost: Send + Sync {
         options: Value,
     ) -> pi_agent::types::BoxFuture<'a, (Vec<Value>, Value, Vec<Vec<String>>)> {
         Box::pin(async move { (Vec::new(), options, Vec::new()) })
+    }
+    /// TS `emit({ type: "session_before_compact", ... })` → the
+    /// `SessionBeforeCompactResult` (`{ cancel?, compaction? }`).
+    /// Default: no handlers (the result of an emission to zero handlers).
+    fn emit_session_before_compact<'a>(
+        &'a self,
+        _event: Value,
+    ) -> pi_agent::types::BoxFuture<'a, Option<Value>> {
+        Box::pin(async { None })
     }
     /// TS `snapshotEventHandlers(type).length` for boundary events —
     /// the handler count driving [`AgentSession::emit_boundary`].
@@ -270,6 +303,13 @@ struct SessionState {
     /// request projection (virtual-model routing is tranche 14; the state
     /// bookkeeping is tranche 12).
     failed_response: Option<MsgId>,
+    /// TS `_compactionAbortController` (shared —
+    /// [`AgentSession::compaction_abort_tap`]).
+    compaction_abort: Arc<Mutex<Option<AbortHandle>>>,
+    /// TS `_autoCompactionAbortController` (shared).
+    auto_compaction_abort: Arc<Mutex<Option<AbortHandle>>>,
+    /// Buffered summarization-retry events (see `compaction` module docs).
+    summarization_events: Arc<Mutex<Vec<Value>>>,
     /// TS `_retryAbortController` (shared — the harness fires
     /// `abortRetry()` while a prompt run holds the session; see
     /// [`AgentSession::abort_retry_tap`]). `Some` while a retry sleep is
@@ -370,6 +410,9 @@ impl AgentSession {
                 run_message_values: Vec::new(),
                 run_message_ids: Vec::new(),
                 failed_response: None,
+                compaction_abort: Arc::new(Mutex::new(None)),
+                auto_compaction_abort: Arc::new(Mutex::new(None)),
+                summarization_events: Arc::new(Mutex::new(Vec::new())),
                 retry_abort: Arc::new(Mutex::new(None)),
             },
             idle_resolvers: Mutex::new(Vec::new()),
@@ -485,6 +528,8 @@ impl AgentSession {
     /// compaction controllers are tranche 13).
     pub fn is_idle(&self) -> bool {
         !self.state.is_agent_run_active.load(Ordering::SeqCst)
+            && self.state.compaction_abort.lock().expect("compaction abort").is_none()
+            && self.state.auto_compaction_abort.lock().expect("auto compaction abort").is_none()
     }
 
     /// TS `waitForIdle()` — a `'static` future so callers can hold it
@@ -633,7 +678,7 @@ impl AgentSession {
     /// tranches; the extension invalidation message is byte-exact.
     pub fn dispose(&mut self) {
         self.abort_retry();
-        // TODO(tranche 13): this.abortCompaction();
+        self.abort_compaction();
         // TODO(tranche 16): this.abortBranchSummary();
         // TODO(tranche 15): this.abortBash();
         self.agent.abort();
@@ -678,12 +723,21 @@ impl AgentSession {
         let is_before_settle = Arc::clone(&self.state.is_before_settle);
         let abort_during_before_settle = Arc::clone(&self.state.abort_during_before_settle);
         let retry_abort = Arc::clone(&self.state.retry_abort);
+        let compaction_abort = Arc::clone(&self.state.compaction_abort);
+        let auto_compaction_abort = Arc::clone(&self.state.auto_compaction_abort);
         let agent = self.agent.clone();
         Arc::new(move || {
             if active.load(Ordering::SeqCst) {
                 abort_requested.store(true, Ordering::SeqCst);
             }
             if let Some(handle) = retry_abort.lock().expect("retry abort slot").as_ref() {
+                handle.abort();
+            }
+            // TS abortCompaction() — part of abort()'s synchronous prefix.
+            if let Some(handle) = compaction_abort.lock().expect("compaction abort").as_ref() {
+                handle.abort();
+            }
+            if let Some(handle) = auto_compaction_abort.lock().expect("auto compaction abort").as_ref() {
                 handle.abort();
             }
             if is_before_settle.load(Ordering::SeqCst) {
@@ -751,5 +805,27 @@ impl AgentSession {
     /// Harness seam: the executed deferred-`Log` tags, in run order.
     pub fn deferred_log(&self) -> &[String] {
         &self.state.deferred_log
+    }
+
+    /// TS `_findLastAssistantMessage()` — the last assistant message in
+    /// agent state (arena id).
+    pub fn find_last_assistant_message(&self) -> Option<MsgId> {
+        self.state
+            .state_message_ids
+            .iter()
+            .rev()
+            .find(|&&id| self.state.arena[id].get("role").and_then(Value::as_str) == Some("assistant"))
+            .copied()
+    }
+
+    /// `settingsManager.getCompactionSettings(this.model)`.
+    pub(crate) fn compaction_settings_for(&self, model: &Value) -> CompactionSettings {
+        let key = if model.is_null() { None } else {
+            Some((
+                model.get("provider").and_then(Value::as_str).unwrap_or_default(),
+                model.get("id").and_then(Value::as_str).unwrap_or_default(),
+            ))
+        };
+        self.settings.compaction_settings(key)
     }
 }

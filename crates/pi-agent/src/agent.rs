@@ -290,6 +290,16 @@ impl Agent {
     }
 
     /// TS `state.model` getter.
+    /// TS `agent.state.thinkingLevel`.
+    pub fn thinking_level(&self) -> String {
+        self.inner.state.lock().expect("agent state").thinking_level.clone()
+    }
+
+    /// TS `agent.streamFunction` — the injected stream seam (shared).
+    pub fn stream_fn(&self) -> Arc<LoopStreamFn> {
+        Arc::clone(&self.inner.stream_fn)
+    }
+
     pub fn model(&self) -> Value {
         self.inner.state.lock().expect("agent state").model.clone()
     }

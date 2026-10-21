@@ -210,6 +210,15 @@ pub fn is_context_overflow(message: &Value, context_window: Option<f64>) -> bool
     false
 }
 
+/// TS `isRecoverableLength(message, desiredMaxOutput)` (overflow.ts): a
+/// length stop that ended below the caller or model's intended output
+/// limit, so one bounded compact-and-retry attempt is allowed.
+pub fn is_recoverable_length(message: &Value, desired_max_output: f64) -> bool {
+    field_str(message, "stopReason") == Some("length")
+        && desired_max_output > 0.0
+        && usage_field(message, "output") < desired_max_output
+}
+
 /// TS `isRetryableAssistantError(message)` (retry.ts).
 pub fn is_retryable_assistant_error(message: &Value) -> bool {
     let error_message = match field_str(message, "stopReason") {
