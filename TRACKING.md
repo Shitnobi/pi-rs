@@ -1395,7 +1395,27 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       microtask-before-next-macrotask) with a custom
       always-wake YieldStep replacing tokio::yield_now. Library
       was correct; the divergence was purely harness scheduling.
+- [x] **Tranche 16 — tree navigation.** crates/pi-session/
+      agent_session/tree.rs: navigateTree (target resolution
+      with byte-exact validation errors, abort-current-run
+      first, branch handling, agent state rebuild from the new
+      branch projection incl. restore_tools_from_transcript,
+      branch-summary path via the summarizer streamFn with
+      abort-handle check at the auth point returning
+      "This operation was aborted"), abortBranchSummary,
+      getUserMessagesForForking. Parity harness
+      `agent-session-tree` (16 cases; suite 2548/2548):
+      ancestor/sibling navigation, branch-summary generation
+      and abort, invalid target, navigate-while-running,
+      forking scenarios, validation. Differential fix: TS tree
+      harness fake modelRuntime gained a faithful getAuth
+      (AbortError rejection on aborted signal, undefined
+      otherwise — the compaction entry's fake also lacks
+      getAuth but never hits the aborted path);
+      branch-summary-generation passes with both sides
+      throwing "Entry s-root not found" (session entries are
+      not branchable parents — symmetric ground truth).
 - [ ] Remaining agent-session tranches (phase3-agent-session.md):
-      AgentSession slices 16–17 (tree,
-      stats) and 18–19 (runtime, services+event-bus),
+      AgentSession slices 17 (stats)
+      and 18–19 (runtime, services+event-bus),
       extending crates/pi-session.
