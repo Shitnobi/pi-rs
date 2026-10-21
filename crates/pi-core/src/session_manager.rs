@@ -244,7 +244,7 @@ pub(crate) fn js_truthy(v: Option<&Value>) -> bool {
 }
 
 /// `new Date(ms).toISOString()`.
-fn iso_string(ms: i64) -> String {
+pub fn iso_string(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let millis = ms.rem_euclid(1000);
     let days = secs.div_euclid(86_400);

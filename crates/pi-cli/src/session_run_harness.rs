@@ -570,6 +570,7 @@ pub fn run_agent_session_run_harness(args: &Value) -> Result<Value, String> {
         model_lookup,
         scoped_models: Vec::new(),
         model_routes: None,
+        physical_model_lookup: None,
         sleeper: None,
     });
 

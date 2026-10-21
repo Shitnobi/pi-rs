@@ -14,6 +14,7 @@ pub mod event_handler;
 pub mod prompt;
 pub mod retry;
 pub mod run;
+pub mod stats;
 pub mod system_prompt;
 pub mod tree;
 pub mod tools;
@@ -90,6 +91,7 @@ pub trait SessionSettingsStore: Send + Sync {
 /// the texts environment-dependent, so the harness injects them).
 /// TS `_modelRuntime.getAuth(model)` result (`{ auth: { baseUrl?,
 /// apiKey?, headers? }, env? }` — the slice the summarizer consumes).
+#[derive(Clone)]
 pub struct RequestAuth {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
@@ -257,6 +259,9 @@ pub struct AgentSessionConfig {
     pub scoped_models: Vec<model::ScopedModel>,
     /// TS `_modelRuntime` routing seam (model & thinking slice).
     pub model_routes: Option<Arc<dyn model::ModelRouteStore>>,
+    /// TS `_modelRuntime.getPhysicalModel(provider, modelId)` — the
+    /// `routedModel` getter seam (stats slice).
+    pub physical_model_lookup: Option<Arc<dyn Fn(&str, &str) -> Option<Value> + Send + Sync>>,
 }
 
 /// A deferred `agent_settled` action (TS `_deferredSettledActions` holds
@@ -423,6 +428,8 @@ pub struct AgentSession {
     _unsubscribe_agent: Option<usize>,
     /// TS `_modelRuntime` routing seam (model & thinking slice).
     model_routes: Option<Arc<dyn model::ModelRouteStore>>,
+    /// TS `_modelRuntime.getPhysicalModel(provider, modelId)` (stats slice).
+    physical_model_lookup: Option<Arc<dyn Fn(&str, &str) -> Option<Value> + Send + Sync>>,
     /// The projection-bridge receiver [`AgentSession::run_with_bridge`]
     /// services while an agent run is parked in the request hook.
     bridge_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<model::ProjectionCall>>>,
@@ -495,6 +502,7 @@ impl AgentSession {
             next_listener_id: 0,
             _unsubscribe_agent: None,
             model_routes: config.model_routes.clone(),
+            physical_model_lookup: config.physical_model_lookup.clone(),
             bridge_rx: std::sync::Mutex::new(Some(bridge_rx)),
         };
         // TS constructor: `_installHiddenDeclarationsProjection` +

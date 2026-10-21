@@ -288,6 +288,7 @@ pub fn run_agent_session_retry_harness(args: &Value) -> Result<Value, String> {
             model_lookup: None,
             scoped_models: Vec::new(),
             model_routes: None,
+        physical_model_lookup: None,
             sleeper: Some(Arc::clone(&sleeper)),
         });
         {

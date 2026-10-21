@@ -7141,6 +7141,226 @@ async function runModule(tool, args, cwd) {
 		}
 	}
 
+	if (tool === "agent-session-stats") {
+		// dist/core/agent-session.js — the stats & exports slice
+		// (getSessionStats / getContextUsage / exportToJsonl /
+		// summarizeForBugReport) over a real AgentSession with a scripted
+		// provider. Mirrors the Rust harness
+		// (crates/pi-cli/src/session_stats_harness.rs). setTimeout is patched
+		// for the duration of the script (fast-forward, unrecorded) so the
+		// bug-report retry backoff never parks. process.chdir(cwd) makes the
+		// default exportToJsonl path deterministic on both sides; the export
+		// file is read back and removed (idempotent).
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		const { AgentSession } = require(path.join(distDir, "core", "agent-session.js"));
+		const { SessionManager } = require(path.join(distDir, "core", "session-manager.js"));
+		const { SettingsManager } = require(path.join(distDir, "core", "settings-manager.js"));
+		// Validation order mirrors the Rust entry exactly.
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		const config = args.config ?? {};
+		if (typeof config !== "object" || config === null || Array.isArray(config)) {
+			throw new Error("invalid config");
+		}
+		if (typeof config.systemPrompt !== "string") throw new Error("missing systemPrompt");
+		if (
+			!Array.isArray(config.entries) ||
+			config.entries.length === 0 ||
+			config.entries[0].type !== "session"
+		) {
+			throw new Error("missing entries");
+		}
+		if (config.model !== undefined && config.model !== null) {
+			if (typeof config.model !== "object" || Array.isArray(config.model)) {
+				throw new Error("invalid model");
+			}
+		}
+		const settingsIn = config.settings ?? {};
+		if (typeof settingsIn !== "object" || settingsIn === null || Array.isArray(settingsIn)) {
+			throw new Error("invalid settings");
+		}
+		const retryIn = settingsIn.retry ?? {};
+		if (typeof retryIn !== "object" || retryIn === null || Array.isArray(retryIn)) {
+			throw new Error("invalid settings");
+		}
+		if (!Array.isArray(args.script)) throw new Error("missing script");
+		if (!Array.isArray(args.providerTurns)) throw new Error("missing providerTurns");
+		if (config.auth !== undefined && config.auth !== null) {
+			if (typeof config.auth !== "object" || Array.isArray(config.auth)) {
+				throw new Error("invalid auth");
+			}
+		}
+		const physicalModels = Array.isArray(config.physicalModels) ? config.physicalModels : [];
+		for (const model of physicalModels) {
+			if (typeof model !== "object" || model === null || Array.isArray(model)) {
+				throw new Error("invalid physicalModels");
+			}
+		}
+
+		const realDateNow = Date.now;
+		Date.now = () => args.nowMs;
+		const RealDate = Date;
+		class PinnedDate extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(args.nowMs);
+				else super(...ctorArgs);
+			}
+		}
+		globalThis.Date = PinnedDate;
+		const realSetTimeout = globalThis.setTimeout;
+		globalThis.setTimeout = (fn, _ms, ...rest) => {
+			fn(...rest);
+			return { __piParityDummyTimeout: true };
+		};
+		const realCwd = process.cwd();
+		process.chdir(cwd);
+		let uuidI = 0;
+		const nextUuid = () => "uid" + String(++uuidI).padStart(5, "0");
+		try {
+			const sessionManager = SessionManager.inMemory("/proj", undefined, config.entries);
+			const projected = sessionManager.buildSessionProjection().messages;
+			const promptsSentToAgent = [];
+			let providerIdx = 0;
+			const fakeStreamFn = (model, context, options) => {
+				const turn = args.providerTurns[providerIdx];
+				if (turn === undefined) throw new Error("provider script exhausted");
+				providerIdx++;
+				const { signal: _signal, ...restOptions } = options ?? {};
+				promptsSentToAgent.push({
+					messages: JSON.parse(JSON.stringify(context.messages ?? [])),
+					model: JSON.parse(JSON.stringify(model ?? null)),
+					options: JSON.parse(JSON.stringify(restOptions ?? {})),
+				});
+				return {
+					async *[Symbol.asyncIterator]() {
+						for (const event of turn.events ?? []) yield event;
+					},
+					result() {
+						return Promise.resolve(turn.result);
+					},
+				};
+			};
+			const agent = new Agent({
+				streamFn: fakeStreamFn,
+				initialState: { messages: projected },
+			});
+			agent.state.model = config.model ?? undefined;
+			const settingsManager = SettingsManager.inMemory({ retry: retryIn });
+			const fakeLoader = {
+				getSkills: () => ({ skills: [], diagnostics: [] }),
+				getPrompts: () => ({ prompts: [], diagnostics: [] }),
+				getAgentsFiles: () => ({ agentsFiles: [] }),
+				getSystemPrompt: () => config.systemPrompt,
+				getAppendSystemPrompt: () => [],
+				getExtensions: () => ({
+					extensions: [],
+					runtime: {
+						mcpServers: { setChangeListener: () => {} },
+						pendingProviderRegistrations: [],
+						pendingNativeProviderRegistrations: [],
+						pendingVirtualModelRegistrations: [],
+					},
+					diagnostics: [],
+				}),
+				getThemes: () => ({ themes: [], diagnostics: [] }),
+			};
+			const findPhysical = (provider, id) =>
+				physicalModels.find((m) => m.provider === provider && m.id === id)?.model;
+			const modelRuntime = {
+				getModel: () => undefined,
+				getPhysicalModel: (provider, id) => findPhysical(provider, id),
+				hasConfiguredAuth: () => true,
+				checkAuth: async () => ({}),
+				isUsingOAuth: () => false,
+				getAuth: async () => config.auth ?? undefined,
+			};
+			const session = new AgentSession({
+				agent,
+				sessionManager,
+				settingsManager,
+				cwd: "/proj",
+				resourceLoader: fakeLoader,
+				modelRuntime,
+				usesDefaultTools: false,
+				baseToolsOverride: {},
+			});
+			const snapEvent = (event) => JSON.parse(JSON.stringify(event));
+			const sessionEvents = [];
+			session.subscribe((event) => {
+				sessionEvents.push(snapEvent(event));
+			});
+			const fakeRunner = {
+				hasHandlers: () => false,
+				emit: async () => undefined,
+				emitMessageEnd: async () => undefined,
+				emitError: () => {},
+				invalidate: () => {},
+				getAllRegisteredTools: () => [],
+				emitBeforeAgentStart: async (_trigger, options) => ({
+					messages: [],
+					systemPromptOptions: JSON.parse(JSON.stringify(options)),
+				}),
+			};
+			session._extensionRunner = fakeRunner;
+			globalThis.__piParityUuidOverride = nextUuid;
+
+			const { readFileSync, rmSync } = require("node:fs");
+			const results = [];
+			for (const op of args.script) {
+				try {
+					if (op === null || typeof op !== "object" || Array.isArray(op)) {
+						throw new Error("ops entries must be objects");
+					}
+					if (typeof op.op !== "string") throw new Error("missing op");
+					let v = null;
+					switch (op.op) {
+						case "getSessionStats":
+							v = session.getSessionStats();
+							break;
+						case "getContextUsage":
+							v = session.getContextUsage() ?? null;
+							break;
+						case "exportToJsonl": {
+							const resolved = session.exportToJsonl(op.path);
+							const content = readFileSync(resolved, "utf8");
+							rmSync(resolved);
+							v = { path: resolved, content };
+							break;
+						}
+						case "summarizeForBugReport": {
+							const controller = new AbortController();
+							v = await session.summarizeForBugReport({
+								hint: op.hint,
+								signal: controller.signal,
+							});
+							break;
+						}
+						default:
+							throw new Error("unknown agent-session-stats op: " + op.op);
+					}
+					results.push(v === undefined ? null : v);
+				} catch (e) {
+					results.push({
+						thrown: e && e.message !== undefined ? String(e.message) : String(e),
+					});
+				}
+			}
+			return {
+				result: {
+					results,
+					sessionEvents,
+					entries: sessionManager.getEntries(),
+					promptsSentToAgent,
+				},
+			};
+		} finally {
+			globalThis.__piParityUuidOverride = null;
+			globalThis.setTimeout = realSetTimeout;
+			Date.now = realDateNow;
+			globalThis.Date = RealDate;
+			process.chdir(realCwd);
+		}
+	}
+
 	if (tool === "agent-session-model") {
 		// dist/core/agent-session.js — the model & thinking-management slice
 		// (setModel / cycleModel / setThinkingLevel / cycleThinkingLevel) plus

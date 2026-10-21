@@ -111,7 +111,7 @@ pub(crate) struct SummarizerCtx {
 
 /// `convertToLlm(currentMessages)` — parse the JSON messages back into the
 /// typed `AgentMessage` enum the shared converter consumes.
-fn to_agent_messages(messages: &[Value]) -> Vec<pi_core::messages::AgentMessage> {
+pub(super) fn to_agent_messages(messages: &[Value]) -> Vec<pi_core::messages::AgentMessage> {
     messages
         .iter()
         .map(|message| {

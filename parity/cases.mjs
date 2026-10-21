@@ -11333,3 +11333,515 @@ cases.push(
 		providerTurns: [],
 	}),
 );
+
+// ======================================================= agent-session-stats
+// The stats & exports slice of AgentSession (getSessionStats /
+// getContextUsage / exportToJsonl / summarizeForBugReport) over a scripted
+// provider. config.auth feeds the fake modelRuntime.getAuth (summarization
+// request auth); config.physicalModels feeds getPhysicalModel (the
+// routedModel seam under a virtual selection). exportToJsonl files are
+// written under the harness cwd, read back, and removed (idempotent).
+const assh = (name, args) => ({
+	name: "agent-session-stats/" + name,
+	tool: "agent-session-stats",
+	args: {
+		...args,
+		config: { systemPrompt: "You are the parity assistant.", ...(args.config ?? {}) },
+	},
+});
+const ASSH_NOW = 1749000000000;
+const asshIso = (ms) => new Date(ms).toISOString();
+const asshHeader = () => [{ type: "session", id: "s-stats", version: 3, cwd: "/proj" }];
+const asshModel = {
+	id: "m-stats",
+	name: "Stats Model",
+	api: "anthropic",
+	provider: "anthropic",
+	baseUrl: "",
+	reasoning: false,
+	input: [],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	contextWindow: 100000,
+	maxTokens: 8192,
+};
+const asshVirtualModel = {
+	id: "m-virtual",
+	name: "Virtual Model",
+	api: "pi-virtual",
+	provider: "pi",
+	baseUrl: "",
+	reasoning: false,
+	input: [],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	contextWindow: 100000,
+	maxTokens: 8192,
+};
+const asshUsage = (o = {}) => ({
+	input: o.input ?? 0,
+	output: o.output ?? 0,
+	cacheRead: o.cacheRead ?? 0,
+	cacheWrite: o.cacheWrite ?? 0,
+	totalTokens: o.totalTokens ?? 0,
+	cost: {
+		input: o.costInput ?? 0,
+		output: o.costOutput ?? 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		total: (o.costInput ?? 0) + (o.costOutput ?? 0),
+	},
+});
+const asshUserEntry = (id, parentId, text, ms) => ({
+	type: "message",
+	id,
+	parentId,
+	timestamp: asshIso(ms),
+	message: { role: "user", content: [{ type: "text", text }], timestamp: ms },
+});
+const asshAsstEntry = (id, parentId, blocks, ms, usage) => ({
+	type: "message",
+	id,
+	parentId,
+	timestamp: asshIso(ms),
+	message: {
+		role: "assistant",
+		content: Array.isArray(blocks) ? blocks : [{ type: "text", text: blocks }],
+		api: "anthropic",
+		provider: "anthropic",
+		model: "m-stats",
+		usage: usage ?? asshUsage(),
+		stopReason: "stop",
+		timestamp: ms,
+	},
+});
+const asshToolResultEntry = (id, parentId, ms, usage) => ({
+	type: "message",
+	id,
+	parentId,
+	timestamp: asshIso(ms),
+	message: {
+		role: "toolResult",
+		content: [{ type: "text", text: "tool output" }],
+		toolCallId: "call-" + id,
+		usage: usage,
+		timestamp: ms,
+	},
+});
+const asshUsageEntry = (id, parentId, ms, usage) => ({
+	type: "usage",
+	id,
+	parentId,
+	timestamp: asshIso(ms),
+	provider: "anthropic",
+	model: "m-stats",
+	usage,
+});
+const asshTurn = (text, o = {}) => ({
+	events: [],
+	result: {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "anthropic",
+		provider: "anthropic",
+		model: "m-stats",
+		usage: o.usage ?? asshUsage(),
+		stopReason: o.stopReason ?? "stop",
+		errorMessage: o.errorMessage,
+		timestamp: ASSH_NOW,
+	},
+});
+cases.push(
+	assh("missing-args", {}),
+	assh("missing-script", {
+		nowMs: ASSH_NOW,
+		config: { model: asshModel, entries: asshHeader() },
+	}),
+	assh("unknown-op", {
+		nowMs: ASSH_NOW,
+		config: { model: asshModel, entries: asshHeader() },
+		script: [{ op: "bogus" }],
+		providerTurns: [],
+	}),
+	// Empty session (header only): all-zero stats, no contextUsage (no
+	// model), no sessionFile (in-memory).
+	assh("stats-empty", {
+		nowMs: ASSH_NOW,
+		config: { entries: asshHeader() },
+		script: [{ op: "getSessionStats" }, { op: "getContextUsage" }],
+		providerTurns: [],
+	}),
+	// Mixed entries: user/assistant/toolResult/bashExecution/contextEdit/
+	// compaction — only the three counted roles increment; toolCalls counts
+	// toolCall blocks; bashExecution and context_edit are ignored.
+	assh("stats-mixed-entries", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [
+				...asshHeader(),
+				asshUserEntry("u1", "s-stats", "hello", ASSH_NOW - 9000),
+				asshAsstEntry(
+					"a1",
+					"u1",
+					[
+						{ type: "text", text: "running" },
+						{ type: "toolCall", id: "call-1", name: "read", arguments: {} },
+						{ type: "toolCall", id: "call-2", name: "write", arguments: {} },
+					],
+					ASSH_NOW - 8000,
+					asshUsage({ input: 10, output: 20, totalTokens: 30, costInput: 0.1, costOutput: 0.2 })
+				),
+				asshToolResultEntry("t1", "a1", ASSH_NOW - 7000, asshUsage({ input: 5, output: 0, totalTokens: 5, costInput: 0.05 })),
+				{
+					type: "message",
+					id: "b1",
+					parentId: "t1",
+					timestamp: asshIso(ASSH_NOW - 6500),
+					message: {
+						role: "bashExecution",
+						content: "ls -la",
+						command: "ls -la",
+						timestamp: ASSH_NOW - 6500,
+					},
+				},
+				{
+					type: "context_edit",
+					id: "ce1",
+					parentId: "b1",
+					timestamp: asshIso(ASSH_NOW - 6000),
+					targetId: "t1",
+					replacement: { content: "edited tool output" },
+				},
+				asshUserEntry("u2", "ce1", "again", ASSH_NOW - 5000),
+				asshAsstEntry("a2", "u2", "done", ASSH_NOW - 4000, asshUsage({ input: 7, output: 3, totalTokens: 10, costInput: 0.07, costOutput: 0.03 })),
+			],
+		},
+		script: [{ op: "getSessionStats" }],
+		providerTurns: [],
+	}),
+	// Token/cost aggregation across usage entries, toolResult usage, and a
+	// branch_summary usage.
+	assh("stats-token-aggregation", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [
+				...asshHeader(),
+				asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000),
+				asshAsstEntry("a1", "u1", "ok", ASSH_NOW - 8000, asshUsage({ input: 100, output: 50, cacheRead: 25, cacheWrite: 10, totalTokens: 185, costInput: 1, costOutput: 0.5 })),
+				asshUsageEntry("us1", "a1", ASSH_NOW - 7500, asshUsage({ input: 40, output: 10, totalTokens: 50, costInput: 0.4, costOutput: 0.1 })),
+				asshToolResultEntry("t1", "us1", ASSH_NOW - 7000, asshUsage({ input: 5, output: 5, totalTokens: 10, costInput: 0.05, costOutput: 0.05 })),
+				{
+					type: "branch_summary",
+					id: "bs1",
+					parentId: "t1",
+					timestamp: asshIso(ASSH_NOW - 6000),
+					summary: "prior turn",
+					usage: asshUsage({ input: 8, output: 2, totalTokens: 10, costInput: 0.08, costOutput: 0.02 }),
+				},
+				asshUserEntry("u2", "bs1", "next", ASSH_NOW - 5000),
+				asshAsstEntry("a2", "u2", "sure", ASSH_NOW - 4000, asshUsage({ input: 20, output: 10, totalTokens: 30, costInput: 0.2, costOutput: 0.1 })),
+			],
+		},
+		script: [{ op: "getSessionStats" }],
+		providerTurns: [],
+	}),
+	// An assistant message without usage throws exactly like the TS.
+	assh("stats-missing-assistant-usage", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [
+				...asshHeader(),
+				asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000),
+				{
+					type: "message",
+					id: "a1",
+					parentId: "u1",
+					timestamp: asshIso(ASSH_NOW - 8000),
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "no usage" }],
+						api: "anthropic",
+						provider: "anthropic",
+						model: "m-stats",
+						stopReason: "stop",
+						timestamp: ASSH_NOW - 8000,
+					},
+				},
+			],
+		},
+		script: [{ op: "getSessionStats" }],
+		providerTurns: [],
+	}),
+	// Context usage from provider usage: tokens = the last assistant
+	// totalTokens, percent = tokens/window*100.
+	assh("context-usage-provider-usage", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [
+				...asshHeader(),
+				asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000),
+				asshAsstEntry("a1", "u1", "ok", ASSH_NOW - 8000, asshUsage({ input: 1000, output: 500, totalTokens: 1500 })),
+				asshUserEntry("u2", "a1", "more", ASSH_NOW - 7000),
+				asshAsstEntry("a2", "u2", "sure", ASSH_NOW - 6000, asshUsage({ input: 2000, output: 500, totalTokens: 2500 })),
+			],
+		},
+		script: [{ op: "getContextUsage" }],
+		providerTurns: [],
+	}),
+	// No model and zero context window both yield undefined (null).
+	assh("context-usage-no-model", {
+		nowMs: ASSH_NOW,
+		config: { entries: asshHeader() },
+		script: [{ op: "getContextUsage" }],
+		providerTurns: [],
+	}),
+	assh("context-usage-zero-window", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: { ...asshModel, contextWindow: 0 },
+			entries: [...asshHeader(), asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000)],
+		},
+		script: [{ op: "getContextUsage" }],
+		providerTurns: [],
+	}),
+	// Right after a compaction with no post-compaction assistant usage:
+	// tokens/percent null.
+	assh("context-usage-after-compaction-unknown", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [
+				...asshHeader(),
+				asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000),
+				asshAsstEntry("a1", "u1", "ok", ASSH_NOW - 8000, asshUsage({ input: 1000, output: 500, totalTokens: 1500 })),
+				{
+					type: "compaction",
+					id: "c1",
+					parentId: "a1",
+					timestamp: asshIso(ASSH_NOW - 7000),
+					summary: "compacted",
+				},
+				asshUserEntry("u2", "c1", "next", ASSH_NOW - 6000),
+			],
+		},
+		script: [{ op: "getContextUsage" }],
+		providerTurns: [],
+	}),
+	// With a post-compaction assistant carrying usage, the estimate is
+	// projected (compaction summary + post-compaction messages).
+	assh("context-usage-after-compaction-projected", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [
+				...asshHeader(),
+				asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000),
+				asshAsstEntry("a1", "u1", "old context", ASSH_NOW - 8000, asshUsage({ input: 1000, output: 500, totalTokens: 1500 })),
+				{
+					type: "compaction",
+					id: "c1",
+					parentId: "a1",
+					timestamp: asshIso(ASSH_NOW - 7000),
+					summary: "compacted history summary text",
+				},
+				asshUserEntry("u2", "c1", "next", ASSH_NOW - 6000),
+				asshAsstEntry("a2", "u2", "resumed", ASSH_NOW - 5000, asshUsage({ input: 300, output: 100, totalTokens: 400 })),
+			],
+		},
+		script: [{ op: "getContextUsage" }],
+		providerTurns: [],
+	}),
+	// Virtual selection: the limits model is the physical model of the
+	// latest successful response (context window from the physical model).
+	assh("context-usage-virtual-model", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshVirtualModel,
+			physicalModels: [
+				{
+					provider: "anthropic",
+					id: "m-stats",
+					model: { ...asshModel, contextWindow: 50000 },
+				},
+			],
+			entries: [
+				...asshHeader(),
+				asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000),
+				asshAsstEntry("a1", "u1", "ok", ASSH_NOW - 8000, asshUsage({ input: 1000, output: 500, totalTokens: 1500 })),
+			],
+		},
+		script: [{ op: "getContextUsage" }],
+		providerTurns: [],
+	}),
+	// Virtual selection with no matching physical model: routedModel is
+	// undefined, so the virtual model's own window applies.
+	assh("context-usage-virtual-model-unresolved", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshVirtualModel,
+			entries: [
+				...asshHeader(),
+				asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000),
+				asshAsstEntry("a1", "u1", "ok", ASSH_NOW - 8000, asshUsage({ input: 1000, output: 500, totalTokens: 1500 })),
+			],
+		},
+		script: [{ op: "getContextUsage" }],
+		providerTurns: [],
+	}),
+	// exportToJsonl with an explicit path: header + branch entries with
+	// re-chained parentId, byte-exact.
+	assh("export-jsonl-explicit-path", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [
+				...asshHeader(),
+				asshUserEntry("u1", "s-stats", "hello", ASSH_NOW - 9000),
+				asshAsstEntry("a1", "u1", "world", ASSH_NOW - 8000, asshUsage({ input: 10, output: 5, totalTokens: 15 })),
+				asshAsstEntry("a1b", "u1", "sibling", ASSH_NOW - 7500),
+				asshUserEntry("u2", "a1", "more", ASSH_NOW - 7000),
+			],
+		},
+		script: [{ op: "exportToJsonl", path: "stats-export-explicit.jsonl" }],
+		providerTurns: [],
+	}),
+	// Default path: timestamped filename under the process cwd (pinned
+	// date), resolved identically on both sides.
+	assh("export-jsonl-default-path", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [...asshHeader(), asshUserEntry("u1", "s-stats", "only", ASSH_NOW - 9000)],
+		},
+		script: [{ op: "exportToJsonl" }],
+		providerTurns: [],
+	}),
+	// summarizeForBugReport: full prompt (conversation + instructions) and
+	// the request options (maxTokens, sessionId, cacheRetention) recorded.
+	assh("bug-report-basic", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [
+				...asshHeader(),
+				asshUserEntry("u1", "s-stats", "it crashed when saving", ASSH_NOW - 9000),
+				asshAsstEntry("a1", "u1", "I will save the file", ASSH_NOW - 8000, asshUsage({ input: 10, output: 5, totalTokens: 15 })),
+			],
+		},
+		script: [{ op: "summarizeForBugReport" }],
+		providerTurns: [asshTurn("# What the user was doing\nediting files")],
+	}),
+	// A user hint flows into <user-report>.
+	assh("bug-report-hint", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [
+				...asshHeader(),
+				asshUserEntry("u1", "s-stats", "broken tool", ASSH_NOW - 9000),
+				asshAsstEntry("a1", "u1", "running tool", ASSH_NOW - 8000, asshUsage({ totalTokens: 15 })),
+			],
+		},
+		script: [{ op: "summarizeForBugReport", hint: "  the write tool hangs  " }],
+		providerTurns: [asshTurn("report text")],
+	}),
+	// No model selected.
+	assh("bug-report-no-model", {
+		nowMs: ASSH_NOW,
+		config: { entries: asshHeader() },
+		script: [{ op: "summarizeForBugReport" }],
+		providerTurns: [],
+	}),
+	// A tool-call response is rejected.
+	assh("bug-report-tool-call", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [...asshHeader(), asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000)],
+		},
+		script: [{ op: "summarizeForBugReport" }],
+		providerTurns: [
+			{
+				events: [],
+				result: {
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call-9", name: "read", arguments: {} }],
+					api: "anthropic",
+					provider: "anthropic",
+					model: "m-stats",
+					usage: asshUsage(),
+					stopReason: "stop",
+					timestamp: ASSH_NOW,
+				},
+			},
+		],
+	}),
+	// An empty summary is rejected.
+	assh("bug-report-empty", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [...asshHeader(), asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000)],
+		},
+		script: [{ op: "summarizeForBugReport" }],
+		providerTurns: [asshTurn("   ")],
+	}),
+	// An aborted summarization is cancelled.
+	assh("bug-report-aborted", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			entries: [...asshHeader(), asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000)],
+		},
+		script: [{ op: "summarizeForBugReport" }],
+		providerTurns: [asshTurn("partial", { stopReason: "aborted" })],
+	}),
+	// Retryable provider error: the first turn errors ("overloaded"), the
+	// retry succeeds — two provider calls recorded.
+	assh("bug-report-retry", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 100 } },
+			entries: [...asshHeader(), asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000)],
+		},
+		script: [{ op: "summarizeForBugReport" }],
+		providerTurns: [
+			asshTurn("x", { stopReason: "error", errorMessage: "provider is overloaded" }),
+			asshTurn("recovered report"),
+		],
+	}),
+	// Auth (apiKey/headers/env/baseUrl): the request carries them and the
+	// model's baseUrl is replaced.
+	assh("bug-report-auth", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: asshModel,
+			auth: {
+				auth: { baseUrl: "https://proxy.example", apiKey: "sk-test", headers: { "x-custom": "1" } },
+				env: { ANTHROPIC_API_KEY: "sk-test" },
+			},
+			entries: [...asshHeader(), asshUserEntry("u1", "s-stats", "hi", ASSH_NOW - 9000)],
+		},
+		script: [{ op: "summarizeForBugReport" }],
+		providerTurns: [asshTurn("authed report")],
+	}),
+	// A small context window truncates the selection: the prompt carries
+	// the "only the last N of M messages" note.
+	assh("bug-report-truncated-selection", {
+		nowMs: ASSH_NOW,
+		config: {
+			model: { ...asshModel, contextWindow: 2000 },
+			entries: [
+				...asshHeader(),
+				...Array.from({ length: 8 }, (_, i) =>
+					asshUserEntry("u" + (i + 1), i === 0 ? "s-stats" : "u" + i, "word ".repeat(200), ASSH_NOW - 10000 + i * 100)
+				),
+			],
+		},
+		script: [{ op: "summarizeForBugReport" }],
+		providerTurns: [asshTurn("short report")],
+	}),
+);

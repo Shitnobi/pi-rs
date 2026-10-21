@@ -465,6 +465,7 @@ pub fn run_agent_session_model_harness(args: &Value) -> Result<Value, String> {
         model_lookup: None,
         scoped_models,
         model_routes: Some(Arc::clone(&routes) as Arc<dyn ModelRouteStore>),
+        physical_model_lookup: None,
         sleeper: Some(Arc::new(ImmediateSleeper)),
     });
     {
