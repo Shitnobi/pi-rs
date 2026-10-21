@@ -257,7 +257,7 @@ impl AgentSession {
     /// TS `_flushPendingCustomMessages` — append custom messages queued
     /// while the agent was running, once the current turn's tool results
     /// are in agent state and session history.
-    fn flush_pending_custom_messages(&mut self) {
+    pub(crate) fn flush_pending_custom_messages(&mut self) {
         if self.state.pending_custom_messages.is_empty() {
             return;
         }
@@ -327,7 +327,7 @@ impl AgentSession {
 
     /// TS `_emitAgentSettled` — cache-warmer hook, extension + public
     /// `agent_settled`, deferred settled actions, idle resolution.
-    pub async fn emit_agent_settled(&mut self) {
+    pub async fn emit_agent_settled(&mut self) -> Result<(), String> {
         // TODO(tranche 13): this._cacheWarmer?.onAgentSettled();
         self.state.is_agent_run_active = false;
         self.state.is_emitting_agent_settled = true;
@@ -340,15 +340,53 @@ impl AgentSession {
 
         let deferred = std::mem::take(&mut self.state.deferred_settled_actions);
         if !deferred.is_empty() {
+            let mut failure: Option<String> = None;
             for action in deferred {
-                let DeferredSettledAction::Log(tag) = action;
-                self.state.deferred_log.push(tag);
-                // TODO(tranche 11): prompt / sendCustomMessage re-queueing.
+                match action {
+                    DeferredSettledAction::Log(tag) => {
+                        self.state.deferred_log.push(tag);
+                    }
+                    DeferredSettledAction::Prompt { text, options } => {
+                        // Boxed: prompt → start_run → emit_agent_settled is
+                        // recursive (TS nests the same way at runtime).
+                        let result = Box::pin(self.prompt(&text, options)).await;
+                        if let Err(error) = result {
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                    DeferredSettledAction::SendCustomMessage {
+                        custom_type,
+                        content,
+                        display,
+                        details,
+                        trigger_turn,
+                        deliver_as,
+                    } => {
+                        let result = Box::pin(self.send_custom_message(
+                            &custom_type,
+                            content,
+                            display,
+                            details,
+                            trigger_turn,
+                            deliver_as.as_deref(),
+                        ))
+                        .await;
+                        if let Err(error) = result {
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                }
             }
             self.resolve_idle_wait_if_idle();
-            return;
+            return match failure {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
         }
         self.resolve_idle_wait_if_idle();
+        Ok(())
     }
 
     /// TS `_emitExtensionEvent(event)` — map agent events onto extension

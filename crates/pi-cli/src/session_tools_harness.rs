@@ -312,6 +312,9 @@ pub fn run_agent_session_tools_harness(args: &Value) -> Result<Value, String> {
     });
 
     let mut session = AgentSession::new(AgentSessionConfig {
+        model_auth: None,
+        skills: Vec::new(),
+        prompt_templates: Vec::new(),
         agent,
         session_manager,
         settings: Arc::new(FixedSettings {

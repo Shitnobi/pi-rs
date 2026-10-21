@@ -1228,7 +1228,28 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       flag AND gate emit_error recording the same way — construction-time
       prepareLoadout throws hit the real (empty) runner in TS and are
       invisible; the Rust fake must mirror that or double-record.
+- [x] **Tranche 10 — prompt pipeline.** crates/pi-session/
+      agent_session/prompt.rs (~700 LOC): prompt (extension-command
+      dispatch, input interception, skill/template expansion,
+      streaming→steer/followUp queueing, model/auth validation),
+      steer/followUp/_queueUserInput, sendUserMessage, image
+      normalization seam (processImage seam; cases pin
+      autoResize:false), reduced run driver (_startRun/_prepareRun/
+      _handlePostAgentRun/_runBeforeSettleBoundary with queue
+      re-dispatch), and the agent→session event pump (AgentEvent →
+      arena SessionAgentEvent; FIFO drain — one arena slot per
+      streaming message; nestedCalls/usage in-place-mutation carry at
+      message_end). mod.rs: ModelAuthStore trait, ExtensionHost gains
+      get_command/execute_command/emit_input, DeferredSettledAction
+      Prompt/SendCustomMessage carriers executed by _emitAgentSettled.
+      Parity harness `agent-session-prompt` (14 cases; suite
+      2460/2460). Key fixes found in differential: preflight callback
+      must read the normalized options object (not op.options —
+      undefined without options); TS AgentSession gets
+      baseToolsOverride:{} so createAllToolDefinitions (unported) never
+      declares builtin tools the reduced Rust prepare_run can't patch;
+      skill-name slice must skip the "/skill:" prefix (TS slice(7)).
 - [ ] Remaining agent-session tranches (phase3-agent-session.md):
-      AgentSession slices 10–17 (prompt, run, retry, compaction,
+      AgentSession slices 11–17 (run, retry, compaction,
       model, bash, tree, stats) and 18–19 (runtime, services+event-bus),
       extending crates/pi-session.

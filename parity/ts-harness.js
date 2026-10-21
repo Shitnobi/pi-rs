@@ -5528,6 +5528,421 @@ async function runModule(tool, args, cwd) {
 			globalThis.Date = RealDate;
 		}
 	}
+	if (tool === "agent-session-prompt") {
+		// dist/core/agent-session.js — the prompt slice of the REAL
+		// AgentSession: prompt, steer/followUp (_queueUserInput),
+		// sendUserMessage, extension-command dispatch, skill/template
+		// expansion, image normalization, and the _startRun driver, over a
+		// real Agent with a scripted provider (the `agent` entry's
+		// providerTurns scripting; each stream call's llm context is
+		// recorded as promptsSentToAgent). Mirrors the Rust harness
+		// (crates/pi-cli/src/session_prompt_harness.rs).
+		//
+		// Bridges (documented divergences of the Rust tranche-10 port):
+		// `_preparePromptAndToolLoadout` is stubbed to undefined (system-
+		// patch diff is tranche 11); the fake `emitBeforeAgentStart`
+		// returns { systemPromptOptions: clone, messages: [] }; docs-path
+		// bearing auth errors are normalized to "<docs>" on both sides.
+		// The fake _resourceLoader supplies the harness skills/templates
+		// (real skill files are written for non-failing entries; the Rust
+		// side injects the content directly).
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		const { AgentSession } = require(path.join(distDir, "core", "agent-session.js"));
+		const { SessionManager } = require(path.join(distDir, "core", "session-manager.js"));
+		const { SettingsManager } = require(path.join(distDir, "core", "settings-manager.js"));
+		const { DefaultResourceLoader } = require(path.join(distDir, "core", "resource-loader.js"));
+		const { getDocsPath } = require(path.join(distDir, "config.js"));
+		const fs = require("fs");
+		// Validation order mirrors the Rust entry exactly.
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		const config = args.config ?? {};
+		if (typeof config !== "object" || config === null || Array.isArray(config)) {
+			throw new Error("invalid config");
+		}
+		const settingsIn = config.settings ?? {};
+		if (typeof settingsIn !== "object" || settingsIn === null || Array.isArray(settingsIn)) {
+			throw new Error("invalid settings");
+		}
+		const retryIn = settingsIn.retry ?? {};
+		if (typeof retryIn !== "object" || retryIn === null || Array.isArray(retryIn)) {
+			throw new Error("invalid settings");
+		}
+		if (settingsIn.imageAutoResize !== undefined && typeof settingsIn.imageAutoResize !== "boolean") {
+			throw new Error("invalid imageAutoResize");
+		}
+		const modelAuthIn = config.modelAuth ?? {};
+		if (typeof modelAuthIn !== "object" || modelAuthIn === null || Array.isArray(modelAuthIn)) {
+			throw new Error("invalid modelAuth");
+		}
+		const authMode = modelAuthIn.mode ?? "ok";
+		if (authMode !== "ok" && authMode !== "noKey" && authMode !== "oauth") {
+			throw new Error("invalid modelAuth");
+		}
+		if (
+			!Array.isArray(config.entries) ||
+			config.entries.length === 0 ||
+			config.entries[0].type !== "session"
+		) {
+			throw new Error("missing entries");
+		}
+		if (config.model !== undefined && config.model !== null) {
+			if (typeof config.model !== "object" || Array.isArray(config.model)) {
+				throw new Error("invalid model");
+			}
+		}
+		const modeField = (key) => {
+			if (config[key] === undefined || config[key] === null) return undefined;
+			if (typeof config[key] !== "string") throw new Error("invalid " + key);
+			return config[key];
+		};
+		const steeringMode = modeField("steeringMode");
+		if (steeringMode !== undefined && steeringMode !== "all" && steeringMode !== "one-at-a-time") {
+			throw new Error("invalid steeringMode");
+		}
+		const followUpMode = modeField("followUpMode");
+		if (followUpMode !== undefined && followUpMode !== "all" && followUpMode !== "one-at-a-time") {
+			throw new Error("invalid followUpMode");
+		}
+		const commandsIn = args.commands ?? {};
+		if (typeof commandsIn !== "object" || commandsIn === null || Array.isArray(commandsIn)) {
+			throw new Error("invalid commands");
+		}
+		for (const spec of Object.values(commandsIn)) {
+			if (spec === null || typeof spec !== "object" || Array.isArray(spec)) {
+				throw new Error("invalid commands");
+			}
+			if (spec.mode !== undefined && spec.mode !== "ok" && spec.mode !== "throw") {
+				throw new Error("invalid commands");
+			}
+		}
+		let inputHandler;
+		if (args.inputHandler !== undefined && args.inputHandler !== null) {
+			if (typeof args.inputHandler !== "object" || Array.isArray(args.inputHandler)) {
+				throw new Error("invalid inputHandler");
+			}
+			const mode = args.inputHandler.mode ?? "continue";
+			if (mode !== "continue" && mode !== "handled" && mode !== "transform") {
+				throw new Error("invalid inputHandler");
+			}
+			inputHandler = args.inputHandler;
+		}
+		const templates = args.templates ?? [];
+		if (!Array.isArray(templates)) throw new Error("invalid templates");
+		const skills = args.skills ?? [];
+		if (!Array.isArray(skills)) throw new Error("invalid skills");
+		if (!Array.isArray(args.script)) throw new Error("missing script");
+		if (!Array.isArray(args.providerTurns)) throw new Error("missing providerTurns");
+
+		const realDocsPath = getDocsPath();
+		const realDateNow = Date.now;
+		Date.now = () => args.nowMs;
+		const RealDate = Date;
+		class PinnedDate extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(args.nowMs);
+				else super(...ctorArgs);
+			}
+		}
+		globalThis.Date = PinnedDate;
+		// Real skill files for non-failing entries (the Rust side reads the
+		// injected content; the file must exist for readFileSync here).
+		for (const skill of skills) {
+			if (skill && typeof skill === "object" && !skill.readFails && typeof skill.filePath === "string") {
+				fs.mkdirSync(path.dirname(skill.filePath), { recursive: true });
+				fs.writeFileSync(skill.filePath, skill.content ?? "");
+			}
+		}
+		let uuidI = 0;
+		const nextUuid = () => "uid" + String(++uuidI).padStart(5, "0");
+		try {
+			const sessionManager = SessionManager.inMemory("/proj", undefined, config.entries);
+			const projected = sessionManager.buildSessionProjection().messages;
+			const promptsSentToAgent = [];
+			let providerIdx = 0;
+			const fakeStreamFn = (_model, context, _options) => {
+				const turn = args.providerTurns[providerIdx];
+				if (turn === undefined) throw new Error("provider script exhausted");
+				providerIdx++;
+				promptsSentToAgent.push(JSON.parse(JSON.stringify(context.messages ?? [])));
+				return {
+					async *[Symbol.asyncIterator]() {
+						for (const event of turn.events ?? []) yield event;
+					},
+					result() {
+						return Promise.resolve(turn.result);
+					},
+				};
+			};
+			const agent = new Agent({
+				streamFn: fakeStreamFn,
+				initialState: {
+					messages: projected,
+					...(steeringMode !== undefined ? { steeringMode } : {}),
+					...(followUpMode !== undefined ? { followUpMode } : {}),
+				},
+			});
+			agent.state.model = config.model ?? undefined;
+			const settingsManager = SettingsManager.inMemory({
+				retry: retryIn,
+				...(settingsIn.imageAutoResize !== undefined
+					? { images: { autoResize: settingsIn.imageAutoResize } }
+					: {}),
+			});
+			const resourceLoader = new DefaultResourceLoader({
+				cwd: "/proj",
+				agentDir: "/proj/.pi",
+				settingsManager,
+				noExtensions: true,
+			});
+			const modelRuntime = {
+				getModel: () => undefined,
+				getPhysicalModel: () => undefined,
+				hasConfiguredAuth: () => authMode === "ok",
+				checkAuth: async () => (authMode === "ok" ? {} : undefined),
+				isUsingOAuth: () => authMode === "oauth",
+			};
+			const session = new AgentSession({
+				agent,
+				sessionManager,
+				settingsManager,
+				cwd: "/proj",
+				resourceLoader,
+				modelRuntime,
+				usesDefaultTools: false,
+				// Empty base-tools override on both sides: the Rust port has
+				// no createAllToolDefinitions, so without this the real dist
+				// declares its builtin tools and _preparePromptAndToolLoadout
+				// emits a system patch the Rust run driver skips.
+				baseToolsOverride: {},
+			});
+			const snapEvent = (event) => JSON.parse(JSON.stringify(event));
+			const extensionEvents = [];
+			const extensionErrors = [];
+			const commandCalls = [];
+			const inputEvents = [];
+			const commands = commandsIn;
+			const fakeRunner = {
+				hasHandlers: (event) => event === "input" && inputHandler !== undefined,
+				emit: async (event) => {
+					extensionEvents.push(snapEvent(event));
+				},
+				emitMessageEnd: async (event) => {
+					extensionEvents.push(snapEvent(event));
+					return undefined;
+				},
+				emitError: (error) => {
+					extensionErrors.push(snapEvent(error));
+				},
+				invalidate: () => {},
+				getAllRegisteredTools: () => [],
+				getCommand: (name) =>
+					commands[name] !== undefined
+						? {
+								handler: async (callArgs) => {
+									commandCalls.push({ name, args: callArgs });
+									if (commands[name].mode === "throw") {
+										throw new Error(commands[name].errorText ?? "");
+									}
+								},
+							}
+						: undefined,
+				createCommandContext: () => ({}),
+				emitInput: async (text, images, source, streamingBehavior) => {
+					inputEvents.push(
+						snapEvent({
+							type: "input",
+							text,
+							...(Array.isArray(images) ? { images } : {}),
+							source,
+							...(streamingBehavior !== undefined ? { streamingBehavior } : {}),
+						}),
+					);
+					if (!inputHandler) return { action: "continue" };
+					if (inputHandler.mode === "handled") return { action: "handled" };
+					if (inputHandler.mode === "transform") {
+						return {
+							action: "transform",
+							...(inputHandler.text !== undefined ? { text: inputHandler.text } : {}),
+							...(inputHandler.images !== undefined ? { images: inputHandler.images } : {}),
+						};
+					}
+					return { action: "continue" };
+				},
+				emitBeforeAgentStart: async (_trigger, options) => ({
+					systemPromptOptions: structuredClone(options),
+					messages: [],
+				}),
+			};
+			session._extensionRunner = fakeRunner;
+			const fakeLoader = {
+				getSkills: () => ({ skills, diagnostics: [] }),
+				getPrompts: () => ({ prompts: templates, diagnostics: [] }),
+				getAgentsFiles: () => ({ agentsFiles: [] }),
+				getSystemPrompt: () => undefined,
+				getAppendSystemPrompt: () => [],
+				getExtensions: () => ({ extensions: [], diagnostics: [] }),
+				getThemes: () => ({ themes: [], diagnostics: [] }),
+			};
+			session._resourceLoader = fakeLoader;
+			// Bridge: the Rust tranche-10 prepare_run skips the
+			// system-patch diff (tranche 11 TODO).
+			session._preparePromptAndToolLoadout = () => undefined;
+
+			const sessionEvents = [];
+			const dispositions = [];
+			session.subscribe((event) => {
+				sessionEvents.push(snapEvent(event));
+			});
+			globalThis.__piParityUuidOverride = nextUuid;
+
+			const normalize = (message) => String(message).split(realDocsPath).join("<docs>");
+			const results = [];
+			for (const op of args.script) {
+				try {
+					if (op === null || typeof op !== "object" || Array.isArray(op)) {
+						throw new Error("ops entries must be objects");
+					}
+					if (typeof op.op !== "string") throw new Error("missing op");
+					let v = null;
+					switch (op.op) {
+						case "prompt": {
+							if (typeof op.text !== "string") throw new Error("missing text");
+							const options = op.options ?? {};
+							if (typeof options !== "object" || options === null || Array.isArray(options)) {
+								throw new Error("invalid options");
+							}
+							if (
+								options.expandPromptTemplates !== undefined &&
+								typeof options.expandPromptTemplates !== "boolean"
+							) {
+								throw new Error("invalid expandPromptTemplates");
+							}
+							if (
+								options.streamingBehavior !== undefined &&
+								options.streamingBehavior !== null &&
+								typeof options.streamingBehavior !== "string"
+							) {
+								throw new Error("invalid streamingBehavior");
+							}
+							if (options.source !== undefined && options.source !== null && typeof options.source !== "string") {
+								throw new Error("invalid source");
+							}
+							if (options.images !== undefined && options.images !== null && !Array.isArray(options.images)) {
+								throw new Error("invalid images");
+							}
+							const preflight =
+								options.preflightTag !== undefined
+									? (disposition) => {
+											dispositions.push({ tag: options.preflightTag, disposition });
+										}
+									: undefined;
+							await session.prompt(op.text, {
+								...(options.expandPromptTemplates !== undefined
+									? { expandPromptTemplates: options.expandPromptTemplates }
+									: {}),
+								...(options.images !== undefined ? { images: options.images } : {}),
+								...(options.streamingBehavior !== undefined
+									? { streamingBehavior: options.streamingBehavior }
+									: {}),
+								...(options.source !== undefined ? { source: options.source } : {}),
+								...(preflight !== undefined ? { preflightResult: preflight } : {}),
+							});
+							break;
+						}
+						case "steer":
+						case "followUp": {
+							if (typeof op.text !== "string") throw new Error("missing text");
+							if (op.images !== undefined && op.images !== null && !Array.isArray(op.images)) {
+								throw new Error("invalid images");
+							}
+							if (op.source !== undefined && op.source !== null && typeof op.source !== "string") {
+								throw new Error("invalid source");
+							}
+							v = await (op.op === "steer"
+								? session.steer(op.text, op.images ?? undefined, op.source !== undefined ? { source: op.source } : undefined)
+								: session.followUp(op.text, op.images ?? undefined, op.source !== undefined ? { source: op.source } : undefined));
+							break;
+						}
+						case "sendCustomMessage": {
+							if (typeof op.customType !== "string") throw new Error("missing customType");
+							if (op.content === undefined) throw new Error("missing content");
+							if (typeof op.display !== "boolean") throw new Error("missing display");
+							if (op.triggerTurn !== undefined && typeof op.triggerTurn !== "boolean") {
+								throw new Error("invalid triggerTurn");
+							}
+							if (op.deliverAs !== undefined && op.deliverAs !== null && typeof op.deliverAs !== "string") {
+								throw new Error("invalid deliverAs");
+							}
+							await session.sendCustomMessage(
+								{ customType: op.customType, content: op.content, display: op.display, details: op.details },
+								{
+									...(op.triggerTurn === undefined ? {} : { triggerTurn: op.triggerTurn }),
+									...(op.deliverAs === undefined ? {} : { deliverAs: op.deliverAs }),
+								},
+							);
+							break;
+						}
+						case "sendUserMessage": {
+							if (op.content === undefined) throw new Error("missing content");
+							if (typeof op.content !== "string" && !Array.isArray(op.content)) {
+								throw new Error("invalid content");
+							}
+							if (op.deliverAs !== undefined && op.deliverAs !== null && typeof op.deliverAs !== "string") {
+								throw new Error("invalid deliverAs");
+							}
+							if (
+								op.expandPromptTemplates !== undefined &&
+								typeof op.expandPromptTemplates !== "boolean"
+							) {
+								throw new Error("invalid expandPromptTemplates");
+							}
+							await session.sendUserMessage(op.content, {
+								...(op.deliverAs === undefined ? {} : { deliverAs: op.deliverAs }),
+								...(op.expandPromptTemplates === undefined
+									? {}
+									: { expandPromptTemplates: op.expandPromptTemplates }),
+							});
+							break;
+						}
+						case "setStreaming":
+							if (typeof op.value !== "boolean") throw new Error("missing value");
+							session._isAgentRunActive = op.value;
+							break;
+						default:
+							throw new Error("unknown agent-session-prompt op: " + op.op);
+					}
+					results.push(v === undefined ? null : v);
+				} catch (e) {
+					results.push({ thrown: normalize(e && e.message !== undefined ? e.message : String(e)) });
+				}
+			}
+			const queueState = {
+				steering: session._steeringMessages,
+				followUp: session._followUpMessages,
+				isIdle: session.isIdle,
+				pendingCustomMessages: session._pendingCustomMessages,
+			};
+			return {
+				result: {
+					results,
+					dispositions,
+					sessionEvents,
+					extensionEvents,
+					extensionErrors,
+					commandCalls,
+					inputEvents,
+					queueState,
+					promptsSentToAgent,
+					entries: sessionManager.getEntries(),
+				},
+			};
+		} finally {
+			globalThis.__piParityUuidOverride = null;
+			Date.now = realDateNow;
+			globalThis.Date = RealDate;
+		}
+	}
+
 	if (tool === "file-mutation-queue") {
 		// dist/core/tools/file-mutation-queue.js — withFileMutationQueue over
 		// scripted fns. Ops run concurrently; each fn marks itself started,

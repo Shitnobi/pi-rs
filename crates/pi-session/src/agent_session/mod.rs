@@ -8,6 +8,7 @@
 
 pub mod events;
 pub mod event_handler;
+pub mod prompt;
 pub mod tools;
 
 use std::collections::{HashMap, HashSet};
@@ -28,6 +29,23 @@ pub use events::{MsgId, SessionAgentEvent};
 /// (tranche 10+).
 pub trait SessionSettingsStore: Send + Sync {
     fn retry_settings(&self) -> RetrySettings;
+    /// TS `settingsManager.getImageAutoResize()` (default `true`).
+    fn image_auto_resize(&self) -> bool {
+        true
+    }
+}
+
+/// TS `_modelRuntime` auth surface the prompt pipeline validates against
+/// (`hasConfiguredAuth` / `checkAuth` / `isUsingOAuth`) plus the
+/// docs-path-bearing error messages (`auth-guidance.ts` — the paths make
+/// the texts environment-dependent, so the harness injects them).
+pub trait ModelAuthStore: Send + Sync {
+    fn has_configured_auth(&self, provider: &str) -> bool;
+    /// TS `(await checkAuth(provider)) !== undefined`.
+    fn check_auth(&self, provider: &str) -> bool;
+    fn is_using_oauth(&self, provider: &str) -> bool;
+    fn no_model_selected_message(&self) -> String;
+    fn no_api_key_message(&self, provider: &str) -> String;
 }
 
 /// Stand-in for `ExtensionRunner` (plan §4 `ExtensionHost`): the extension
@@ -42,6 +60,25 @@ pub trait ExtensionHost: Send + Sync {
     fn emit_message_end<'a>(&'a self, event: Value) -> BoxFuture<'a, Option<Value>>;
     /// TS `emitError(error)`.
     fn emit_error(&self, error: Value);
+    /// TS `runner.getCommand(name) !== undefined` (prompt slice).
+    fn get_command(&self, _name: &str) -> bool {
+        false
+    }
+    /// TS `command.handler(args, ctx)` — `Err` models a throw.
+    fn execute_command<'a>(
+        &'a self,
+        _name: &'a str,
+        _args: &'a str,
+    ) -> pi_agent::types::BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Err("command not found".to_string()) })
+    }
+    /// TS `runner.emitInput(event)` → the input-event result.
+    fn emit_input<'a>(
+        &'a self,
+        _event: Value,
+    ) -> pi_agent::types::BoxFuture<'a, prompt::InputAction> {
+        Box::pin(async { prompt::InputAction::Continue })
+    }
     /// TS `invalidate(message)`.
     fn invalidate(&self, message: &str);
     /// TS `runner.getAllRegisteredTools()` — the tools-slice seam (plan §4).
@@ -89,15 +126,31 @@ pub struct AgentSessionConfig {
     /// definitions are unported (see [`tools`] module docs), so production
     /// callers must pass an override until Phase 4+.
     pub base_tools_override: Option<Vec<(String, Arc<dyn pi_agent::AgentTool>)>>,
+    /// TS `_modelRuntime` auth seam (prompt slice).
+    pub model_auth: Option<Arc<dyn ModelAuthStore>>,
+    /// TS `resourceLoader.getSkills()` (prompt slice; Phase 4 loader).
+    pub skills: Vec<prompt::SkillSpec>,
+    /// TS `resourceLoader.getPrompts().prompts`.
+    pub prompt_templates: Vec<pi_core::prompt_templates::PromptTemplate>,
 }
 
 /// A deferred `agent_settled` action (TS `_deferredSettledActions` holds
 /// async closures re-invoking `prompt`/`sendCustomMessage`). Those callers
 /// land with the run pipeline (tranche 11); until then the harness drives
 /// the deterministic `Log` stand-in (plan §2 trap 8).
-#[derive(Debug, Clone)]
 pub enum DeferredSettledAction {
     Log(String),
+    /// A deferred re-invocation of `prompt` (TS pushes a closure).
+    Prompt { text: String, options: prompt::PromptOptions },
+    /// A deferred re-invocation of `sendCustomMessage`.
+    SendCustomMessage {
+        custom_type: String,
+        content: Value,
+        display: bool,
+        details: Option<Value>,
+        trigger_turn: Option<bool>,
+        deliver_as: Option<String>,
+    },
 }
 
 /// TS `AgentSessionEventListener`.
@@ -154,6 +207,11 @@ struct SessionState {
     is_emitting_agent_settled: bool,
     /// Tools slice state (TS `_toolRegistry` & friends; [`tools`]).
     tools: tools::ToolsState,
+    /// Bridge state: the message currently streaming (TS: the one mutated
+    /// object) and this run's completed messages (value → arena id).
+    open_message: Option<MsgId>,
+    run_message_values: Vec<Value>,
+    run_message_ids: Vec<MsgId>,
 }
 
 /// TS `class AgentSession` — the events slice.
@@ -173,6 +231,15 @@ pub struct AgentSession {
     /// TS `_cwd`.
     pub cwd: String,
     state: SessionState,
+    /// TS `_modelRuntime` auth seam (prompt slice).
+    model_auth: Option<Arc<dyn ModelAuthStore>>,
+    /// TS `resourceLoader.getSkills()` specs (prompt slice).
+    skills: Vec<prompt::SkillSpec>,
+    /// TS `resourceLoader.getPrompts().prompts`.
+    prompt_templates: Vec<pi_core::prompt_templates::PromptTemplate>,
+    /// The agent→session event queue (the subscription only pushes;
+    /// [`prompt`] pumps it at run checkpoints — see its module docs).
+    agent_event_queue: Arc<Mutex<Vec<pi_agent::AgentEvent>>>,
     /// Idle-wait resolvers (TS `_idleWaitPromise`/`_resolveIdleWait`
     /// single-slot promise; multiple waiters each get a slot).
     idle_resolvers: Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
@@ -188,6 +255,7 @@ impl AgentSession {
     /// [`AgentSession::handle_agent_event`].
     pub fn new(config: AgentSessionConfig) -> AgentSession {
         let tools_state = tools::ToolsState::new(&config);
+        let agent_event_queue = Arc::new(Mutex::new(Vec::new()));
         let mut session = AgentSession {
             agent: config.agent,
             session_manager: config.session_manager,
@@ -196,6 +264,10 @@ impl AgentSession {
             nested_tool_calls: config.nested_tool_calls,
             clock: config.clock,
             cwd: config.cwd,
+            model_auth: config.model_auth,
+            skills: config.skills,
+            prompt_templates: config.prompt_templates,
+            agent_event_queue: Arc::clone(&agent_event_queue),
             state: SessionState {
                 listeners: Vec::new(),
                 is_agent_run_active: false,
@@ -219,6 +291,9 @@ impl AgentSession {
                 deferred_log: Vec::new(),
                 is_emitting_agent_settled: false,
                 tools: tools_state,
+                open_message: None,
+                run_message_values: Vec::new(),
+                run_message_ids: Vec::new(),
             },
             idle_resolvers: Mutex::new(Vec::new()),
             next_listener_id: 0,
@@ -232,6 +307,16 @@ impl AgentSession {
         if session.state.tools.uses_default_tools {
             let modifiers = session.state.tools.default_tool_modifiers.clone();
             session.restore_tools_from_transcript(&modifiers);
+        }
+        // TS constructor: `this._unsubscribeAgent = this.agent.subscribe(
+        // this._handleAgentEvent)`. The Rust subscription only queues;
+        // `prompt::pump_agent_events` drains it at run checkpoints.
+        {
+            let queue = Arc::clone(&session.agent_event_queue);
+            session.agent.subscribe(Arc::new(move |event, _signal| {
+                queue.lock().expect("agent event queue").push(event);
+                Box::pin(async {})
+            }));
         }
         session
     }
@@ -359,25 +444,33 @@ impl AgentSession {
     // Queueing (TS `_queueSteer` / `_queueFollowUp`)
     // ========================================================================
 
-    /// TS `_queueSteer(text)` — internal, already expanded.
-    pub fn queue_steer_internal(&mut self, text: &str) {
+    /// TS `_queueSteer(text, images?)` — internal, already expanded.
+    pub fn queue_steer_internal(&mut self, text: &str, images: Option<&[Value]>) {
         self.state.steering_messages.push(text.to_string());
         self.emit_queue_update();
+        let mut content = vec![json!({ "type": "text", "text": text })];
+        if let Some(images) = images {
+            content.extend(images.iter().cloned());
+        }
         let message = json!({
             "role": "user",
-            "content": [{ "type": "text", "text": text }],
+            "content": content,
             "timestamp": pi_core::ai::js_number(self.clock.date_now_ms()),
         });
         self.agent.steer(message);
     }
 
-    /// TS `_queueFollowUp(text)`.
-    pub fn queue_follow_up_internal(&mut self, text: &str) {
+    /// TS `_queueFollowUp(text, images?)`.
+    pub fn queue_follow_up_internal(&mut self, text: &str, images: Option<&[Value]>) {
         self.state.follow_up_messages.push(text.to_string());
         self.emit_queue_update();
+        let mut content = vec![json!({ "type": "text", "text": text })];
+        if let Some(images) = images {
+            content.extend(images.iter().cloned());
+        }
         let message = json!({
             "role": "user",
-            "content": [{ "type": "text", "text": text }],
+            "content": content,
             "timestamp": pi_core::ai::js_number(self.clock.date_now_ms()),
         });
         self.agent.follow_up(message);
@@ -399,7 +492,7 @@ impl AgentSession {
     /// TS `sendCustomMessage(message, options)` — the paths the events
     /// slice covers. `triggerTurn: Some(true)` needs the run pipeline
     /// (tranche 11) and is rejected here.
-    pub fn send_custom_message(
+    pub async fn send_custom_message(
         &mut self,
         custom_type: &str,
         content: Value,
@@ -437,11 +530,17 @@ impl AgentSession {
             }
         } else if trigger_turn == Some(true) {
             if self.state.is_emitting_agent_settled {
-                // TS defers a re-invocation of sendCustomMessage; the
-                // deferred-action carriers arrive with tranche 11.
-                return Err("sendCustomMessage deferred re-queueing requires the run pipeline (tranche 11)".to_string());
+                self.state.deferred_settled_actions.push(DeferredSettledAction::SendCustomMessage {
+                    custom_type: custom_type.to_string(),
+                    content: app_message.get("content").cloned().unwrap_or(Value::Null),
+                    display,
+                    details: app_message.get("details").filter(|d| !d.is_null()).cloned(),
+                    trigger_turn,
+                    deliver_as: deliver_as.map(str::to_string),
+                });
+                return Ok(());
             }
-            return Err("sendCustomMessage triggerTurn requires the run pipeline (tranche 11)".to_string());
+            self.start_run(prompt::RunTrigger::Custom { message: app_message }, None).await?;
         } else if self.is_streaming() {
             // Appending now would put the message between an assistant
             // tool call and its result; defer to the end of the turn (TS).

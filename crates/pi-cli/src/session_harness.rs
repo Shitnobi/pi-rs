@@ -392,6 +392,9 @@ pub fn run_agent_session_events_harness(args: &Value) -> Result<Value, String> {
         allowed_tool_names: None,
         excluded_tool_names: None,
         base_tools_override: None,
+        model_auth: None,
+        skills: Vec::new(),
+        prompt_templates: Vec::new(),
     });
 
     // Seed the identity arena with the pool in order (pool index == MsgId),
@@ -435,11 +438,11 @@ pub fn run_agent_session_events_harness(args: &Value) -> Result<Value, String> {
                 }
                 "queueSteer" => {
                     let text = str_field(op, "text")?;
-                    session.queue_steer_internal(&text);
+                    session.queue_steer_internal(&text, None);
                 }
                 "queueFollowUp" => {
                     let text = str_field(op, "text")?;
-                    session.queue_follow_up_internal(&text);
+                    session.queue_follow_up_internal(&text, None);
                 }
                 "setStreaming" => {
                     let flag = bool_field(op, "value")?;
@@ -474,7 +477,7 @@ pub fn run_agent_session_events_harness(args: &Value) -> Result<Value, String> {
                         details,
                         trigger_turn,
                         deliver_as.as_deref(),
-                    )?;
+                    ).await?;
                 }
                 "findPersisted" => {
                     let index = pool_index(op.get("messageIndex"), messages.len(), "invalid messageIndex")?;
@@ -484,7 +487,7 @@ pub fn run_agent_session_events_harness(args: &Value) -> Result<Value, String> {
                         .unwrap_or(Value::Null);
                 }
                 "emitAgentSettled" => {
-                    session.emit_agent_settled().await;
+                    session.emit_agent_settled().await?;
                 }
                 "waitForIdle" => {
                     let tag = str_field(op, "tag")?;

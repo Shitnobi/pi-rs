@@ -84,6 +84,45 @@ const astBase = (extra = {}) => ({
 	...extra,
 });
 
+const asp = (name, args) => ({
+	name: "agent-session-prompt/" + name,
+	tool: "agent-session-prompt",
+	args,
+});
+const ASP_NOW = 1747000000000;
+const aspHeader = () => [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }];
+const aspModel = (provider = "unknown") => ({
+	id: "m1",
+	name: "Model One",
+	api: "unknown",
+	provider,
+	baseUrl: "",
+	reasoning: false,
+	input: [],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 0,
+	maxTokens: 0,
+});
+const aspMsg = (o = {}) => ({
+	role: "assistant",
+	content: o.content ?? [{ type: "text", text: "done" }],
+	api: "unknown",
+	provider: o.provider ?? "unknown",
+	model: o.model ?? "m1",
+	usage: {
+		input: 3,
+		output: 5,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 8,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	},
+	stopReason: o.stopReason ?? "stop",
+	...(o.timestamp !== undefined ? { timestamp: o.timestamp } : {}),
+	...(o.errorMessage !== undefined ? { errorMessage: o.errorMessage } : {}),
+});
+const aspTurn = (result, events = []) => ({ events, result });
+
 export const cases = [
 	// ---------------------------------------------------------------- read
 	{ name: "read/missing", tool: "read", args: { path: "nope.txt" } },
@@ -2294,6 +2333,213 @@ export const cases = [
 			ops: [{ op: "setActiveTools", names: ["read", "thrower"] }],
 		}),
 	},
+
+	// ------------------------------------------------- agent-session-prompt
+	// Differential parity for the prompt slice of AgentSession (TS
+	// dist/core/agent-session.js ↔ crates/pi-session
+	// agent_session/prompt.rs): prompt / steer / followUp /
+	// sendUserMessage / sendCustomMessage over a real Agent with a
+	// scripted provider, extension-command dispatch, skill & template
+	// expansion, image normalization, and queueing while a run is marked
+	// active. entries[0] is the session header; provider turns are popped
+	// per LLM call with each call's llm context recorded as
+	// promptsSentToAgent; docs-path-bearing auth errors are normalized to
+	// "<docs>" on both sides; skill files are written for non-failing
+	// entries on the TS side (the Rust side reads injected content).
+	asp("missing-args", {}),
+	// Happy path: a prompt runs a full turn over the scripted provider and
+	// settles; the starting user message (timestamp from the pinned clock)
+	// and the assistant reply are persisted as new entries.
+	asp("prompt-happy-path", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		script: [
+			{ op: "prompt", text: "hello there", options: { preflightTag: "p1", source: "test" } },
+		],
+		providerTurns: [aspTurn(aspMsg())],
+	}),
+	// Model/auth validation: no model → no-model-selected; a provider with
+	// no configured key → no-API-key; OAuth mode → authentication failed.
+	// All embed the docs path (normalized to "<docs>").
+	asp("prompt-no-model", {
+		nowMs: ASP_NOW,
+		config: { entries: aspHeader() },
+		script: [{ op: "prompt", text: "hi", options: { preflightTag: "p1" } }],
+		providerTurns: [],
+	}),
+	asp("prompt-no-api-key", {
+		nowMs: ASP_NOW,
+		config: { modelAuth: { mode: "noKey" }, model: aspModel("anthropic"), entries: aspHeader() },
+		script: [{ op: "prompt", text: "hi" }],
+		providerTurns: [],
+	}),
+	asp("prompt-oauth-error", {
+		nowMs: ASP_NOW,
+		config: { modelAuth: { mode: "oauth" }, model: aspModel("anthropic"), entries: aspHeader() },
+		script: [{ op: "prompt", text: "hi" }],
+		providerTurns: [],
+	}),
+	// Queueing while a run is active (setStreaming drives
+	// _isAgentRunActive): prompt without behavior throws; with behavior
+	// (and direct steer/followUp) the message is queued; extension
+	// commands still execute immediately.
+	asp("streaming-queue", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		commands: { note: { mode: "ok" } },
+		script: [
+			{ op: "setStreaming", value: true },
+			{ op: "prompt", text: "no behavior" },
+			{ op: "prompt", text: "queued steer", options: { streamingBehavior: "steer", preflightTag: "q1" } },
+			{ op: "prompt", text: "queued follow", options: { streamingBehavior: "followUp" } },
+			{ op: "steer", text: "direct steer" },
+			{ op: "followUp", text: "direct follow" },
+			{ op: "prompt", text: "/note during stream" },
+			{ op: "prompt", text: "/unknowncmd arg" },
+		],
+		providerTurns: [],
+	}),
+	// A steer queued while "active" is re-dispatched by the next run: the
+	// first provider turn sees both the queued steering message and the
+	// fresh prompt.
+	asp("steer-requeue-on-next-run", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		script: [
+			{ op: "setStreaming", value: true },
+			{ op: "steer", text: "mid steer" },
+			{ op: "setStreaming", value: false },
+			{ op: "prompt", text: "fresh prompt" },
+		],
+		providerTurns: [aspTurn(aspMsg()), aspTurn(aspMsg())],
+	}),
+	// Extension commands: dispatch (args string after the name), error
+	// capture via emitError, unknown commands falling through to a normal
+	// run, and the cannot-queue guard in steer.
+	asp("extension-commands", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		commands: {
+			note: { mode: "ok" },
+			boom: { mode: "throw", errorText: "boom failed" },
+		},
+		script: [
+			{ op: "prompt", text: "/note hi there", options: { preflightTag: "c1" } },
+			{ op: "prompt", text: "/boom now", options: { preflightTag: "c2" } },
+			{ op: "prompt", text: "/plaincmd arg" },
+			{ op: "steer", text: "/note queued" },
+		],
+		providerTurns: [aspTurn(aspMsg())],
+	}),
+	// Skill and template expansion: /skill:name blocks (frontmatter
+	// stripped, args appended), read failures surface as emitError with
+	// the ENOENT message, unknown skills pass through, and /name template
+	// substitution runs the positional and ARGUMENTS placeholders.
+	asp("skill-template-expansion", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		templates: [{
+			name: "greet",
+			description: "Greets",
+			argumentHint: "name",
+			content: "hello $1 and all: $ARGUMENTS",
+			sourceInfo: { path: "/t/greet.md", source: "file", scope: "user", origin: "package" },
+			filePath: "/t/greet.md",
+		}],
+		skills: [
+			{
+				name: "deploy",
+				filePath: "/tmp/asp-skills/deploy.md",
+				baseDir: "/tmp/asp-skills",
+				content: "---\nname: deploy\n---\nRun the deploy steps.",
+			},
+			{
+				name: "ghost",
+				filePath: "/tmp/asp-skills/ghost.md",
+				baseDir: "/tmp/asp-skills",
+				content: "",
+				readFails: true,
+			},
+		],
+		script: [
+			{ op: "prompt", text: "/skill:deploy prod", options: { preflightTag: "s1" } },
+			{ op: "prompt", text: "/skill:ghost x" },
+			{ op: "prompt", text: "/skill:missing y" },
+			{ op: "prompt", text: "/greet world again" },
+		],
+		providerTurns: [aspTurn(aspMsg()), aspTurn(aspMsg()), aspTurn(aspMsg()), aspTurn(aspMsg())],
+	}),
+	// Image normalization (autoResize pinned false): a supported mime
+	// passes through; an unsupported mime becomes an omission hint on the
+	// prompt text.
+	asp("image-normalization", {
+		nowMs: ASP_NOW,
+		config: { settings: { imageAutoResize: false }, model: aspModel(), entries: aspHeader() },
+		script: [
+			{
+				op: "prompt",
+				text: "look",
+				options: {
+					images: [
+						{ type: "image", mimeType: "image/png", data: "aGVsbG8=" },
+						{ type: "image", mimeType: "image/bmp", data: "aGVsbG8=" },
+					],
+				},
+			},
+		],
+		providerTurns: [aspTurn(aspMsg())],
+	}),
+	// Input-handler interception: "handled" swallows the prompt
+	// (disposition handled, no run); "transform" rewrites the text and
+	// images before the run.
+	asp("input-handler-handled", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		inputHandler: { mode: "handled" },
+		script: [
+			{ op: "prompt", text: "eaten", options: { preflightTag: "h1" } },
+			{ op: "steer", text: "also eaten" },
+		],
+		providerTurns: [],
+	}),
+	asp("input-handler-transform", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		inputHandler: { mode: "transform", text: "rewritten" },
+		script: [{ op: "prompt", text: "original" }],
+		providerTurns: [aspTurn(aspMsg())],
+	}),
+	// sendUserMessage (source "extension", no template expansion): a plain
+	// string runs a turn; array content is folded to text + images.
+	asp("send-user-message", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		script: [
+			{ op: "sendUserMessage", content: "plain note" },
+			{
+				op: "sendUserMessage",
+				content: [{ type: "text", text: "array note" }, { type: "text", text: "second line" }],
+			},
+		],
+		providerTurns: [aspTurn(aspMsg()), aspTurn(aspMsg())],
+	}),
+	// sendCustomMessage with triggerTurn: the custom message itself is the
+	// run's starting message.
+	asp("send-custom-message-trigger-turn", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader() },
+		script: [
+			{
+				op: "sendCustomMessage",
+				customType: "note",
+				content: [{ type: "text", text: "ctx" }],
+				display: true,
+				details: { k: 1 },
+				triggerTurn: true,
+			},
+		],
+		providerTurns: [aspTurn(aspMsg())],
+	}),
 
 	// ------------------------------------------------------------- tui-utils
 	// Differential parity for the pure width-engine functions of the TUI
