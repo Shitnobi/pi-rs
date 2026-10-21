@@ -36,8 +36,9 @@ pub mod provider;
 ///
 /// Mirrors the TS `providers/all.ts` model lists: `MODELS`, `IMAGE_MODELS`
 /// and `CLASSIFIER_MODELS` from `models.generated.ts`, grouped by provider
-/// and api with type-prefixed model keys. Verified entry-for-entry against
-/// the TS dist (1713 models across 42 providers).
+/// and api with type-prefixed model keys. Regenerate with
+/// scripts/gen-builtin-catalog.mjs against the TS dist (1731 models across
+/// 42 providers as of 2026-10-20).
 pub fn builtin_catalog() -> Value {
 	static CATALOG: OnceLock<Value> = OnceLock::new();
 	CATALOG

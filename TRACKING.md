@@ -1109,6 +1109,17 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       reference now lives durably at /home/shinobi/pi-repo with a
       /tmp/pi-repo symlink (recreate with `ln -sfn /home/shinobi/pi-repo
       /tmp/pi-repo`); write long-running outputs under /home/shinobi.
+- [x] builtin-catalog.json refresh (2026-10-20, later): the TS reference
+      was rebuilt (fresh clone + npm run build) and packages/ai's build
+      regenerated provider data with `compat.supportsStrictMode` etc. that
+      the vendored Rust catalog (1713 entries) lacked — full parity showed
+      mr-models-all / reg-getall / reg-register-virtual failures. Fixed by
+      regenerating `builtin-catalog.json` from the current dist data via
+      new `scripts/gen-builtin-catalog.mjs` (1731 models, 42 providers,
+      entry-for-entry equal to TS; provider order taken from
+      providers/all.js import order — NOT filename sort, because '-' < '.'
+      would put google-vertex before google). model-runtime 54/54 and
+      model-registry 31/31 green again.
 - [ ] Agent-session tranches (tokio, per plan §5.5). Wave-1 spec ready:
       /home/shinobi/agent-session-wave1-spec.md (tranches 0–2: pi-agent
       skeleton, message conversion, tool-call pipeline).
