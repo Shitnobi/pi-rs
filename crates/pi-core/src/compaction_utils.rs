@@ -6,7 +6,7 @@
 
 use serde_json::{json, Map, Value};
 
-use pi_core::ai::content_text;
+use crate::ai::content_text;
 
 // ============================================================================
 // File Operation Tracking

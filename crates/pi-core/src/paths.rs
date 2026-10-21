@@ -103,7 +103,7 @@ pub fn normalize_path(input: &str, options: &PathInputOptions) -> String {
             return home;
         }
         if let Some(rest) = normalized.strip_prefix("~/") {
-            return node_join(&home, rest);
+            return node_join_2(&home, rest);
         }
     }
 
@@ -115,7 +115,7 @@ pub fn normalize_path(input: &str, options: &PathInputOptions) -> String {
 }
 
 /// Node `path.join` for two unix segments.
-fn node_join(a: &str, b: &str) -> String {
+fn node_join_2(a: &str, b: &str) -> String {
     if a.is_empty() {
         return b.to_string();
     }
@@ -151,7 +151,7 @@ pub fn resolve_path(input: &str, base_dir: &str, options: &PathInputOptions) -> 
     if normalized.starts_with('/') {
         normalize_absolute(&normalized)
     } else {
-        normalize_absolute(&node_join(&normalized_base_dir, &normalized))
+        normalize_absolute(&node_join_2(&normalized_base_dir, &normalized))
     }
 }
 
@@ -374,5 +374,30 @@ mod tests {
             "/x/Screenshot at 12.03.45\u{202F}PM.png"
         );
         assert_eq!(try_macos_screenshot_path("/x/AM. plain.txt"), "/x/AM. plain.txt");
+    }
+}
+
+/// Node `path.join` (posix flavor) for already-normalized absolute
+/// components. Absolute later parts reset the result, like Node.
+pub fn node_join(base: &str, parts: &[&str]) -> String {
+    let mut result = base.trim_end_matches('/').to_string();
+    for part in parts {
+        if part.starts_with('/') {
+            result = part.trim_end_matches('/').to_string();
+        } else if !part.is_empty() {
+            result.push('/');
+            result.push_str(part);
+        }
+    }
+    result
+}
+
+/// Node `path.dirname` for posix paths.
+pub fn node_dirname(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(idx) => trimmed[..idx].to_string(),
+        None => ".".to_string(),
     }
 }

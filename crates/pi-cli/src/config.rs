@@ -22,7 +22,7 @@
 
 use pi_core::paths::{normalize_path, PathInputOptions};
 use pi_core::text::strip_bom;
-use pi_session::config::{node_dirname, node_join};
+use pi_core::paths::{node_dirname, node_join};
 use serde::Serialize;
 use serde_json::Value;
 

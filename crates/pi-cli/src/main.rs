@@ -174,10 +174,8 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "bash-executor" => return run_bash_executor_harness(&input, cwd),
         "output-accumulator" => return run_output_accumulator_harness(&input),
         "messages" => return run_messages_harness(&input),
-        "session-manager" => return run_session_manager_harness(&input, cwd),
         "compaction-utils" => return run_compaction_utils_harness(&input),
         "compaction" => return run_compaction_harness(&input),
-        "nested-calls" => return run_nested_calls_harness(&input),
         "agent" => return agent_harness::run_agent_harness(&input, std::path::Path::new(cwd)),
         "agent-queue" => {
             return agent_harness::run_agent_queue_harness(&input, std::path::Path::new(cwd))
@@ -1591,126 +1589,10 @@ fn run_messages_harness(input: &Value) -> Result<Value, String> {
     }
 }
 
-/// Drive pi-session `session_manager.rs` functions (mirrors
-/// dist/core/session-manager.js). Relative paths in args are resolved against
-/// the harness cwd, matching the TS harness's `path.resolve(cwd, ...)`.
-/// `normalize_id8_strings` deep-rewrites string values that are exactly 8
-/// lowercase hex chars (generated entry ids) to `<id8>`, mirroring the TS
-/// harness's post-migration rewrite in the `migrateSessionEntries` arm.
-fn normalize_id8_strings(value: &mut Value) {
-    match value {
-        Value::String(s) => {
-            let b = s.as_bytes();
-            if b.len() == 8 && b.iter().all(|&c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
-                *s = "<id8>".to_string();
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                normalize_id8_strings(item);
-            }
-        }
-        Value::Object(map) => {
-            for v in map.values_mut() {
-                normalize_id8_strings(v);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn run_session_manager_harness(input: &Value, cwd: &str) -> Result<Value, String> {
-    use pi_core::paths::{resolve_path, PathInputOptions};
-    use pi_session::session_manager as sm;
-    use pi_session::session_manager::leaf_spec_from_value;
-
-    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
-    let entries_arg = || -> Result<Vec<Value>, String> {
-        input["entries"]
-            .as_array()
-            .cloned()
-            .ok_or_else(|| "missing entries".to_string())
-    };
-    let leaf = leaf_spec_from_value(input.get("leafId"));
-    match fn_name {
-        "assertValidSessionId" => {
-            let id = input["id"].as_str().ok_or("missing id")?;
-            match sm::assert_valid_session_id(id) {
-                Ok(()) => Ok(serde_json::json!({ "valid": true })),
-                Err(e) => Ok(serde_json::json!({ "error": e })),
-            }
-        }
-        "migrateSessionEntries" => {
-            let mut entries = entries_arg()?;
-            sm::migrate_session_entries(&mut entries);
-            // Both sides emit random 8-hex entry ids (the dist imports
-            // randomUUID as ESM, invisible to the harness crypto override),
-            // so normalize them on both sides.
-            for entry in &mut entries {
-                normalize_id8_strings(entry);
-            }
-            Ok(serde_json::json!({ "entries": entries }))
-        }
-        "parseSessionEntries" => {
-            let content = input["content"].as_str().ok_or("missing content")?;
-            Ok(serde_json::json!({ "entries": sm::parse_session_entries(content) }))
-        }
-        "getLatestCompactionEntry" => {
-            let entries = entries_arg()?;
-            Ok(serde_json::json!({ "entry": sm::get_latest_compaction_entry(&entries) }))
-        }
-        "sessionEntryToContextMessages" => {
-            let entry = input["entry"].clone();
-            if entry.is_null() {
-                return Err("missing entry".to_string());
-            }
-            Ok(serde_json::json!({ "messages": sm::session_entry_to_context_messages(&entry) }))
-        }
-        "buildContextEntries" => {
-            let entries = entries_arg()?;
-            Ok(serde_json::json!({ "entries": sm::build_context_entries(&entries, &leaf) }))
-        }
-        "buildSessionProjection" => {
-            let entries = entries_arg()?;
-            Ok(sm::build_session_projection(&entries, &leaf).to_value())
-        }
-        "buildSessionContext" => {
-            let entries = entries_arg()?;
-            Ok(sm::build_session_context(&entries, &leaf))
-        }
-        "getDefaultSessionDir" => {
-            let cwd_arg = input["cwd"].as_str().ok_or("missing cwd")?;
-            let agent_dir = match input.get("agentDir").filter(|v| !v.is_null()) {
-                Some(v) => {
-                    let dir = v.as_str().ok_or("agentDir must be a string")?;
-                    Some(resolve_path(dir, cwd, &PathInputOptions::default()))
-                }
-                None => None,
-            };
-            let dir = sm::get_default_session_dir(cwd_arg, agent_dir.as_deref())?;
-            Ok(serde_json::json!({ "dir": dir }))
-        }
-        "loadEntriesFromFile" => {
-            let file_path = input["filePath"].as_str().ok_or("missing filePath")?;
-            let resolved = resolve_path(file_path, cwd, &PathInputOptions::default());
-            let entries = sm::load_entries_from_file(&resolved)?;
-            Ok(serde_json::json!({ "entries": entries }))
-        }
-        "findMostRecentSession" => {
-            let session_dir = input["sessionDir"].as_str().ok_or("missing sessionDir")?;
-            let resolved = resolve_path(session_dir, cwd, &PathInputOptions::default());
-            let cwd_arg = input.get("cwd").filter(|v| !v.is_null()).and_then(Value::as_str);
-            let path = sm::find_most_recent_session(&resolved, cwd_arg);
-            Ok(serde_json::json!({ "path": path }))
-        }
-        other => Err(format!("unknown session-manager fn: {}", other)),
-    }
-}
-
 /// Drive pi-session `compaction_utils.rs` (mirrors
 /// dist/core/compaction/utils.js).
 fn run_compaction_utils_harness(input: &Value) -> Result<Value, String> {
-    use pi_session::compaction_utils as cu;
+    use pi_core::compaction_utils as cu;
 
     let fn_name = input["fn"].as_str().ok_or("missing fn")?;
     match fn_name {
@@ -1754,8 +1636,8 @@ fn run_compaction_utils_harness(input: &Value) -> Result<Value, String> {
 /// Drive pi-session `compaction.rs` (mirrors
 /// dist/core/compaction/compaction.js).
 fn run_compaction_harness(input: &Value) -> Result<Value, String> {
-    use pi_session::compaction as c;
-    use pi_session::session_manager::{build_session_projection, LeafSpec};
+    use pi_core::compaction as c;
+    use pi_core::session_manager::{build_session_projection, LeafId};
 
     let fn_name = input["fn"].as_str().ok_or("missing fn")?;
     let entries_arg = || -> Result<Vec<Value>, String> {
@@ -1782,7 +1664,7 @@ fn run_compaction_harness(input: &Value) -> Result<Value, String> {
         "estimateProjectedContextTokens" => {
             let entries = entries_arg()?;
             let branch_entries = entries_arg()?;
-            let projection = build_session_projection(&entries, &LeafSpec::Latest);
+            let projection = build_session_projection(&entries, LeafId::Unset, None);
             Ok(serde_json::json!({ "result": c::estimate_projected_context_tokens(&projection, &branch_entries).to_value() }))
         }
         "shouldCompact" => {
@@ -1825,64 +1707,6 @@ fn run_compaction_harness(input: &Value) -> Result<Value, String> {
             Ok(serde_json::json!({ "result": c::prepare_compaction(&entries, &settings).unwrap_or(Value::Null) }))
         }
         other => Err(format!("unknown compaction fn: {}", other)),
-    }
-}
-
-/// Drive pi-session `nested_tool_calls.rs` (mirrors
-/// dist/core/nested-tool-calls.js).
-fn run_nested_calls_harness(input: &Value) -> Result<Value, String> {
-    use pi_session::nested_tool_calls as nc;
-
-    let fn_name = input["fn"].as_str().ok_or("missing fn")?;
-    match fn_name {
-        "limits" => Ok(serde_json::json!({ "result": nc::nested_call_limits() })),
-        "recorder" => {
-            let empty: Vec<Value> = Vec::new();
-            let ops = input["ops"].as_array().unwrap_or(&empty);
-            let mut recorder = nc::NestedCallRecorder::new();
-            let mut results: Vec<Value> = Vec::new();
-            for op in ops {
-                match op["op"].as_str().unwrap_or("") {
-                    "start" => {
-                        let index = recorder.start(&op["toolCall"]);
-                        results.push(serde_json::json!({ "index": match index {
-                            Some(i) => serde_json::json!(i),
-                            None => Value::Null,
-                        } }));
-                    }
-                    "finish" => {
-                        let index = op["index"].as_u64().map(|v| v as usize);
-                        let is_error = op["isError"].as_bool().unwrap_or(false);
-                        let error = op["error"].as_str().unwrap_or("");
-                        recorder.finish(index, is_error, error);
-                        results.push(serde_json::json!({}));
-                    }
-                    "addUsage" => {
-                        recorder.add_usage(&op["usage"]);
-                        results.push(serde_json::json!({}));
-                    }
-                    "totalUsage" => {
-                        results.push(serde_json::json!({ "result": recorder.total_usage().unwrap_or(Value::Null) }));
-                    }
-                    "snapshot" => {
-                        let snap = recorder.snapshot().map(|mut s| {
-                            if let Some(calls) = s["calls"].as_array_mut() {
-                                for call in calls {
-                                    if call.get("durationMs").is_some() {
-                                        call["durationMs"] = serde_json::json!(0);
-                                    }
-                                }
-                            }
-                            s
-                        });
-                        results.push(serde_json::json!({ "result": snap.unwrap_or(Value::Null) }));
-                    }
-                    other => return Err(format!("unknown nested-calls op: {}", other)),
-                }
-            }
-            Ok(serde_json::json!({ "results": results }))
-        }
-        other => Err(format!("unknown nested-calls fn: {}", other)),
     }
 }
 

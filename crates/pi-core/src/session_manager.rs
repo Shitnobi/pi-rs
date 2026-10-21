@@ -226,7 +226,7 @@ fn js_trim(s: &str) -> &str {
     s.trim_matches(is_js_whitespace)
 }
 
-fn js_truthy(v: Option<&Value>) -> bool {
+pub(crate) fn js_truthy(v: Option<&Value>) -> bool {
     match v {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,

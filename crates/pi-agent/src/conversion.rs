@@ -2,7 +2,7 @@
 //! (`declareToolChanges`, `withToolChanges`), the `defaultConvertToLlm`
 //! filter from `agent.ts`, and `estimateMessagesTokens` from
 //! `coding-agent/src/core/agent-session.ts` (the compaction `estimateTokens`
-//! arithmetic, already ported in `pi-session`).
+//! arithmetic, already ported in `pi-core`).
 
 use serde_json::{Map, Value};
 
@@ -123,7 +123,7 @@ pub fn default_convert_to_llm(messages: &[Value]) -> Vec<Value> {
 pub fn estimate_messages_tokens(messages: &[Value]) -> i64 {
     let mut tokens = 0.0f64;
     for message in messages {
-        tokens += pi_session::compaction::estimate_tokens(message);
+        tokens += pi_core::compaction::estimate_tokens(message);
     }
     tokens as i64
 }

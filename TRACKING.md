@@ -1140,10 +1140,30 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
   - JS-semantics traps recorded in commit messages: first-position key
     order, undefined-omitted JSON, first-position spread order,
     Promise.all sequential join, f64 rounding for durationMs.
-- [ ] Remaining agent-session tranches 6–19 (phase3-agent-session.md):
-      file mutation queue, nested tool-call runner, session event
-      handling, tool registry, prompt pipeline, run orchestration,
-      compaction, retry, model/thinking, bash, tree navigation, stats,
-      runtime, services+event-bus. **Before tranche 8:** reconcile the
-      two parallel session-manager ports (crates/pi-session vs
-      crates/pi-core).
+- [x] **Session-manager port reconciled — pi-core is canonical; the
+      pi-session crate is deleted.** Duplicate history: pi-session
+      (Oct 16, 3ae4404) ported session-manager.ts + compaction + a
+      partial nested-calls recorder (Value-based, ambient std::env
+      reads); the Oct-20 core wave (7bddbaa/171de2b) re-ported
+      session-manager.ts + the FULL nested-tool-calls module (runner
+      included) into pi-core with Generators injection and no ambient
+      state — more complete, so it wins.
+      Compaction + compaction_utils moved into pi-core, adapted to the
+      typed pi-core SessionProjection (Value-form helpers
+      projected_entry_values / projection_messages_values /
+      entry_context_messages keep the algorithm code unchanged);
+      node_join/node_dirname moved to pi-core::paths (private 2-arg
+      node_join renamed node_join_2); js_truthy made pub(crate);
+      pi-agent's estimate_tokens now resolves through pi-core; pi-agent
+      and pi-cli dropped their pi-session deps; crate removed from the
+      workspace. Superseded harness entries session-manager (62 cases)
+      and nested-calls (12) deleted — covered by sess-manager (129) and
+      nested-tool-calls (28); compaction (44) and compaction-utils (18)
+      entries now drive the pi-core modules. Tranche 7's runner is
+      thereby already ported; only agent-loop integration remains.
+- [ ] Remaining agent-session tranches (phase3-agent-session.md): file
+      mutation queue (tranche 6), then AgentSession slices 8–17 (events,
+      tools, prompt, run, retry, compaction, model, bash, tree, stats)
+      and 18–19 (runtime, services+event-bus). The future AgentSession
+      crate (recreate pi-session or extend pi-agent) depends on
+      pi-core + pi-agent + pi-providers.

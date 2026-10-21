@@ -9,15 +9,40 @@ use std::collections::HashSet;
 
 use serde_json::{json, Map, Value};
 
-use pi_core::ai::{get_current_system_message, js_number};
+use crate::ai::{get_current_system_message, js_number};
+use crate::session_manager::{build_session_projection, js_truthy, session_entry_to_context_messages, LeafId, SessionProjection};
 
 use crate::compaction_utils::{
     create_file_ops, extract_file_ops_from_message, js_str_len, js_stringify, FileOperations,
 };
-use crate::session_manager::{
-    build_session_projection, js_truthy, session_entry_to_context_messages, LeafSpec,
-    SessionProjection,
-};
+
+/// Value form of one projected entry: `{sourceEntry, messages}` — the JSON
+/// shape the TS `buildSessionProjection` produces.
+fn projected_entry_values(projection: &SessionProjection) -> Vec<Value> {
+    projection
+        .entries
+        .iter()
+        .map(|e| json!({ "sourceEntry": e.source_entry, "messages": e.messages }))
+        .collect()
+}
+
+/// Value form of `sessionEntryToContextMessages` (typed [`AgentMessage`]s
+/// serialized back to their JSON wire shape).
+fn entry_context_messages(entry: &Value) -> Vec<Value> {
+    session_entry_to_context_messages(entry)
+        .iter()
+        .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+        .collect()
+}
+
+/// Value form of the projection's model-visible messages.
+fn projection_messages_values(projection: &SessionProjection) -> Vec<Value> {
+    projection
+        .messages
+        .iter()
+        .map(|m| serde_json::to_value(m).unwrap_or(Value::Null))
+        .collect()
+}
 
 // ============================================================================
 // File Operation Tracking
@@ -251,11 +276,13 @@ pub fn estimate_projected_context_tokens(
     projection: &SessionProjection,
     branch_entries: &[Value],
 ) -> ContextUsageEstimate {
-    let estimate = estimate_context_tokens(&projection.messages);
+    let projection_messages = projection_messages_values(projection);
+    let projected_entries = projected_entry_values(projection);
+    let estimate = estimate_context_tokens(&projection_messages);
     if let Some(last_usage_index) = estimate.last_usage_index {
         let mut projected_message_index = 0usize;
         let mut usage_entry_id: Option<&str> = None;
-        for entry in &projection.entries {
+        for entry in &projected_entries {
             let entry_len = entry["messages"].as_array().map_or(0, Vec::len);
             let next_message_index = projected_message_index + entry_len;
             if last_usage_index < next_message_index {
@@ -284,11 +311,11 @@ pub fn estimate_projected_context_tokens(
         }
     }
 
-    let current_system = get_current_system_message(&projection.messages);
+    let current_system = get_current_system_message(&projection_messages);
     let mut tokens = current_system
         .as_ref()
         .map_or(0.0, estimate_tokens);
-    for message in &projection.messages {
+    for message in &projection_messages {
         if message["role"] != "system" {
             tokens += estimate_tokens(message);
         }
@@ -418,7 +445,7 @@ fn is_turn_start_entry(entry: &Value) -> bool {
     if entry["type"] == "compaction" {
         return false;
     }
-    session_entry_to_context_messages(entry)
+    entry_context_messages(entry)
         .iter()
         .any(is_turn_start_message)
 }
@@ -431,7 +458,7 @@ fn find_valid_cut_points(entries: &[Value], start_index: usize, end_index: usize
         if entry["type"] == "compaction" {
             continue;
         }
-        if session_entry_to_context_messages(entry).iter().any(is_cut_point_message) {
+        if entry_context_messages(entry).iter().any(is_cut_point_message) {
             cut_points.push(i);
         }
     }
@@ -497,7 +524,7 @@ pub fn find_cut_point(
     'outer: for i in (start_index..end_index).rev() {
         let entry = &entries[i];
         let mut message_tokens = 0.0;
-        for message in session_entry_to_context_messages(entry) {
+        for message in entry_context_messages(entry) {
             message_tokens += estimate_tokens(&message);
         }
         if message_tokens == 0.0 {
@@ -522,7 +549,7 @@ pub fn find_cut_point(
     while cut_index > start_index {
         let prev_entry = &entries[cut_index - 1];
         if prev_entry["type"] == "compaction"
-            || !session_entry_to_context_messages(prev_entry).is_empty()
+            || !entry_context_messages(prev_entry).is_empty()
         {
             break;
         }
@@ -596,7 +623,7 @@ fn find_projected_turn_start_index(entries: &[Value], entry_index: usize, start_
 
 fn is_intrinsically_visible(entry: &Value) -> bool {
     entry["sourceEntry"]["type"] != "context_edit"
-        && !session_entry_to_context_messages(&entry["sourceEntry"]).is_empty()
+        && !entry_context_messages(&entry["sourceEntry"]).is_empty()
 }
 
 fn is_omitted(entry: &Value) -> bool {
@@ -718,8 +745,8 @@ pub fn prepare_compaction(path_entries: &[Value], settings: &CompactionSettings)
         }
     }
 
-    let projection = build_session_projection(path_entries, &LeafSpec::Latest);
-    let projected_entries = &projection.entries;
+    let projection = build_session_projection(path_entries, LeafId::Unset, None);
+    let projected_entries = projected_entry_values(&projection);
     let source_entries: Vec<Value> = projected_entries
         .iter()
         .map(|entry| entry["sourceEntry"].clone())
@@ -749,7 +776,7 @@ pub fn prepare_compaction(path_entries: &[Value], settings: &CompactionSettings)
     let boundary_end = projected_entries.len();
     let tokens_before = estimate_projected_context_tokens(&projection, path_entries).tokens;
     let cut_point = find_projected_cut_point(
-        projected_entries,
+        &projected_entries,
         boundary_start,
         boundary_end,
         settings.keep_recent_tokens,

@@ -34,3 +34,5 @@ pub mod diagnostics;
 pub mod settings_manager;
 pub mod prompt_templates;
 pub mod skills;
+pub mod compaction;
+pub mod compaction_utils;

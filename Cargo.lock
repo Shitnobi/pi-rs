@@ -456,7 +456,6 @@ dependencies = [
  "fancy-regex",
  "pi-core",
  "pi-providers",
- "pi-session",
  "serde",
  "serde_json",
  "tokio",
@@ -469,7 +468,6 @@ dependencies = [
  "pi-agent",
  "pi-core",
  "pi-providers",
- "pi-session",
  "pi-tools",
  "pi-tui",
  "serde",
@@ -501,15 +499,6 @@ dependencies = [
  "indexmap",
  "pi-core",
  "pi-tools",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "pi-session"
-version = "0.1.0"
-dependencies = [
- "pi-core",
  "serde",
  "serde_json",
 ]

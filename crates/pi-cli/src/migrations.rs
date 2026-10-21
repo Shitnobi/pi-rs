@@ -20,7 +20,7 @@ use serde_json::{Map, Value};
 
 use crate::cli::js_trim;
 use crate::config::{get_agent_dir, get_bin_dir, CONFIG_DIR_NAME, EnvProvider, FsProvider};
-use pi_session::config::{node_dirname, node_join};
+use pi_core::paths::{node_dirname, node_join};
 use serde::Serialize;
 
 pub const MIGRATION_GUIDE_URL: &str =
