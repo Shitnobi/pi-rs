@@ -11126,3 +11126,210 @@ cases.push(
 		],
 	}),
 );
+
+// ======================================================= agent-session-tree
+// The tree-navigation slice of AgentSession (navigateTree /
+// abortBranchSummary / getUserMessagesForForking) over a scripted provider
+// (the same providerTurns script drives the branch-summary summarizer
+// model call). extensionHandlers configures the fake extension runner
+// (session_before_tree handlers may cancel, provide a summary, override
+// instructions/label, or abort the in-flight branch summary).
+const asth = (name, args) => ({
+	name: "agent-session-tree/" + name,
+	tool: "agent-session-tree",
+	args: {
+		...args,
+		config: { systemPrompt: "You are the parity assistant.", ...(args.config ?? {}) },
+	},
+});
+const ASTH_NOW = 1749000000000;
+const asthIso = (ms) => new Date(ms).toISOString();
+const asthHeader = () => [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }];
+const asthModel = {
+	id: "m-asth",
+	name: "Tree Model",
+	api: "anthropic",
+	provider: "anthropic",
+	baseUrl: "",
+	reasoning: false,
+	input: [],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	contextWindow: 100000,
+	maxTokens: 8192,
+};
+const asthUsage = (o = {}) => ({
+	input: o.input ?? 0,
+	output: o.output ?? 0,
+	cacheRead: o.cacheRead ?? 0,
+	cacheWrite: o.cacheWrite ?? 0,
+	totalTokens: o.totalTokens ?? 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+});
+const asthUserEntry = (id, parentId, text, ms) => ({
+	type: "message",
+	id,
+	parentId,
+	timestamp: asthIso(ms),
+	message: { role: "user", content: [{ type: "text", text }], timestamp: ms },
+});
+const asthAsstEntry = (id, parentId, text, ms) => ({
+	type: "message",
+	id,
+	parentId,
+	timestamp: asthIso(ms),
+	message: { role: "assistant", content: [{ type: "text", text }], timestamp: ms },
+});
+// s-root -> u1 -> a1 -> u2 -> a2 (leaf) with sibling a1b under u1.
+const asthSeed = () => [
+	...asthHeader(),
+	asthUserEntry("u1", "s-root", "first question", ASTH_NOW - 5000),
+	asthAsstEntry("a1", "u1", "first answer", ASTH_NOW - 4000),
+	asthAsstEntry("a1b", "u1", "alternate answer", ASTH_NOW - 3500),
+	asthUserEntry("u2", "a1", "second question", ASTH_NOW - 3000),
+	asthAsstEntry("a2", "u2", "second answer", ASTH_NOW - 2000),
+];
+const asthSummarizerTurn = () => ({
+	events: [],
+	result: {
+		role: "assistant",
+		content: [{ type: "text", text: "Branch summary." }],
+		api: "anthropic",
+		provider: "anthropic",
+		model: "m-asth",
+		usage: asthUsage({ input: 9, output: 13, totalTokens: 22 }),
+		stopReason: "stop",
+		timestamp: ASTH_NOW,
+	},
+});
+cases.push(
+	asth("missing-args", {}),
+	asth("missing-script", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthHeader() },
+	}),
+	asth("unknown-op", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [{ op: "bogus" }],
+		providerTurns: [],
+	}),
+	asth("missing-targetid", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [{ op: "navigateTree", options: {} }],
+		providerTurns: [],
+	}),
+	// Navigating to the current leaf is a no-op: {cancelled:false} with no
+	// extension events and no entry changes.
+	asth("navigate-noop", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [{ op: "navigateTree", targetId: "a2" }],
+		providerTurns: [],
+	}),
+	// Navigate to an ancestor user message: editorText is restored from the
+	// message content, new leaf is the user entry's parent, session_tree
+	// event fires.
+	asth("navigate-to-ancestor-user", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [{ op: "navigateTree", targetId: "u2", options: { summarize: false } }],
+		providerTurns: [],
+	}),
+	// Navigate to a sibling branch (assistant entry): leaf becomes the
+	// target entry itself, no editorText.
+	asth("navigate-to-sibling-assistant", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [{ op: "navigateTree", targetId: "a1b", options: { summarize: false } }],
+		providerTurns: [],
+	}),
+	// Navigate to the root user with summarize:true: the branch summarizer
+	// consumes one provider turn and a branch_summary entry is appended.
+	asth("branch-summary-generation", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [{ op: "navigateTree", targetId: "u1", options: { summarize: true, label: "focus" } }],
+		providerTurns: [asthSummarizerTurn()],
+	}),
+	// Custom instructions flow into the summarizer prompt.
+	asth("branch-summary-custom-instructions", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [
+			{
+				op: "navigateTree",
+				targetId: "u1",
+				options: { summarize: true, customInstructions: "Emphasize decisions." },
+			},
+		],
+		providerTurns: [asthSummarizerTurn()],
+	}),
+	// A session_before_tree handler aborts the in-flight branch summary.
+	asth("branch-summary-abort", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [{ op: "navigateTree", targetId: "u1", options: { summarize: true } }],
+		providerTurns: [asthSummarizerTurn()],
+		extensionHandlers: { session_before_tree: [{ abortBranchSummary: true }] },
+	}),
+	// A session_before_tree handler cancels navigation outright.
+	asth("extension-cancel", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [{ op: "navigateTree", targetId: "u1", options: { summarize: false } }],
+		providerTurns: [],
+		extensionHandlers: { session_before_tree: [{ cancel: true }] },
+	}),
+	// A session_before_tree handler supplies the summary (no provider call).
+	asth("extension-summary", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [{ op: "navigateTree", targetId: "u1", options: { summarize: true } }],
+		providerTurns: [],
+		extensionHandlers: {
+			session_before_tree: [
+				{
+					summary: {
+						summary: "Hook summary.",
+						details: { readFiles: ["/proj/a.ts"], modifiedFiles: ["/proj/b.ts"] },
+						usage: asthUsage({ input: 4, output: 6, totalTokens: 10 }),
+					},
+					label: "hooked",
+				},
+			],
+		},
+	}),
+	asth("invalid-target", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [{ op: "navigateTree", targetId: "nope" }],
+		providerTurns: [],
+	}),
+	asth("navigate-while-streaming", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [
+			{ op: "setStreaming", value: true },
+			{ op: "navigateTree", targetId: "u1", options: { summarize: false } },
+			{ op: "isCompacting" },
+		],
+		providerTurns: [],
+	}),
+	asth("no-model-summarize", {
+		nowMs: ASTH_NOW,
+		config: { model: null, entries: asthSeed() },
+		script: [{ op: "navigateTree", targetId: "u1", options: { summarize: true } }],
+		providerTurns: [],
+	}),
+	asth("user-messages-for-forking", {
+		nowMs: ASTH_NOW,
+		config: { model: asthModel, entries: asthSeed() },
+		script: [
+			{ op: "getUserMessagesForForking" },
+			{ op: "isCompacting" },
+			{ op: "waitForIdle" },
+		],
+		providerTurns: [],
+	}),
+);

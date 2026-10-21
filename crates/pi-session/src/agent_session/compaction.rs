@@ -93,10 +93,20 @@ pub(crate) struct SummarizerCtx {
     pub uuid_v7: pi_core::session_manager::UuidGen,
     pub now_ms: i64,
     pub sleeper: Arc<dyn Sleeper>,
-    pub reason: String,
+    /// The `summarization_retry_attempt_start` source fields
+    /// (`{source: "compaction", reason}` or `{source: "branchSummary"}`).
+    pub attempt_start_source: Value,
     pub signal: AbortHandle,
-    /// TS `customInstructions` — the manual-compaction focus text.
+    /// TS `customInstructions` — the manual-compaction focus text (also the
+    /// branch-summary focus text on the tree slice).
     pub custom_instructions: Option<String>,
+    /// Branch-summary-only: `replaceInstructions` (prompt build) and the
+    /// `reserveTokens` budget. Compaction passes `false` / `0`.
+    pub replace_instructions: bool,
+    pub reserve_tokens: f64,
+    /// Whether the request options include the `reasoning` thinking level
+    /// (compaction does; branch summaries pass no thinking level).
+    pub include_reasoning: bool,
 }
 
 /// `convertToLlm(currentMessages)` — parse the JSON messages back into the
@@ -110,21 +120,12 @@ fn to_agent_messages(messages: &[Value]) -> Vec<pi_core::messages::AgentMessage>
         .collect()
 }
 
-/// `completeSummarization` — the shared retry-wrapped LLM call.
-/// Returns `(text, usage)`.
-async fn run_summarizer(
+/// `completeSummarization` — the shared retry-wrapped LLM call, returning
+/// the raw response message (post-failure checks are the callers').
+pub(super) async fn run_summarizer_raw(
     ctx: &SummarizerCtx,
-    prompt_text: &str,
-    label: &str,
-    tool_call_error: &str,
-) -> Result<(String, Value), String> {
-    // `buildSummarizationContext` — `normalizeContext({ systemPrompt, messages })`.
-    let context = json!({
-        "messages": [
-            { "role": "system", "content": SUMMARIZATION_SYSTEM_PROMPT, "timestamp": 0 },
-            { "role": "user", "content": [{ "type": "text", "text": prompt_text }], "timestamp": js_number(ctx.now_ms as f64) },
-        ],
-    });
+    context: &Value,
+) -> Result<Value, String> {
     // `createSummarizationOptions` + the `cacheRetention: "none"` /
     // `sessionId: options.sessionId ?? uuidv7()` wrapper.
     let mut options = Map::new();
@@ -137,7 +138,8 @@ async fn run_summarizer(
     if let Some(env) = &ctx.env {
         options.insert("env".to_string(), env.clone());
     }
-    if ctx.model.get("reasoning").and_then(Value::as_bool).unwrap_or(false)
+    if ctx.include_reasoning
+        && ctx.model.get("reasoning").and_then(Value::as_bool).unwrap_or(false)
         && !ctx.thinking_level.is_empty()
         && ctx.thinking_level != "off"
     {
@@ -200,14 +202,35 @@ async fn run_summarizer(
             aborted.insert("stopReason".to_string(), json!("aborted"));
             break Value::Object(aborted);
         }
-        ctx.events.lock().expect("summarization events").push(json!({
-            "type": "summarization_retry_attempt_start",
-            "source": "compaction",
-            "reason": ctx.reason,
-        }));
+        let mut event = Map::new();
+        event.insert("type".to_string(), json!("summarization_retry_attempt_start"));
+        if let Some(source) = ctx.attempt_start_source.as_object() {
+            for (key, value) in source {
+                event.insert(key.clone(), value.clone());
+            }
+        }
+        ctx.events.lock().expect("summarization events").push(Value::Object(event));
         last_retry = Some((attempt, error_message));
     };
+    Ok(response)
+}
 
+/// `completeSummarization` + the compaction-side failure checks — the
+/// retry-wrapped LLM call returning `(text, usage)`.
+async fn run_summarizer(
+    ctx: &SummarizerCtx,
+    prompt_text: &str,
+    label: &str,
+    tool_call_error: &str,
+) -> Result<(String, Value), String> {
+    // `buildSummarizationContext` — `normalizeContext({ systemPrompt, messages })`.
+    let context = json!({
+        "messages": [
+            { "role": "system", "content": SUMMARIZATION_SYSTEM_PROMPT, "timestamp": 0 },
+            { "role": "user", "content": [{ "type": "text", "text": prompt_text }], "timestamp": js_number(ctx.now_ms as f64) },
+        ],
+    });
+    let response = run_summarizer_raw(ctx, &context).await?;
     if let Some(failure) = pi_core::compaction::get_summarization_failure(&response, label) {
         return Err(failure);
     }
@@ -223,7 +246,7 @@ async fn run_summarizer(
     Ok((text, usage))
 }
 
-fn push_retry_finished(ctx: &SummarizerCtx) {
+pub(super) fn push_retry_finished(ctx: &SummarizerCtx) {
     ctx.events.lock().expect("summarization events").push(json!({
         "type": "summarization_retry_finished",
     }));
@@ -351,7 +374,7 @@ async fn compact_driver(ctx: &SummarizerCtx, preparation: &Value) -> Result<Valu
 impl AgentSession {
     /// TS `_getSummarizationRequestAuth` (see module docs for the
     /// divergences: no virtual-model routing, no streamSimple branch).
-    fn get_summarization_request_auth(&self, model: &Value) -> SummarizerAuth {
+    pub(super) fn get_summarization_request_auth(&self, model: &Value) -> SummarizerAuth {
         let thinking_level = self.agent.thinking_level();
         match self.model_auth.as_ref().and_then(|auth| auth.get_auth(model)) {
             None => SummarizerAuth {
@@ -384,7 +407,7 @@ impl AgentSession {
     }
 
     /// Drain the buffered summarization-retry events (see module docs).
-    fn flush_summarization_events(&mut self) {
+    pub(super) fn flush_summarization_events(&mut self) {
         let events: Vec<Value> =
             std::mem::take(self.state.summarization_events.lock().expect("summarization events").as_mut());
         for event in events {
@@ -414,9 +437,12 @@ impl AgentSession {
             uuid_v7: self.session_manager.generators().uuid_v7_gen(),
             now_ms: self.clock.date_now_ms() as i64,
             sleeper: Arc::clone(&self.sleeper),
-            reason: reason.to_string(),
+            attempt_start_source: json!({ "source": "compaction", "reason": reason }),
             signal: signal.clone(),
             custom_instructions: custom_instructions.map(str::to_string),
+            replace_instructions: false,
+            reserve_tokens: 0.0,
+            include_reasoning: true,
         };
         let result = compact_driver(&ctx, preparation).await;
         self.flush_summarization_events();
@@ -685,11 +711,12 @@ impl AgentSession {
         }
     }
 
-    /// TS `get isCompacting` (branch summarization is tranche 16, so its
-    /// controller is absent here).
+    /// TS `get isCompacting` (manual + auto compaction controllers and the
+    /// branch-summary controller, tranche 16).
     pub fn is_compacting(&self) -> bool {
         self.state.compaction_abort.lock().expect("compaction abort").is_some()
             || self.state.auto_compaction_abort.lock().expect("auto compaction abort").is_some()
+            || self.state.branch_summary_abort.lock().expect("branch summary abort").is_some()
     }
 
     /// Harness seam: the shared abort tap for extension fakes that call

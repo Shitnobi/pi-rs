@@ -15,6 +15,7 @@ pub mod prompt;
 pub mod retry;
 pub mod run;
 pub mod system_prompt;
+pub mod tree;
 pub mod tools;
 
 use std::collections::{HashMap, HashSet};
@@ -73,6 +74,13 @@ pub trait SessionSettingsStore: Send + Sync {
     /// TS `settingsManager.getShellPath()` (bash slice).
     fn shell_path(&self) -> Option<String> {
         None
+    }
+    /// TS `settingsManager.getBranchSummarySettings()` (tree slice).
+    fn branch_summary_settings(&self) -> pi_core::settings_manager::BranchSummarySettings {
+        pi_core::settings_manager::BranchSummarySettings {
+            reserve_tokens: 16384.0,
+            skip_prompt: false,
+        }
     }
 }
 
@@ -160,6 +168,15 @@ pub trait ExtensionHost: Send + Sync {
     /// `SessionBeforeCompactResult` (`{ cancel?, compaction? }`).
     /// Default: no handlers (the result of an emission to zero handlers).
     fn emit_session_before_compact<'a>(
+        &'a self,
+        _event: Value,
+    ) -> pi_agent::types::BoxFuture<'a, Option<Value>> {
+        Box::pin(async { None })
+    }
+    /// TS `emit({ type: "session_before_tree", ... })` → the
+    /// `SessionBeforeTreeResult` (`{ cancel?, summary?, customInstructions?,
+    /// replaceInstructions?, label? }`). Default: no handlers.
+    fn emit_session_before_tree<'a>(
         &'a self,
         _event: Value,
     ) -> pi_agent::types::BoxFuture<'a, Option<Value>> {
@@ -348,6 +365,9 @@ struct SessionState {
     compaction_abort: Arc<Mutex<Option<AbortHandle>>>,
     /// TS `_autoCompactionAbortController` (shared).
     auto_compaction_abort: Arc<Mutex<Option<AbortHandle>>>,
+    /// TS `_branchSummaryAbortController` (shared —
+    /// [`AgentSession::branch_summary_abort_tap`]).
+    branch_summary_abort: Arc<Mutex<Option<AbortHandle>>>,
     /// Buffered summarization-retry events (see `compaction` module docs).
     summarization_events: Arc<Mutex<Vec<Value>>>,
     /// TS `_retryAbortController` (shared — the harness fires
@@ -465,6 +485,7 @@ impl AgentSession {
                 failed_response: None,
                 compaction_abort: Arc::new(Mutex::new(None)),
                 auto_compaction_abort: Arc::new(Mutex::new(None)),
+                branch_summary_abort: Arc::new(Mutex::new(None)),
                 summarization_events: Arc::new(Mutex::new(Vec::new())),
                 retry_abort: Arc::new(Mutex::new(None)),
                 scoped_models: config.scoped_models,
@@ -599,9 +620,7 @@ impl AgentSession {
     /// TS `get isIdle` (`!_isAgentRunActive && !isCompacting`;
     /// compaction controllers are tranche 13).
     pub fn is_idle(&self) -> bool {
-        !self.state.is_agent_run_active.load(Ordering::SeqCst)
-            && self.state.compaction_abort.lock().expect("compaction abort").is_none()
-            && self.state.auto_compaction_abort.lock().expect("auto compaction abort").is_none()
+        !self.state.is_agent_run_active.load(Ordering::SeqCst) && !self.is_compacting()
     }
 
     /// TS `waitForIdle()` — a `'static` future so callers can hold it
@@ -751,7 +770,7 @@ impl AgentSession {
     pub fn dispose(&mut self) {
         self.abort_retry();
         self.abort_compaction();
-        // TODO(tranche 16): this.abortBranchSummary();
+        self.abort_branch_summary();
         self.abort_bash();
         self.agent.abort();
         self.extension_host.invalidate(
@@ -797,6 +816,7 @@ impl AgentSession {
         let retry_abort = Arc::clone(&self.state.retry_abort);
         let compaction_abort = Arc::clone(&self.state.compaction_abort);
         let auto_compaction_abort = Arc::clone(&self.state.auto_compaction_abort);
+        let branch_summary_abort = Arc::clone(&self.state.branch_summary_abort);
         let agent = self.agent.clone();
         Arc::new(move || {
             if active.load(Ordering::SeqCst) {
@@ -810,6 +830,9 @@ impl AgentSession {
                 handle.abort();
             }
             if let Some(handle) = auto_compaction_abort.lock().expect("auto compaction abort").as_ref() {
+                handle.abort();
+            }
+            if let Some(handle) = branch_summary_abort.lock().expect("branch summary abort").as_ref() {
                 handle.abort();
             }
             if is_before_settle.load(Ordering::SeqCst) {

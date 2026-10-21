@@ -637,15 +637,14 @@ impl AgentSession {
     }
 
     /// TS `abort()` — abort the current operation and wait for idle.
-    /// Branch-summary aborts arrive with their tranche; TS `abort()` never
-    /// aborts bash controllers (only `dispose()` does).
+    /// TS `abort()` never aborts bash controllers (only `dispose()` does).
     pub async fn abort(&mut self) {
         if self.state.is_agent_run_active.load(Ordering::SeqCst) {
             self.state.agent_run_abort_requested.store(true, Ordering::SeqCst);
         }
         self.abort_retry();
         self.abort_compaction();
-        // TODO(tranche 16): this.abortBranchSummary();
+        self.abort_branch_summary();
         // TS abort() does not abort bash controllers (only dispose() does).
         if self.state.is_before_settle.load(Ordering::SeqCst) {
             self.state.abort_during_before_settle.store(true, Ordering::SeqCst);

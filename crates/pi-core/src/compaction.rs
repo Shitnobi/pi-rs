@@ -1076,5 +1076,168 @@ pub fn update_summarization_prompt() -> String {
     )
 }
 
+// ============================================================================
+// Branch summarization (branch-summarization.ts)
+// ============================================================================
+
+/// `BRANCH_SUMMARY_PREAMBLE` (branch-summarization.ts).
+pub const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
+
+/// `BRANCH_SUMMARY_PROMPT` (branch-summarization.ts).
+pub const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+
+/// `CollectEntriesResult` — entries to summarize (chronological) and the
+/// common ancestor id (`None` = root).
+pub struct CollectEntriesResult {
+    pub entries: Vec<Value>,
+    pub common_ancestor_id: Option<String>,
+}
+
+/// `collectEntriesForBranchSummary` — walk from the old leaf back to the
+/// common ancestor with the target, collecting entries along the way.
+/// Compaction boundaries are included (their summaries become context).
+pub fn collect_entries_for_branch_summary(
+    session: &crate::session_manager::SessionManager,
+    old_leaf_id: Option<&str>,
+    target_id: &str,
+) -> CollectEntriesResult {
+    let Some(old_leaf_id) = old_leaf_id else {
+        return CollectEntriesResult { entries: Vec::new(), common_ancestor_id: None };
+    };
+    // The common ancestor: the deepest node on both paths. `getBranch` is
+    // root-first, so iterate the target path backwards.
+    let old_path: HashSet<String> = session
+        .get_branch(Some(old_leaf_id))
+        .iter()
+        .filter_map(|entry| entry["id"].as_str().map(str::to_string))
+        .collect();
+    let target_path = session.get_branch(Some(target_id));
+    let mut common_ancestor_id: Option<String> = None;
+    for entry in target_path.iter().rev() {
+        if let Some(id) = entry["id"].as_str() {
+            if old_path.contains(id) {
+                common_ancestor_id = Some(id.to_string());
+                break;
+            }
+        }
+    }
+
+    let mut entries: Vec<Value> = Vec::new();
+    let mut current: Option<String> = Some(old_leaf_id.to_string());
+    while let Some(id) = current {
+        if Some(&id) == common_ancestor_id.as_ref() {
+            break;
+        }
+        let Some(entry) = session.get_entry(&id) else { break };
+        current = entry["parentId"].as_str().map(str::to_string);
+        entries.push(entry.clone());
+    }
+    entries.reverse();
+    CollectEntriesResult { entries, common_ancestor_id }
+}
+
+/// `BranchPreparation` — the messages, cumulative file operations, and
+/// total token estimate for one branch summary.
+pub struct BranchPreparation {
+    pub messages: Vec<crate::messages::AgentMessage>,
+    pub file_ops: FileOperations,
+    pub total_tokens: f64,
+}
+
+/// `getMessageFromEntry` (branch-summarization.ts) — the AgentMessage an
+/// entry contributes to the summarization conversation. Tool results,
+/// settings entries, labels, and session-info entries contribute nothing.
+pub fn branch_message_from_entry(entry: &Value) -> Option<crate::messages::AgentMessage> {
+    use crate::messages::{
+        create_branch_summary_message, create_compaction_summary_message, create_custom_message,
+        AgentMessage, CustomContent,
+    };
+    match entry["type"].as_str() {
+        Some("message") => {
+            // Skip tool results - context is in the assistant's tool call.
+            if entry["message"]["role"].as_str() == Some("toolResult") {
+                return None;
+            }
+            Some(AgentMessage::Base(entry["message"].clone()))
+        }
+        Some("custom_message") => {
+            let content: CustomContent =
+                serde_json::from_value(entry["content"].clone()).ok()?;
+            Some(AgentMessage::Custom(create_custom_message(
+                entry["customType"].as_str()?,
+                content,
+                entry["display"].as_bool(),
+                entry.get("details").filter(|d| !d.is_null()).cloned(),
+                entry["timestamp"].as_str()?,
+            )))
+        }
+        Some("branch_summary") => Some(AgentMessage::BranchSummary(create_branch_summary_message(
+            entry["summary"].as_str()?,
+            entry["fromId"].as_str(),
+            entry["timestamp"].as_str()?,
+        ))),
+        Some("compaction") => Some(AgentMessage::CompactionSummary(
+            create_compaction_summary_message(
+                entry["summary"].as_str()?,
+                entry["tokensBefore"].as_u64()?,
+                entry["timestamp"].as_str()?,
+            ),
+        )),
+        _ => None,
+    }
+}
+
+/// `prepareBranchEntries` — walk entries from NEWEST to OLDEST, adding
+/// messages until the token budget (0 = no limit), keeping the most recent
+/// context when the branch is too long. File operations are collected from
+/// ALL entries first (cumulative tracking across nested branch summaries;
+/// only pi-generated summaries, `fromHook !== true`).
+pub fn prepare_branch_entries(entries: &[Value], token_budget: f64) -> BranchPreparation {
+    let mut messages: Vec<crate::messages::AgentMessage> = Vec::new();
+    let mut file_ops = create_file_ops();
+    let mut total_tokens = 0.0f64;
+
+    for entry in entries {
+        if entry["type"].as_str() == Some("branch_summary")
+            && !entry["fromHook"].as_bool().unwrap_or(false)
+            && entry.get("details").is_some_and(|d| d.is_object())
+        {
+            if let Some(read) = entry["details"]["readFiles"].as_array() {
+                for file in read.iter().filter_map(Value::as_str) {
+                    file_ops.read_push(file);
+                }
+            }
+            if let Some(modified) = entry["details"]["modifiedFiles"].as_array() {
+                // Modified files go into both edited and written for proper
+                // deduplication.
+                for file in modified.iter().filter_map(Value::as_str) {
+                    file_ops.edited_push(file);
+                }
+            }
+        }
+    }
+
+    for entry in entries.iter().rev() {
+        let Some(message) = branch_message_from_entry(entry) else { continue };
+        let message_value = serde_json::to_value(&message).unwrap_or(Value::Null);
+        extract_file_ops_from_message(&message_value, &mut file_ops);
+        let tokens = estimate_tokens(&message_value);
+        if token_budget > 0.0 && total_tokens + tokens > token_budget {
+            // Summary entries are important context: try to fit them anyway.
+            let is_summary =
+                matches!(entry["type"].as_str(), Some("compaction") | Some("branch_summary"));
+            if is_summary && total_tokens < token_budget * 0.9 {
+                messages.insert(0, message);
+                total_tokens += tokens;
+            }
+            break;
+        }
+        messages.insert(0, message);
+        total_tokens += tokens;
+    }
+
+    BranchPreparation { messages, file_ops, total_tokens }
+}
+
 /// `TURN_PREFIX_SUMMARIZATION_PROMPT` (compaction.ts).
 pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "The messages above are earlier context from an ongoing conversation. Later messages are stored separately and do not need to be reconstructed.\n\nCreate a concise checkpoint of the user's request and the progress shown above. This checkpoint will be placed before the later messages so the conversation can continue with the necessary context.\n\n## Original Request\n[What did the user ask for?]\n\n## Progress So Far\n- [Key decisions and work completed in these messages]\n\n## Context Needed to Continue\n- [Information from these messages needed to understand the later work]\n\nOnly summarize information explicitly present above. Do not infer or recreate later messages.";
