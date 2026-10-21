@@ -22,6 +22,7 @@ mod runtime_harness;
 mod core_harness;
 mod agent_harness;
 mod agent_loop_harness;
+mod session_harness;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -193,6 +194,7 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "agent-loop" => {
             return agent_loop_harness::run_agent_loop_harness(&input, std::path::Path::new(cwd))
         }
+        "agent-session-events" => return session_harness::run_agent_session_events_harness(&input),
         "tui-utils" => return run_tui_utils_harness(&input),
         "tui-fuzzy" => return run_tui_fuzzy_harness(&input),
         "tui-word-navigation" => return run_tui_word_navigation_harness(&input),

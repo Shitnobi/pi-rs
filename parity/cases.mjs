@@ -1754,6 +1754,324 @@ export const cases = [
 	},
 
 
+	// ---------------------------------------------------- agent-session-events
+	// Differential parity for the events slice of AgentSession (TS
+	// dist/core/agent-session.js ↔ crates/pi-session). The case declares a
+	// message POOL (referenced by index in ops/entries) that both harnesses
+	// wire as the same objects; entries[0] must be the session header.
+	// Conventions: entry ids never look like "uuid-N" (appended entries get
+	// those); messageEndReplacement/nestedRecords targets are never
+	// entry-linked (in-place mutation is only visible through live TS
+	// references); sendCustomMessage passes boolean display, object-or-absent
+	// details, and never triggerTurn:true (run pipeline, tranche 11).
+	{
+		name: "agent-session-events/missing-args",
+		tool: "agent-session-events",
+		args: {},
+	},
+	{
+		name: "agent-session-events/per-role-persistence",
+		tool: "agent-session-events",
+		args: {
+			nowMs: 1747000000000,
+			messages: [
+				{ role: "system", content: "be brief", timestamp: 1 },
+				{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 2 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "hello" }],
+					stopReason: "stop",
+					provider: "anthropic",
+					model: "claude-x",
+					timestamp: 3,
+				},
+				{ role: "toolResult", toolCallId: "c0", content: "out", timestamp: 4 },
+			],
+			stateCount: 0,
+			entries: [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }],
+			ops: [
+				{ op: "agentEvent", event: { type: "message_end", messageIndex: 0 } },
+				{ op: "findPersisted", messageIndex: 0 },
+				{ op: "agentEvent", event: { type: "message_end", messageIndex: 1 } },
+				{ op: "findPersisted", messageIndex: 1 },
+				{ op: "agentEvent", event: { type: "message_end", messageIndex: 2 } },
+				{ op: "findPersisted", messageIndex: 2 },
+				{ op: "agentEvent", event: { type: "message_end", messageIndex: 3 } },
+				{ op: "findPersisted", messageIndex: 3 },
+			],
+		},
+	},
+	{
+		name: "agent-session-events/custom-entry-shape",
+		tool: "agent-session-events",
+		args: {
+			nowMs: 1747000000000,
+			messages: [
+				{
+					role: "custom",
+					customType: "note",
+					content: [{ type: "text", text: "cached" }],
+					display: true,
+					details: { kind: "memo" },
+					timestamp: 5,
+				},
+			],
+			stateCount: 0,
+			entries: [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }],
+			ops: [
+				{ op: "agentEvent", event: { type: "message_end", messageIndex: 0 } },
+				{
+					op: "sendCustomMessage",
+					customType: "todo",
+					content: [{ type: "text", text: "later" }],
+					display: false,
+				},
+			],
+		},
+	},
+	{
+		name: "agent-session-events/queue-removal",
+		tool: "agent-session-events",
+		args: {
+			nowMs: 1747000000000,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "go left" }], timestamp: 1 },
+				{ role: "user", content: [{ type: "text", text: "go right" }], timestamp: 2 },
+				{ role: "user", content: [{ type: "text", text: "unrelated" }], timestamp: 3 },
+			],
+			stateCount: 0,
+			entries: [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }],
+			ops: [
+				{ op: "queueSteer", text: "go left" },
+				{ op: "queueFollowUp", text: "go right" },
+				{ op: "agentEvent", event: { type: "message_start", messageIndex: 0 } },
+				{ op: "agentEvent", event: { type: "message_start", messageIndex: 2 } },
+				{ op: "agentEvent", event: { type: "message_start", messageIndex: 1 } },
+			],
+		},
+	},
+	{
+		name: "agent-session-events/nested-merge",
+		tool: "agent-session-events",
+		args: {
+			nowMs: 1747000000000,
+			messages: [
+				{
+					role: "toolResult",
+					toolCallId: "c1",
+					content: "out",
+					usage: {
+						input: 2,
+						output: 3,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 5,
+						cost: { input: 0.001, output: 0.002, cacheRead: 0, cacheWrite: 0, total: 0.003 },
+					},
+					timestamp: 1,
+				},
+				{ role: "toolResult", toolCallId: "c2", content: "plain", timestamp: 2 },
+			],
+			stateCount: 0,
+			entries: [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }],
+			nestedRecords: {
+				c1: {
+					calls: [{ type: "toolCall", id: "n1", name: "grep", arguments: { q: "x" } }],
+					usage: {
+						input: 5,
+						output: 7,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 12,
+						cost: { input: 0.005, output: 0.007, cacheRead: 0, cacheWrite: 0, total: 0.012 },
+					},
+				},
+			},
+			ops: [
+				{ op: "agentEvent", event: { type: "message_start", messageIndex: 0 } },
+				{ op: "agentEvent", event: { type: "message_end", messageIndex: 0 } },
+				{ op: "agentEvent", event: { type: "message_start", messageIndex: 1 } },
+				{ op: "agentEvent", event: { type: "agent_end", messageIndices: [0, 1] } },
+			],
+		},
+	},
+	{
+		name: "agent-session-events/auto-retry-end",
+		tool: "agent-session-events",
+		args: {
+			nowMs: 1747000000000,
+			messages: [
+				{ role: "assistant", content: [], stopReason: "stop", timestamp: 1 },
+				{ role: "assistant", content: [], stopReason: "error", errorMessage: "boom", timestamp: 2 },
+			],
+			stateCount: 0,
+			entries: [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }],
+			ops: [
+				{ op: "setRetryAttempt", value: 2 },
+				{ op: "agentEvent", event: { type: "message_end", messageIndex: 0 } },
+				{ op: "setRetryAttempt", value: 1 },
+				{ op: "agentEvent", event: { type: "message_end", messageIndex: 1 } },
+			],
+		},
+	},
+	{
+		name: "agent-session-events/will-retry",
+		tool: "agent-session-events",
+		args: {
+			nowMs: 1747000000000,
+			model: { provider: "anthropic", id: "claude-x", contextWindow: 1000 },
+			messages: [
+				{
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage: "overloaded",
+					provider: "anthropic",
+					model: "claude-x",
+					timestamp: 1,
+				},
+				{
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage: "prompt is too long",
+					provider: "anthropic",
+					model: "claude-x",
+					timestamp: 2,
+				},
+			],
+			stateCount: 0,
+			entries: [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }],
+			ops: [
+				{ op: "agentEvent", event: { type: "agent_end", messageIndices: [0] } },
+				{ op: "setRetryAttempt", value: 3 },
+				{ op: "agentEvent", event: { type: "agent_end", messageIndices: [0] } },
+				{ op: "setRetryAttempt", value: 0 },
+				{ op: "agentEvent", event: { type: "agent_end", messageIndices: [1] } },
+				{ op: "requestAbort" },
+				{ op: "agentEvent", event: { type: "agent_end", messageIndices: [0] } },
+			],
+		},
+	},
+	{
+		name: "agent-session-events/turn-end-flush",
+		tool: "agent-session-events",
+		args: {
+			nowMs: 1747000000000,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "run it" }], timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "doing" }],
+					stopReason: "error",
+					errorMessage: "boom",
+					timestamp: 2,
+				},
+				{ role: "toolResult", toolCallId: "c9", content: "res", timestamp: 3 },
+			],
+			stateCount: 3,
+			entries: [
+				{ type: "session", id: "s-root", version: 3, cwd: "/proj" },
+				{ type: "message", id: "e1", parentId: null, timestamp: "2025-05-01T00:00:00.000Z", messageIndex: 0 },
+			],
+			ops: [
+				{ op: "setStreaming", value: true },
+				{
+					op: "sendCustomMessage",
+					customType: "aside",
+					content: [{ type: "text", text: "quiet note" }],
+					display: true,
+					details: { silent: true },
+					triggerTurn: false,
+				},
+				{
+					op: "sendCustomMessage",
+					customType: "queued",
+					content: [{ type: "text", text: "next" }],
+					display: true,
+					deliverAs: "nextTurn",
+				},
+				{ op: "agentEvent", event: { type: "turn_end", messageIndex: 1, toolResultIndices: [2] } },
+				{ op: "agentEvent", event: { type: "turn_end", messageIndex: 1, toolResultIndices: [2, 0] } },
+			],
+		},
+	},
+	{
+		name: "agent-session-events/settled-deferred-idle",
+		tool: "agent-session-events",
+		args: {
+			nowMs: 1747000000000,
+			messages: [],
+			stateCount: 0,
+			entries: [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }],
+			ops: [
+				{ op: "setStreaming", value: true },
+				{ op: "waitForIdle", tag: "w1" },
+				{ op: "deferAction", tag: "d1" },
+				{ op: "deferAction", tag: "d2" },
+				{ op: "requestAbort" },
+				{ op: "emitAgentSettled" },
+				{ op: "waitForIdle", tag: "w2" },
+			],
+		},
+	},
+	{
+		name: "agent-session-events/find-persisted-scans",
+		tool: "agent-session-events",
+		args: {
+			nowMs: 1747000000000,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "seed" }], timestamp: 1 },
+				{ role: "assistant", content: [], stopReason: "stop", timestamp: 2 },
+				{ role: "system", content: "extra", timestamp: 3 },
+			],
+			stateCount: 2,
+			entries: [
+				{ type: "session", id: "s-root", version: 3, cwd: "/proj" },
+				{ type: "message", id: "e1", parentId: null, timestamp: "2025-05-01T00:00:00.000Z", messageIndex: 0 },
+				{
+					type: "custom_message",
+					id: "c1",
+					parentId: "e1",
+					timestamp: "2025-05-01T00:00:01.000Z",
+					customType: "note",
+					content: [{ type: "text", text: "hi" }],
+					display: true,
+				},
+			],
+			ops: [
+				{ op: "findPersisted", messageIndex: 0 },
+				{ op: "findPersisted", messageIndex: 1 },
+				{ op: "findPersisted", messageIndex: 2 },
+				{ op: "findPersisted", messageIndex: 1 },
+			],
+		},
+	},
+	{
+		name: "agent-session-events/message-end-replacement",
+		tool: "agent-session-events",
+		args: {
+			nowMs: 1747000000000,
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "original" }],
+					stopReason: "stop",
+					timestamp: 1,
+				},
+			],
+			stateCount: 1,
+			entries: [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }],
+			extensionConfig: {
+				messageEndReplacement: { role: "assistant", content: null, stopReason: "stop" },
+			},
+			ops: [
+				{ op: "agentEvent", event: { type: "message_start", messageIndex: 0 } },
+				{ op: "agentEvent", event: { type: "message_end", messageIndex: 0 } },
+			],
+		},
+	},
+
 	// ------------------------------------------------------------- tui-utils
 	// Differential parity for the pure width-engine functions of the TUI
 	// package (layer 1 of the TUI parity plan; see docs/TUI_PORT_PLAN.md).

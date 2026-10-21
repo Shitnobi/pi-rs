@@ -1181,9 +1181,36 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       (realFiles/symlinks) is idempotent on both sides (rm before
       symlink) so stale scratch state can't produce EEXIST. Full parity
       2424/2424.
+- [x] **Tranche 8 — AgentSession event handling.** New crate
+      `crates/pi-session` (recreated; deps pi-core + pi-agent + serde)
+      with the `agent_session/` module tree from the plan: mod.rs
+      (AgentSession facade + config, SessionSettingsStore /
+      ExtensionHost / NestedCallsStore traits, SessionState, message
+      arena, subscribe/_emit, isIdle/waitForIdle, queue steer/follow-up,
+      sendCustomMessage, dispose, harness seams), events.rs
+      (SessionAgentEvent — AgentEvent with messages replaced by arena
+      ids — + to_value), event_handler.rs (_handleAgentEvent port:
+      abort-at-agent_start, nested-calls takeRecord merge +
+      combineUsage, steering-then-followUp queue removal + queue_update,
+      extension-emit-then-public-emit, agent_end willRetry enrichment,
+      message_end persistence mapping, assistant bookkeeping +
+      auto_retry_end, turn_end flush; _willRetryAfterAgentEnd,
+      _findPersistedMessageEntryId, _flushPendingCustomMessages,
+      _emitAgentSettled + deferred actions, _emitExtensionEvent).
+      retry_error.rs ports isContextOverflow + isRetryableAssistantError
+      (overflow.ts + retry.ts pattern lists). pi-agent gained
+      Agent::model(); pi-core Generators::with_gens for injected
+      uuid/clock in tests. WeakMap-identity emulation: insertion-ordered
+      Vec<Value> arena keyed by MsgId + entry_message_ids side-table;
+      the harness feeds a shared message pool + messageIndex refs so
+      reference-compare semantics stay observable on both sides.
+      Parity harness `agent-session-events` (11 cases; suite total
+      2435): real AgentSession on the TS side (recording fake extension
+      runner, SettingsManager.inMemory, __piParityUuidOverride pinned
+      after construction) vs the Rust facade; Date pinned via Date.now
+      override + PinnedDate class so new Date().toISOString() matches
+      the fixed clock. Full parity 2435/2435.
 - [ ] Remaining agent-session tranches (phase3-agent-session.md):
-      AgentSession slices 8–17 (events, tools, prompt, run, retry,
-      compaction, model, bash, tree, stats) and 18–19 (runtime,
-      services+event-bus). The future AgentSession crate (recreate
-      pi-session or extend pi-agent) depends on pi-core + pi-agent +
-      pi-providers.
+      AgentSession slices 9–17 (tools, prompt, run, retry, compaction,
+      model, bash, tree, stats) and 18–19 (runtime, services+event-bus),
+      extending crates/pi-session.

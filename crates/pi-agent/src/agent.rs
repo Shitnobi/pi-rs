@@ -275,6 +275,11 @@ impl Agent {
         self.inner.state.lock().expect("agent state").is_streaming
     }
 
+    /// TS `state.model` getter.
+    pub fn model(&self) -> Value {
+        self.inner.state.lock().expect("agent state").model.clone()
+    }
+
     /// The harness state snapshot (getState + the tool `snapshot` step):
     /// exact JSON shape / key order from the shared protocol spec.
     pub fn state_snapshot(&self) -> Value {

@@ -13,6 +13,7 @@ path = "src/main.rs"
 pi-core = { path = "../pi-core" }
 pi-providers = { path = "../pi-providers" }
 pi-agent = { path = "../pi-agent" }
+pi-session = { path = "../pi-session" }
 pi-tools = { path = "../pi-tools" }
 pi-tui = { path = "../pi-tui" }
 serde = { workspace = true }

@@ -196,6 +196,12 @@ impl Generators {
         Self::default()
     }
 
+    /// Harness/tests constructor with fully-injected generators (the
+    /// default fields are real OS randomness / system clock).
+    pub fn with_gens(uuid_v7: UuidGen, uuid_v4: UuidGen, now_ms: NowMsGen) -> Self {
+        Generators { uuid_v7, uuid_v4, now_ms }
+    }
+
     fn now_iso(&self) -> String {
         iso_string((self.now_ms)())
     }

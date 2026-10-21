@@ -4908,6 +4908,369 @@ async function runModule(tool, args, cwd) {
 		return { result: { events, stateMessages: agent.state.messages, results, snapshots } };
 	}
 
+	if (tool === "agent-session-events") {
+		// dist/core/agent-session.js — the events slice of the REAL
+		// AgentSession: _handleAgentEvent (persistence, queue bookkeeping,
+		// extension + public emission, nested-call merge, turn_end flush,
+		// retry classification), sendCustomMessage, _emitAgentSettled,
+		// _findPersistedMessageEntryId, waitForIdle. Mirrors the Rust
+		// harness (crates/pi-cli/src/session_harness.rs, pi-session port).
+		//
+		// Message identity: the pool objects are wired into events, agent
+		// state, and seeded entries so the WeakMap/WeakSet/reference-compare
+		// semantics the Rust arena port emulates stay observable. Collectors
+		// deep-clone at collection time (the Rust side snapshots at emit).
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		const { AgentSession } = require(path.join(distDir, "core", "agent-session.js"));
+		const { SessionManager } = require(path.join(distDir, "core", "session-manager.js"));
+		const { SettingsManager } = require(path.join(distDir, "core", "settings-manager.js"));
+		const { DefaultResourceLoader } = require(path.join(distDir, "core", "resource-loader.js"));
+		// Validation order mirrors the Rust entry exactly.
+		if (!Array.isArray(args.messages)) throw new Error("missing messages");
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		if (typeof args.stateCount !== "number" || !Number.isInteger(args.stateCount)) {
+			throw new Error("missing stateCount");
+		}
+		if (args.stateCount < 0 || args.stateCount > args.messages.length) {
+			throw new Error("invalid stateCount");
+		}
+		if (
+			!Array.isArray(args.entries) ||
+			args.entries.length === 0 ||
+			args.entries[0].type !== "session"
+		) {
+			throw new Error("missing entries");
+		}
+		if (args.model !== undefined && args.model !== null) {
+			if (typeof args.model !== "object" || Array.isArray(args.model)) {
+				throw new Error("invalid model");
+			}
+		}
+		if (!Array.isArray(args.ops)) throw new Error("missing ops");
+		const pool = args.messages;
+		const poolIndex = (v, err) => {
+			if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v >= pool.length) {
+				throw new Error(err);
+			}
+			return v;
+		};
+		const indexList = (v, err) => {
+			if (!Array.isArray(v)) throw new Error(err);
+			return v.map((i) => poolIndex(i, err));
+		};
+		// Wire entries: message entries carry messageIndex → the pool object
+		// (so `entry.message === message` reference scans work).
+		const wiredEntries = [];
+		const entryMessageIndices = [];
+		for (const entry of args.entries) {
+			if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+				throw new Error("entries entries must be objects");
+			}
+			const wired = {};
+			for (const [key, value] of Object.entries(entry)) {
+				if (key === "messageIndex") {
+					const index = poolIndex(value, "invalid messageIndex");
+					wired.message = pool[index];
+					if (typeof wired.id === "string") entryMessageIndices.push([wired.id, index]);
+				} else {
+					wired[key] = value;
+				}
+			}
+			wiredEntries.push(wired);
+		}
+		const settingsIn = args.settings ?? {};
+		if (typeof settingsIn !== "object" || settingsIn === null || Array.isArray(settingsIn)) {
+			throw new Error("invalid settings");
+		}
+		const retryIn = settingsIn.retry ?? {};
+		if (typeof retryIn !== "object" || retryIn === null || Array.isArray(retryIn)) {
+			throw new Error("invalid settings");
+		}
+		const extensionConfig = args.extensionConfig ?? {};
+		if (typeof extensionConfig !== "object" || extensionConfig === null || Array.isArray(extensionConfig)) {
+			throw new Error("invalid extensionConfig");
+		}
+		const nestedRecordsIn = args.nestedRecords ?? {};
+		if (typeof nestedRecordsIn !== "object" || nestedRecordsIn === null || Array.isArray(nestedRecordsIn)) {
+			throw new Error("invalid nestedRecords");
+		}
+		const nestedRecords = { ...nestedRecordsIn };
+
+		const realDateNow = Date.now;
+		Date.now = () => args.nowMs;
+		// Pin `new Date()` too: appendMessage stamps entries with
+		// `new Date().toISOString()`, which Date.now pinning alone leaves at
+		// wall-clock time. The Rust side's now generator returns nowMs.
+		const RealDate = Date;
+		class PinnedDate extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(args.nowMs);
+				else super(...ctorArgs);
+			}
+		}
+		globalThis.Date = PinnedDate;
+		let uuidI = 0;
+		const nextUuid = () => "uid" + String(++uuidI).padStart(5, "0");
+		try {
+			const agent = new Agent({
+				streamFn: () => {
+					throw new Error("agent-session-events harness streamFn must never be called");
+				},
+				initialState: { messages: [], model: args.model ?? undefined },
+			});
+			const sessionManager = SessionManager.inMemory("/proj", undefined, wiredEntries);
+			const settingsManager = SettingsManager.inMemory({ retry: retryIn });
+			const resourceLoader = new DefaultResourceLoader({
+				cwd: "/proj",
+				agentDir: "/proj/.pi",
+				settingsManager,
+				noExtensions: true,
+			});
+			const modelRuntime = { getPhysicalModel: () => undefined };
+			const session = new AgentSession({
+				agent,
+				sessionManager,
+				settingsManager,
+				cwd: "/proj",
+				resourceLoader,
+				modelRuntime,
+				usesDefaultTools: false,
+			});
+			// Swap the extension runner with a recording fake (mirrors the
+			// Rust RecordingExtensionHost): emit logs, emitMessageEnd logs and
+			// returns the configured replacement, no boundary handlers.
+			const extensionEvents = [];
+			const fakeRunner = {
+				hasHandlers: () => false,
+				emit: async (event) => {
+					extensionEvents.push(snapEvent(event));
+				},
+				emitMessageEnd: async (event) => {
+					extensionEvents.push(snapEvent(event));
+					return extensionConfig.messageEndReplacement ?? undefined;
+				},
+				emitError: () => {},
+				invalidate: () => {},
+			};
+			session._extensionRunner = fakeRunner;
+			// Preloaded nested-call records (mirrors PreloadedNestedCallsStore).
+			session._nestedToolCalls = {
+				takeRecord: (id) => {
+					const record = nestedRecords[id];
+					delete nestedRecords[id];
+					return record;
+				},
+				clear: () => {
+					for (const key of Object.keys(nestedRecords)) delete nestedRecords[key];
+				},
+			};
+			// Seed state with the pool objects (identity!), like the Rust
+			// arena seeding + seedStateMessages.
+			agent.state.messages = pool.slice(0, args.stateCount);
+
+			const sessionEvents = [];
+			const snapEvent = (event) => JSON.parse(JSON.stringify(event));
+			const deferredLog = [];
+			const unsubscribe = session.subscribe((event) => {
+				sessionEvents.push(snapEvent(event));
+			});
+
+			// uuid counter: pinned AFTER construction so constructor-time
+			// randomness cannot shift it; Rust generates ids only on append.
+			globalThis.__piParityUuidOverride = nextUuid;
+
+			const buildEvent = (op) => {
+				const event = op.event;
+				if (event === null || typeof event !== "object" || Array.isArray(event)) {
+					throw new Error("missing event");
+				}
+				if (typeof event.type !== "string") throw new Error("missing event type");
+				switch (event.type) {
+					case "agent_start":
+						return { type: "agent_start" };
+					case "agent_end":
+						return { type: "agent_end", messages: indexList(event.messageIndices, "invalid messageIndices").map((i) => pool[i]) };
+					case "turn_start":
+						return { type: "turn_start" };
+					case "turn_end":
+						return {
+							type: "turn_end",
+							message: pool[poolIndex(event.messageIndex, "invalid messageIndex")],
+							toolResults: indexList(event.toolResultIndices, "invalid toolResultIndices").map((i) => pool[i]),
+						};
+					case "message_start":
+						return { type: "message_start", message: pool[poolIndex(event.messageIndex, "invalid messageIndex")] };
+					case "message_update":
+						if (event.assistantMessageEvent === undefined) {
+							throw new Error("missing assistantMessageEvent");
+						}
+						return {
+							type: "message_update",
+							message: pool[poolIndex(event.messageIndex, "invalid messageIndex")],
+							assistantMessageEvent: event.assistantMessageEvent,
+						};
+					case "message_end":
+						return { type: "message_end", message: pool[poolIndex(event.messageIndex, "invalid messageIndex")] };
+					case "tool_execution_start":
+						if (typeof event.toolCallId !== "string") throw new Error("missing toolCallId");
+						if (typeof event.toolName !== "string") throw new Error("missing toolName");
+						if (event.args === undefined) throw new Error("missing args");
+						return { type: "tool_execution_start", toolCallId: event.toolCallId, toolName: event.toolName, args: event.args };
+					case "tool_execution_update":
+						if (typeof event.toolCallId !== "string") throw new Error("missing toolCallId");
+						if (typeof event.toolName !== "string") throw new Error("missing toolName");
+						if (event.args === undefined) throw new Error("missing args");
+						if (event.partialResult === undefined) throw new Error("missing partialResult");
+						return {
+							type: "tool_execution_update",
+							toolCallId: event.toolCallId,
+							toolName: event.toolName,
+							args: event.args,
+							partialResult: event.partialResult,
+						};
+					case "tool_execution_end":
+						if (typeof event.toolCallId !== "string") throw new Error("missing toolCallId");
+						if (typeof event.toolName !== "string") throw new Error("missing toolName");
+						if (event.result === undefined) throw new Error("missing result");
+						if (typeof event.isError !== "boolean") throw new Error("missing isError");
+						if (event.durationMs !== undefined && typeof event.durationMs !== "number") {
+							throw new Error("invalid durationMs");
+						}
+						return {
+							type: "tool_execution_end",
+							toolCallId: event.toolCallId,
+							toolName: event.toolName,
+							result: event.result,
+							isError: event.isError,
+							...(event.durationMs === undefined ? {} : { durationMs: event.durationMs }),
+						};
+					default:
+						throw new Error("unknown agent event type: " + event.type);
+				}
+			};
+
+			const strField = (op, key) => {
+				if (typeof op[key] !== "string") throw new Error("missing " + key);
+				return op[key];
+			};
+			const boolField = (op, key) => {
+				if (typeof op[key] !== "boolean") throw new Error("missing " + key);
+				return op[key];
+			};
+
+			const results = [];
+			const idleWaits = [];
+			for (const op of args.ops) {
+				if (op === null || typeof op !== "object" || Array.isArray(op)) {
+					throw new Error("ops entries must be objects");
+				}
+				if (typeof op.op !== "string") throw new Error("missing op");
+				let v = null;
+				switch (op.op) {
+					case "agentEvent":
+						await session._handleAgentEvent(buildEvent(op));
+						break;
+					case "queueSteer":
+						await session._queueSteer(strField(op, "text"));
+						break;
+					case "queueFollowUp":
+						await session._queueFollowUp(strField(op, "text"));
+						break;
+					case "setStreaming":
+						session._isAgentRunActive = boolField(op, "value");
+						break;
+					case "setRetryAttempt":
+						if (typeof op.value !== "number") throw new Error("missing value");
+						session._retryAttempt = op.value;
+						break;
+					case "requestAbort":
+						session._agentRunAbortRequested = true;
+						break;
+					case "sendCustomMessage": {
+						const customType = strField(op, "customType");
+						if (op.content === undefined) throw new Error("missing content");
+						const display = boolField(op, "display");
+						if (op.triggerTurn !== undefined && typeof op.triggerTurn !== "boolean") {
+							throw new Error("invalid triggerTurn");
+						}
+						if (op.deliverAs !== undefined && op.deliverAs !== null && typeof op.deliverAs !== "string") {
+							throw new Error("invalid deliverAs");
+						}
+						await session.sendCustomMessage(
+							{ customType, content: op.content, display, details: op.details },
+							{
+								...(op.triggerTurn === undefined ? {} : { triggerTurn: op.triggerTurn }),
+								...(op.deliverAs === undefined ? {} : { deliverAs: op.deliverAs }),
+							},
+						);
+						break;
+					}
+					case "findPersisted":
+						v = session._findPersistedMessageEntryId(pool[poolIndex(op.messageIndex, "invalid messageIndex")]) ?? null;
+						break;
+					case "emitAgentSettled":
+						await session._emitAgentSettled();
+						break;
+					case "waitForIdle": {
+						const tag = strField(op, "tag");
+						const entry = { tag, resolved: false };
+						idleWaits.push(entry);
+						session.waitForIdle().then(() => {
+							entry.resolved = true;
+						});
+						break;
+					}
+					case "deferAction": {
+						const tag = strField(op, "tag");
+						// Deferred-Log stand-in (mirrors the Rust
+						// push_deferred_log_action seam): the deferred action
+						// appends its tag when _emitAgentSettled runs it.
+						session._deferredSettledActions.push(async () => {
+							deferredLog.push(tag);
+						});
+						break;
+					}
+					case "unsubscribe":
+						unsubscribe();
+						break;
+					default:
+						throw new Error("unknown agent-session-events op: " + op.op);
+				}
+				results.push(v === undefined ? null : v);
+			}
+			// Drain the microtask queue (macrotask turn) so `.then` flags of
+			// waits resolved during ops are visible — mirrors the Rust
+			// single poll of each collected idle future.
+			await new Promise((r) => setImmediate(r));
+			const queueState = {
+				steering: session._steeringMessages,
+				followUp: session._followUpMessages,
+				isIdle: session.isIdle,
+				retryAttempt: session.retryAttempt,
+				pendingCustomMessages: session._pendingCustomMessages,
+				lastAssistantToolResults: session._lastAssistantToolResults,
+				lastActivityOutcome: session._lastActivityOutcome,
+				turnIndex: session._turnIndex,
+			};
+			const deferredLogOut = deferredLog.slice();
+			return {
+				result: {
+					results,
+					sessionEvents,
+					extensionEvents,
+					entries: sessionManager.getEntries(),
+					queueState,
+					deferredLog: deferredLogOut,
+					idleWaits,
+				},
+			};
+		} finally {
+			globalThis.__piParityUuidOverride = null;
+			Date.now = realDateNow;
+			globalThis.Date = RealDate;
+		}
+	}
+
 	if (tool === "file-mutation-queue") {
 		// dist/core/tools/file-mutation-queue.js — withFileMutationQueue over
 		// scripted fns. Ops run concurrently; each fn marks itself started,

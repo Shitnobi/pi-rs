@@ -468,6 +468,7 @@ dependencies = [
  "pi-agent",
  "pi-core",
  "pi-providers",
+ "pi-session",
  "pi-tools",
  "pi-tui",
  "serde",
@@ -504,6 +505,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-session"
+version = "0.1.0"
+dependencies = [
+ "fancy-regex",
+ "pi-agent",
+ "pi-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "pi-tools"
 version = "0.1.0"
 dependencies = [
@@ -511,6 +524,7 @@ dependencies = [
  "pi-photon",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

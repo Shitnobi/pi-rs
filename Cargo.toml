@@ -2,7 +2,7 @@
 resolver = "2"
 members = ["crates/pi-core", "crates/pi-tools",
     "crates/pi-providers", "crates/pi-cli", "crates/pi-photon", "crates/pi-tui",
-    "crates/pi-agent"]
+    "crates/pi-agent", "crates/pi-session"]
 
 [workspace.package]
 version = "0.1.0"
