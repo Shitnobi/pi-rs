@@ -204,7 +204,7 @@ impl AgentSession {
 
     /// TS `_isRetryableError(message)` — context overflow is handled by
     /// compaction, not retry.
-    fn is_retryable_error(&self, message: &Value) -> bool {
+    pub(super) fn is_retryable_error(&self, message: &Value) -> bool {
         let context_window = self
             .model_for_message(message)
             .or_else(|| {

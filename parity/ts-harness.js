@@ -6306,6 +6306,252 @@ async function runModule(tool, args, cwd) {
 		}
 	}
 
+	if (tool === "agent-session-retry") {
+		// dist/core/agent-session.js — the auto-retry slice (_prepareRetry /
+		// _omitRecoveryAttempt / abortRetry) over a real AgentSession with a
+		// scripted provider. Mirrors the Rust harness
+		// (crates/pi-cli/src/session_retry_harness.rs). setTimeout is patched
+		// for the duration of the script so the retry backoff sleep is
+		// observable: "immediate" mode records {ms} and resolves synchronously
+		// (fast-forward); "pending" mode records {ms} and never fires, so only
+		// abortRetry()/abort() can end the sleep (deterministic abort-mid-sleep
+		// cases). promptStart fires prompt without awaiting; waitEvent parks
+		// until a session event of the given type appears; awaitPrompt drains
+		// the outstanding prompt promise.
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		const { AgentSession } = require(path.join(distDir, "core", "agent-session.js"));
+		const { SessionManager } = require(path.join(distDir, "core", "session-manager.js"));
+		const { SettingsManager } = require(path.join(distDir, "core", "settings-manager.js"));
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		const config = args.config ?? {};
+		if (typeof config !== "object" || config === null || Array.isArray(config)) {
+			throw new Error("invalid config");
+		}
+		const settingsIn = config.settings ?? {};
+		if (typeof settingsIn !== "object" || settingsIn === null || Array.isArray(settingsIn)) {
+			throw new Error("invalid settings");
+		}
+		const retryIn = settingsIn.retry ?? {};
+		if (typeof retryIn !== "object" || retryIn === null || Array.isArray(retryIn)) {
+			throw new Error("invalid settings");
+		}
+		if (typeof config.systemPrompt !== "string") throw new Error("invalid systemPrompt");
+		if (
+			!Array.isArray(config.entries) ||
+			config.entries.length === 0 ||
+			config.entries[0].type !== "session"
+		) {
+			throw new Error("missing entries");
+		}
+		if (config.model !== undefined && config.model !== null) {
+			if (typeof config.model !== "object" || Array.isArray(config.model)) {
+				throw new Error("invalid model");
+			}
+		}
+		const sleepMode = args.sleepMode ?? "immediate";
+		if (sleepMode !== "immediate" && sleepMode !== "pending") throw new Error("invalid sleepMode");
+		if (!Array.isArray(args.script)) throw new Error("missing script");
+		if (!Array.isArray(args.providerTurns)) throw new Error("missing providerTurns");
+
+		const realDateNow = Date.now;
+		Date.now = () => args.nowMs;
+		const RealDate = Date;
+		class PinnedDate extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(args.nowMs);
+				else super(...ctorArgs);
+			}
+		}
+		globalThis.Date = PinnedDate;
+		const realSetTimeout = globalThis.setTimeout;
+		const sleepLog = [];
+		const dummyTimeout = { __piParityDummyTimeout: true };
+		globalThis.setTimeout = (fn, ms, ...rest) => {
+			sleepLog.push({ ms });
+			if (sleepMode === "pending") return dummyTimeout;
+			fn(...rest);
+			return dummyTimeout;
+		};
+		let uuidI = 0;
+		const nextUuid = () => "uid" + String(++uuidI).padStart(5, "0");
+		try {
+			const sessionManager = SessionManager.inMemory("/proj", undefined, config.entries);
+			const projected = sessionManager.buildSessionProjection().messages;
+			const promptsSentToAgent = [];
+			let providerIdx = 0;
+			const fakeStreamFn = (_model, context, _options) => {
+				const turn = args.providerTurns[providerIdx];
+				if (turn === undefined) throw new Error("provider script exhausted");
+				providerIdx++;
+				promptsSentToAgent.push(JSON.parse(JSON.stringify(context.messages ?? [])));
+				return {
+					async *[Symbol.asyncIterator]() {
+						for (const event of turn.events ?? []) yield event;
+					},
+					result() {
+						return Promise.resolve(turn.result);
+					},
+				};
+			};
+			const agent = new Agent({
+				streamFn: fakeStreamFn,
+				initialState: { messages: projected },
+			});
+			agent.state.model = config.model ?? undefined;
+			const settingsManager = SettingsManager.inMemory({ retry: retryIn });
+			const fakeLoader = {
+				getSkills: () => ({ skills: [], diagnostics: [] }),
+				getPrompts: () => ({ prompts: [], diagnostics: [] }),
+				getAgentsFiles: () => ({ agentsFiles: [] }),
+				getSystemPrompt: () => config.systemPrompt,
+				getAppendSystemPrompt: () => [],
+				getExtensions: () => ({
+					extensions: [],
+					runtime: {
+						mcpServers: { setChangeListener: () => {} },
+						pendingProviderRegistrations: [],
+						pendingNativeProviderRegistrations: [],
+						pendingVirtualModelRegistrations: [],
+					},
+					diagnostics: [],
+				}),
+				getThemes: () => ({ themes: [], diagnostics: [] }),
+			};
+			const modelRuntime = {
+				getModel: () => undefined,
+				getPhysicalModel: () => undefined,
+				hasConfiguredAuth: () => true,
+				checkAuth: async () => ({}),
+				isUsingOAuth: () => false,
+			};
+			const session = new AgentSession({
+				agent,
+				sessionManager,
+				settingsManager,
+				cwd: "/proj",
+				resourceLoader: fakeLoader,
+				modelRuntime,
+				usesDefaultTools: false,
+				baseToolsOverride: {},
+			});
+			const snapEvent = (event) => JSON.parse(JSON.stringify(event));
+			const extensionEvents = [];
+			const extensionErrors = [];
+			const fakeRunner = {
+				hasHandlers: () => false,
+				emit: async (event) => {
+					extensionEvents.push(snapEvent(event));
+				},
+				emitMessageEnd: async (event) => {
+					extensionEvents.push(snapEvent(event));
+					return undefined;
+				},
+				emitError: (error) => {
+					extensionErrors.push({
+						extensionPath: error.extensionPath,
+						event: error.event,
+						error: error.error,
+					});
+				},
+				invalidate: () => {},
+				getAllRegisteredTools: () => [],
+				emitBeforeAgentStart: async (_trigger, options) => ({
+					messages: [],
+					systemPromptOptions: JSON.parse(JSON.stringify(options)),
+				}),
+			};
+			session._extensionRunner = fakeRunner;
+
+			const sessionEvents = [];
+			session.subscribe((event) => {
+				sessionEvents.push(snapEvent(event));
+			});
+			globalThis.__piParityUuidOverride = nextUuid;
+
+			const pendingPromises = [];
+			const results = [];
+			for (const op of args.script) {
+				try {
+					if (op === null || typeof op !== "object" || Array.isArray(op)) {
+						throw new Error("ops entries must be objects");
+					}
+					if (typeof op.op !== "string") throw new Error("missing op");
+					let v = null;
+					switch (op.op) {
+						case "prompt": {
+							if (typeof op.text !== "string") throw new Error("missing text");
+							if (pendingPromises.length > 0) {
+								throw new Error("cannot prompt while a prompt is pending");
+							}
+							await session.prompt(op.text);
+							break;
+						}
+						case "promptStart": {
+							if (typeof op.text !== "string") throw new Error("missing text");
+							pendingPromises.push(session.prompt(op.text));
+							break;
+						}
+						case "waitEvent": {
+							if (typeof op.eventType !== "string") throw new Error("missing eventType");
+							while (!sessionEvents.some((event) => event.type === op.eventType)) {
+								await new Promise((resolve) => setImmediate(resolve));
+							}
+							break;
+						}
+						case "abortRetry":
+							session.abortRetry();
+							break;
+						case "abortTap":
+							void session.abort();
+							break;
+						case "abort": {
+							if (pendingPromises.length > 0) {
+								throw new Error("cannot abort while a prompt is pending");
+							}
+							await session.abort();
+							break;
+						}
+						case "waitForIdle": {
+							if (pendingPromises.length > 0) {
+								throw new Error("cannot waitForIdle while a prompt is pending");
+							}
+							await session.waitForIdle();
+							break;
+						}
+						case "awaitPrompt": {
+							const pending = pendingPromises.shift();
+							if (pending === undefined) throw new Error("no pending prompt");
+							await pending;
+							break;
+						}
+						default:
+							throw new Error("unknown agent-session-retry op: " + op.op);
+					}
+					results.push(v === undefined ? null : v);
+				} catch (e) {
+					results.push({ thrown: e && e.message !== undefined ? e.message : String(e) });
+				}
+			}
+			return {
+				result: {
+					results,
+					sessionEvents,
+					entries: sessionManager.getEntries(),
+					sleepLog,
+					promptsSentToAgent,
+					isRetryingAtEnd: session.isRetrying,
+					extensionEvents,
+					extensionErrors,
+				},
+			};
+		} finally {
+			globalThis.__piParityUuidOverride = null;
+			globalThis.setTimeout = realSetTimeout;
+			Date.now = realDateNow;
+			globalThis.Date = RealDate;
+		}
+	}
+
 	if (tool === "file-mutation-queue") {
 		// dist/core/tools/file-mutation-queue.js — withFileMutationQueue over
 		// scripted fns. Ops run concurrently; each fn marks itself started,

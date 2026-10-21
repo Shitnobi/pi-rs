@@ -317,6 +317,7 @@ pub fn run_agent_session_tools_harness(args: &Value) -> Result<Value, String> {
         prompt_templates: Vec::new(),
         system_prompt: None,
         model_lookup: None,
+        sleeper: None,
         agent,
         session_manager,
         settings: Arc::new(FixedSettings {

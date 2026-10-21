@@ -10208,3 +10208,111 @@ function mrRestore(name, o = {}) {
 function mrScoped(model, thinkingLevel) {
 	return { model, ...(thinkingLevel !== undefined ? { thinkingLevel } : {}) };
 }
+
+// =========================================================== agent-session-retry
+const asrr = (name, args) => ({
+	name: "agent-session-retry/" + name,
+	tool: "agent-session-retry",
+	args: {
+		...args,
+		config: { systemPrompt: "You are the parity assistant.", ...(args.config ?? {}) },
+	},
+});
+const asrRetry = (o = {}) => ({
+	enabled: o.enabled ?? true,
+	maxRetries: o.maxRetries ?? 3,
+	baseDelayMs: o.baseDelayMs ?? 4,
+	maxAgentDelayMs: o.maxAgentDelayMs ?? 100,
+});
+const asrErrTurn = (errorMessage) => aspTurn(aspMsg({ stopReason: "error", errorMessage }));
+cases.push(
+	asrr("missing-args", {}),
+	asrr("retry-success", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry() } },
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [asrErrTurn("overloaded_error"), aspTurn(aspMsg({ content: [{ type: "text", text: "recovered" }] }))],
+	}),
+	asrr("retry-multi-error-then-success", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry({ baseDelayMs: 4 }) } },
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [asrErrTurn("overloaded_error"), asrErrTurn("500 Internal"), aspTurn(aspMsg())],
+	}),
+	asrr("retry-exhausted", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry({ maxRetries: 2, baseDelayMs: 2 }) } },
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [asrErrTurn("overloaded_error"), asrErrTurn("overloaded_error"), asrErrTurn("overloaded_error")],
+	}),
+	asrr("retry-disabled", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry({ enabled: false }) } },
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [asrErrTurn("overloaded_error")],
+	}),
+	asrr("non-retryable-error", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry() } },
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [asrErrTurn("invalid_api_key")],
+	}),
+	// NOTE: context-overflow is deferred to tranche 13 (compaction): TS routes
+	// it through _checkCompaction's overflow-recovery path (_omitRecoveryAttempt
+	// + _runAutoCompaction), which is not ported yet.
+	asrr("empty-error-message-not-retried", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry() } },
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [aspTurn(aspMsg({ stopReason: "error", errorMessage: "" }))],
+	}),
+	asrr("backoff-capped-at-max-agent-delay", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry({ maxRetries: 5, baseDelayMs: 1, maxAgentDelayMs: 5 }) } },
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [
+			asrErrTurn("overloaded_error"), asrErrTurn("overloaded_error"), asrErrTurn("overloaded_error"),
+			asrErrTurn("overloaded_error"), asrErrTurn("overloaded_error"), aspTurn(aspMsg()),
+		],
+	}),
+	asrr("backoff-safe-integer-cap", {
+		nowMs: ASP_NOW,
+		config: {
+			model: aspModel(),
+			entries: aspHeader(),
+			settings: { retry: asrRetry({ maxRetries: 1, baseDelayMs: 1e300, maxAgentDelayMs: 1e300 }) },
+		},
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [asrErrTurn("overloaded_error"), aspTurn(aspMsg())],
+	}),
+	asrr("abort-retry-mid-sleep", {
+		nowMs: ASP_NOW,
+		sleepMode: "pending",
+		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry({ baseDelayMs: 100 }) } },
+		script: [
+			{ op: "promptStart", text: "hello" },
+			{ op: "waitEvent", eventType: "auto_retry_start" },
+			{ op: "abortRetry" },
+			{ op: "awaitPrompt" },
+		],
+		providerTurns: [asrErrTurn("overloaded_error")],
+	}),
+	asrr("abort-mid-sleep", {
+		nowMs: ASP_NOW,
+		sleepMode: "pending",
+		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry({ baseDelayMs: 100 }) } },
+		script: [
+			{ op: "promptStart", text: "hello" },
+			{ op: "waitEvent", eventType: "auto_retry_start" },
+			{ op: "abortTap" },
+			{ op: "awaitPrompt" },
+		],
+		providerTurns: [asrErrTurn("overloaded_error")],
+	}),
+	asrr("unknown-op", {
+		nowMs: ASP_NOW,
+		config: { model: aspModel(), entries: aspHeader(), settings: { retry: asrRetry() } },
+		script: [{ op: "bogus" }],
+		providerTurns: [],
+	}),
+);

@@ -56,7 +56,7 @@ impl AgentSession {
         }
         // Compaction before the prompt may have scheduled a retry; the new
         // prompt replaces it.
-        // TODO(tranche 12): `_failedResponse = undefined`.
+        self.state.failed_response = None;
         self.record_selection();
         // The run records the loadout in the transcript; restored tools
         // that did not register by now are dropped.
@@ -66,7 +66,7 @@ impl AgentSession {
         if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
             self.finish_cancelled_retry();
         }
-        // TODO(tranche 12): `_failedResponse = undefined`.
+        self.state.failed_response = None;
         self.state.tools.run_system_prompt_options = None;
         // TODO(tranche 15): `_flushPendingBashMessages()`.
         self.flush_pending_custom_messages();
@@ -94,7 +94,7 @@ impl AgentSession {
             self.pump_agent_events().await;
             self.resume_turn_end_continuation().await;
             while !self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
-                if self.handle_post_agent_run().await {
+                if self.handle_post_agent_run().await? {
                     if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
                         break;
                     }
@@ -275,21 +275,52 @@ impl AgentSession {
         Ok(messages)
     }
 
-    /// TS `_handlePostAgentRun()`.
-    pub(super) async fn handle_post_agent_run(&mut self) -> bool {
+    /// TS `_handlePostAgentRun()`. `Err` models a throw (the
+    /// `_omitRecoveryAttempt` projected-message guard); the TS throw
+    /// propagates out of `prompt()` after the run's finally.
+    pub(super) async fn handle_post_agent_run(&mut self) -> Result<bool, String> {
         let message = self.state.last_assistant_message.take();
         self.state.last_assistant_tool_results.clear();
         if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
             self.finish_cancelled_retry();
-            return false;
+            return Ok(false);
         }
-        if message.is_none() {
-            return self.agent.has_queued_messages();
+        let Some(message) = message else {
+            return Ok(self.agent.has_queued_messages());
+        };
+        if self.is_retryable_error(&self.state.arena[message])
+            && self.prepare_retry(message).await?
+        {
+            if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
+                self.finish_cancelled_retry();
+            }
+            self.state.failed_response = Some(message);
+            return Ok(!self.state.agent_run_abort_requested.load(Ordering::SeqCst));
         }
-        // TODO(tranche 12): retryable-error routing (`_isRetryableError` /
-        // `_prepareRetry`); (tranche 13) `_checkCompaction`.
-        !self.state.agent_run_abort_requested.load(Ordering::SeqCst)
-            && self.agent.has_queued_messages()
+        if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
+            self.finish_cancelled_retry();
+            return Ok(false);
+        }
+
+        if self.state.arena[message].get("stopReason").and_then(Value::as_str) == Some("error")
+            && self.state.retry_attempt > 0.0
+        {
+            let attempt = self.state.retry_attempt;
+            let final_error = self.state.arena[message]
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            self.emit(super::events::auto_retry_end_event(
+                false,
+                attempt,
+                final_error.as_deref(),
+            ));
+            self.state.retry_attempt = 0.0;
+        }
+
+        // TODO(tranche 13): `_checkCompaction`.
+        Ok(!self.state.agent_run_abort_requested.load(Ordering::SeqCst)
+            && self.agent.has_queued_messages())
     }
 
     /// TS `_runBeforeSettleBoundary()`.
@@ -570,7 +601,7 @@ impl AgentSession {
     }
 
     /// TS `_finishCancelledRetry()`.
-    fn finish_cancelled_retry(&mut self) {
+    pub(super) fn finish_cancelled_retry(&mut self) {
         if self.state.retry_attempt == 0.0 {
             return;
         }
@@ -586,7 +617,7 @@ impl AgentSession {
         if self.state.is_agent_run_active.load(Ordering::SeqCst) {
             self.state.agent_run_abort_requested.store(true, Ordering::SeqCst);
         }
-        // TODO(tranche 12): this.abortRetry();
+        self.abort_retry();
         // TODO(tranche 13): this.abortCompaction();
         // TODO(tranche 16): this.abortBranchSummary();
         // TODO(tranche 15): this.abortBash();

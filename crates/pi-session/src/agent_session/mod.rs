@@ -9,6 +9,7 @@
 pub mod events;
 pub mod event_handler;
 pub mod prompt;
+pub mod retry;
 pub mod run;
 pub mod system_prompt;
 pub mod tools;
@@ -24,7 +25,6 @@ use pi_agent::types::BoxFuture;
 use pi_agent::{Agent, Clock};
 use pi_core::session_manager::SessionManager;
 use pi_core::settings_manager::RetrySettings;
-
 pub use events::{MsgId, SessionAgentEvent};
 
 /// TS `settingsManager.getRetrySettings()` seam — the settings the events
@@ -172,6 +172,9 @@ pub struct AgentSessionConfig {
     /// TS `_modelRuntime.getModel(provider, modelId)` — the `_recordSelection`
     /// seam (tranche 14 ports the full runtime).
     pub model_lookup: Option<Arc<dyn Fn(&str, &str) -> Option<Value> + Send + Sync>>,
+    /// TS `sleep(delayMs, signal)` seam (plan §3): the retry backoff
+    /// sleeper. `None` = the real tokio-time sleeper.
+    pub sleeper: Option<Arc<dyn pi_agent::host::Sleeper>>,
 }
 
 /// A deferred `agent_settled` action (TS `_deferredSettledActions` holds
@@ -193,8 +196,10 @@ pub enum DeferredSettledAction {
     },
 }
 
-/// TS `AgentSessionEventListener`.
-pub type SessionEventListener = Box<dyn FnMut(&Value) + Send>;
+/// TS `AgentSessionEventListener`. `Sync` is a Rust-side requirement so
+/// the session (and its listener list) can move onto other threads — the
+/// retry harness holds a prompt run on a spawned task.
+pub type SessionEventListener = Box<dyn FnMut(&Value) + Send + Sync>;
 
 /// The mutable half of `AgentSession` (TS private fields).
 struct SessionState {
@@ -261,6 +266,15 @@ struct SessionState {
     open_message: Option<MsgId>,
     run_message_values: Vec<Value>,
     run_message_ids: Vec<MsgId>,
+    /// TS `_failedResponse` — the failed attempt routed through the
+    /// request projection (virtual-model routing is tranche 14; the state
+    /// bookkeeping is tranche 12).
+    failed_response: Option<MsgId>,
+    /// TS `_retryAbortController` (shared — the harness fires
+    /// `abortRetry()` while a prompt run holds the session; see
+    /// [`AgentSession::abort_retry_tap`]). `Some` while a retry sleep is
+    /// in flight (`isRetrying`).
+    retry_abort: Arc<Mutex<Option<pi_agent::host::AbortHandle>>>,
 }
 
 /// TS `class AgentSession` — the events slice.
@@ -288,6 +302,8 @@ pub struct AgentSession {
     prompt_templates: Vec<pi_core::prompt_templates::PromptTemplate>,
     /// TS `_modelRuntime.getModel` (record_selection seam).
     model_lookup: Option<Arc<dyn Fn(&str, &str) -> Option<Value> + Send + Sync>>,
+    /// TS `sleep(delayMs, signal)` seam — the retry backoff sleeper.
+    sleeper: Arc<dyn pi_agent::host::Sleeper>,
     /// Host paths the default docs section renders (system_prompt docs).
     doc_paths: system_prompt::DocPaths,
     /// The agent→session event queue (the subscription only pushes;
@@ -321,6 +337,7 @@ impl AgentSession {
             skills: config.skills,
             prompt_templates: config.prompt_templates,
             model_lookup: config.model_lookup,
+            sleeper: config.sleeper.unwrap_or(Arc::new(pi_agent::host::TokioSleeper)),
             doc_paths: system_prompt::DocPaths::default(),
             agent_event_queue: Arc::clone(&agent_event_queue),
             state: SessionState {
@@ -352,6 +369,8 @@ impl AgentSession {
                 open_message: None,
                 run_message_values: Vec::new(),
                 run_message_ids: Vec::new(),
+                failed_response: None,
+                retry_abort: Arc::new(Mutex::new(None)),
             },
             idle_resolvers: Mutex::new(Vec::new()),
             next_listener_id: 0,
@@ -613,7 +632,7 @@ impl AgentSession {
     /// summary/bash aborts and resource cleanup arrive with their
     /// tranches; the extension invalidation message is byte-exact.
     pub fn dispose(&mut self) {
-        // TODO(tranche 12): this.abortRetry();
+        self.abort_retry();
         // TODO(tranche 13): this.abortCompaction();
         // TODO(tranche 16): this.abortBranchSummary();
         // TODO(tranche 15): this.abortBash();
@@ -658,10 +677,14 @@ impl AgentSession {
         let abort_requested = Arc::clone(&self.state.agent_run_abort_requested);
         let is_before_settle = Arc::clone(&self.state.is_before_settle);
         let abort_during_before_settle = Arc::clone(&self.state.abort_during_before_settle);
+        let retry_abort = Arc::clone(&self.state.retry_abort);
         let agent = self.agent.clone();
         Arc::new(move || {
             if active.load(Ordering::SeqCst) {
                 abort_requested.store(true, Ordering::SeqCst);
+            }
+            if let Some(handle) = retry_abort.lock().expect("retry abort slot").as_ref() {
+                handle.abort();
             }
             if is_before_settle.load(Ordering::SeqCst) {
                 abort_during_before_settle.store(true, Ordering::SeqCst);

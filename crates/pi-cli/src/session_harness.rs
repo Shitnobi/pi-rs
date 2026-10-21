@@ -397,6 +397,7 @@ pub fn run_agent_session_events_harness(args: &Value) -> Result<Value, String> {
         prompt_templates: Vec::new(),
         system_prompt: None,
         model_lookup: None,
+        sleeper: None,
     });
 
     // Seed the identity arena with the pool in order (pool index == MsgId),

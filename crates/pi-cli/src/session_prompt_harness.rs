@@ -470,6 +470,7 @@ pub fn run_agent_session_prompt_harness(args: &Value) -> Result<Value, String> {
         prompt_templates: templates,
         system_prompt,
         model_lookup: None,
+        sleeper: None,
     });
 
     // Public listener collector (the TS side deep-clones each event at

@@ -568,6 +568,7 @@ pub fn run_agent_session_run_harness(args: &Value) -> Result<Value, String> {
         prompt_templates: Vec::new(),
         system_prompt: Some(system_prompt),
         model_lookup,
+        sleeper: None,
     });
 
     // Install the session-reaching taps (TS: the fake runner closes over
