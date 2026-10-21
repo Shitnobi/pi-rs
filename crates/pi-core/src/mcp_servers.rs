@@ -851,7 +851,11 @@ pub struct RegisteredMcpServer {
 #[derive(Default)]
 pub struct McpServerRegistry {
     servers: Vec<RegisteredMcpServer>,
-    change_listener: Option<Box<dyn Fn()>>,
+    // Invoked after every mutation with the post-mutation server list; the
+    // list is passed (not read back) so listeners never re-enter the
+    // registry's lock (the JS original reads `list()` on the unlocked
+    // single-threaded registry).
+    change_listener: Option<Box<dyn Fn(&[RegisteredMcpServer]) + Send + Sync>>,
 }
 
 impl McpServerRegistry {
@@ -868,7 +872,7 @@ impl McpServerRegistry {
             self.servers.push(server);
         }
         if let Some(listener) = &self.change_listener {
-            listener();
+            listener(&self.servers);
         }
     }
 
@@ -886,7 +890,7 @@ impl McpServerRegistry {
         }
         self.servers.retain(|s| s.name != name);
         if let Some(listener) = &self.change_listener {
-            listener();
+            listener(&self.servers);
         }
     }
 
@@ -901,7 +905,7 @@ impl McpServerRegistry {
 
     /// Called after every change. The runner sets it when it binds, to emit
     /// `mcp_servers_change`.
-    pub fn set_change_listener(&mut self, listener: Option<Box<dyn Fn()>>) {
+    pub fn set_change_listener(&mut self, listener: Option<Box<dyn Fn(&[RegisteredMcpServer]) + Send + Sync>>) {
         self.change_listener = listener;
     }
 }
@@ -1272,9 +1276,11 @@ mod tests {
     #[test]
     fn registry_semantics() {
         let mut registry = McpServerRegistry::new();
-        let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0usize));
         let counter = calls.clone();
-        registry.set_change_listener(Some(Box::new(move || counter.set(counter.get() + 1))));
+        registry.set_change_listener(Some(Box::new(move |_servers| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })));
 
         let config = |url: &str| validate_mcp_server_config("a", &json!({ "url": url })).unwrap();
         registry.register(RegisteredMcpServer {
@@ -1293,7 +1299,7 @@ mod tests {
             config: config("http://3"),
             extension_path: "/y".to_string(),
         });
-        assert_eq!(calls.get(), 3);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         let listed = registry.list();
         assert_eq!(
             listed
@@ -1308,19 +1314,19 @@ mod tests {
         assert_eq!(registry.get("a").unwrap().config.url().unwrap(), "http://3");
         // Unregister with the wrong owner is a no-op (no change event).
         registry.unregister("a", "/wrong");
-        assert_eq!(calls.get(), 3);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         assert_eq!(registry.list().len(), 2);
         // Unregistering an unknown server is also a no-op.
         registry.unregister("nope", "/x");
-        assert_eq!(calls.get(), 3);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         // Right owner removes and fires the listener.
         registry.unregister("a", "/y");
-        assert_eq!(calls.get(), 4);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
         assert_eq!(registry.list().iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["b"]);
         assert!(registry.get("a").is_none());
         // The listener can be cleared.
         registry.set_change_listener(None);
         registry.unregister("b", "/x");
-        assert_eq!(calls.get(), 4);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 }

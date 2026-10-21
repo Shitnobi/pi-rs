@@ -12239,3 +12239,690 @@ cases.push(
 		modelRuntime: { throwOn: ["registerProvider", "registerNativeProvider", "registerVirtualModel"] },
 	}),
 );
+
+// ---- extension-runner: loader + runner core slice (mirrors the ----------
+// "extension-runner" entries in ts-harness.js and pi-cli
+// extension_runner_harness.rs; factory scripts + op sequences).
+
+// Helper: one extension-runner case from an op list.
+function exr(name, ops) {
+	return { tool: "extension-runner", name: "exr/" + name, args: { ops } };
+}
+
+cases.push(
+	// -- load lifecycle ---------------------------------------------------
+	exr("load-empty", [
+		{ op: "load", path: "/ext/a.js", script: [] },
+		{ op: "createRunner" },
+		{ op: "hasHandlers", event: "session_start" },
+	]),
+	exr("load-factory-throw", [
+		{ op: "load", path: "/ext/a.js", script: [{ step: "throw", message: "boom" }] },
+		{ op: "createRunner" },
+	]),
+	exr("load-try-step", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "try", steps: [{ step: "throw", message: "inner failure" }] },
+				{ step: "throw", message: "after try" },
+			],
+		},
+	]),
+	exr("load-pending-lifecycle", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "registerFlag", name: "verbose", options: { type: "boolean", default: true, description: "Verbose output" } },
+				{ step: "getFlag", name: "verbose" },
+				{ step: "getFlag", name: "nope" },
+				{ step: "getMcpServers" },
+				{ step: "try", steps: [{ step: "getActiveTools" }] },
+				{ step: "registerMcpServer", name: "alpha", config: { command: "node" } },
+				{ step: "captureApi", key: "a" },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "mcpList" },
+		{ op: "getActiveTools" },
+		{ op: "bindCore", actions: { activeTools: ["read", "bash"] } },
+		{ op: "getFlagValues" },
+		{ op: "getActiveTools" },
+		{ op: "api", key: "a", steps: [{ step: "getFlag", name: "verbose" }, { step: "getActiveTools" }] },
+	]),
+	exr("load-throw-discards-pending", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "eventsOn", channel: "chan", handler: { id: 1 } },
+				{ step: "registerFlag", name: "f", options: { type: "number", default: 1 } },
+				{ step: "registerMcpServer", name: "s", config: { command: "x" } },
+				{ step: "throw", message: "kaput" },
+			],
+		},
+		{ op: "busEmit", channel: "chan", data: { n: 1 } },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "getFlagValues" },
+		{ op: "mcpList" },
+	]),
+
+	// -- bindCore: model-registry forwarding --------------------------------
+	exr("bindcore-flush-providers", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "registerProvider", name: "p1", config: { baseUrl: "https://p1.example", apiKey: "k" } },
+				{ step: "registerProvider", name: "p2", config: { baseUrl: "https://p2.example" } },
+				{ step: "unregisterProvider", name: "p2" },
+				{ step: "registerProviderNative", provider: { id: "np1", name: "Native One" } },
+				{ step: "registerVirtualModel", definition: { provider: "p1", id: "vm1", modelId: "m" } },
+				{ step: "registerVirtualModel", definition: { provider: "p1", id: "vm2" } },
+				{ step: "unregisterVirtualModel", provider: "p1", id: "vm2" },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+	]),
+	exr("bindcore-flush-throwOn", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "registerProvider", name: "p1", config: { baseUrl: "https://p1.example" } },
+				{ step: "registerVirtualModel", definition: { provider: "p1", id: "vm1" } },
+			],
+		},
+		{ op: "createRunner", throwOn: ["registerProvider", "registerVirtualModel"], throwMsg: "registry down" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+	]),
+	exr("bindcore-provider-hooks", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "registerProvider", name: "hp", config: { x: 1 } },
+				{ step: "registerProviderNative", provider: { id: "np" } },
+				{ step: "registerVirtualModel", definition: { provider: "hp", id: "v" } },
+				{ step: "captureApi", key: "a" },
+			],
+		},
+		{ op: "createRunner" },
+		{
+			op: "bindCore",
+			providerActions: {
+				registerProvider: "log",
+				registerNativeProvider: "log",
+				unregisterProvider: "log",
+				registerVirtualModel: "log",
+				unregisterVirtualModel: "log",
+			},
+		},
+		{
+			op: "api",
+			key: "a",
+			steps: [
+				{ step: "unregisterProvider", name: "hp" },
+				{ step: "registerProvider", name: "live", config: { y: 2 } },
+				{ step: "registerVirtualModel", definition: { provider: "live", id: "lv" } },
+				{ step: "unregisterVirtualModel", provider: "live", id: "lv" },
+			],
+		},
+	]),
+	exr("bindcore-provider-hooks-partial-fallback", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "registerProviderNative", provider: { id: "np" } },
+				{ step: "registerVirtualModel", definition: { provider: "x", id: "v" } },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore", providerActions: { registerProvider: "log" } },
+	]),
+	exr("bindcore-hook-throw", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "registerProvider", name: "hp", config: { x: 1 } }],
+		},
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore", providerActions: { registerProvider: "throw" } },
+	]),
+	exr("api-provider-immediate", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "captureApi", key: "a" }],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{
+			op: "api",
+			key: "a",
+			steps: [
+				{ step: "registerProvider", name: "live", config: { y: 2 } },
+				{ step: "registerProviderNative", provider: { id: "np2" } },
+				{ step: "registerVirtualModel", definition: { provider: "live", id: "lv" } },
+				{ step: "unregisterVirtualModel", provider: "live", id: "lv" },
+				{ step: "unregisterProvider", name: "live" },
+			],
+		},
+	]),
+	exr("api-provider-immediate-throw", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "captureApi", key: "a" }],
+		},
+		{ op: "createRunner", throwOn: ["registerProvider", "unregisterProvider"] },
+		{ op: "bindCore" },
+		{
+			op: "api",
+			key: "a",
+			steps: [
+				{ step: "registerProvider", name: "live", config: {} },
+				{ step: "unregisterProvider", name: "live" },
+			],
+		},
+	]),
+
+	// -- handlers / emit ----------------------------------------------------
+	exr("has-handlers", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "on", event: "evt", handler: { id: 1 } },
+				{ step: "on", event: "evt", handler: { id: 2 } },
+				{ step: "captureApi", key: "a" },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "hasHandlers", event: "evt" },
+		{ op: "hasHandlers", event: "other" },
+		{ op: "api", key: "a", steps: [{ step: "off", index: 0 }] },
+		{ op: "api", key: "a", steps: [{ step: "off", index: 0 }] },
+		{ op: "hasHandlers", event: "evt" },
+		{ op: "api", key: "a", steps: [{ step: "off", index: 1 }] },
+		{ op: "hasHandlers", event: "evt" },
+	]),
+	exr("emit-multi-handler-order", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "on", event: "custom", handler: { id: 1, reads: ["cwd"] } },
+				{ step: "on", event: "custom", handler: { id: 2 } },
+			],
+		},
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [{ step: "on", event: "custom", handler: { id: 3, reads: ["mode", "hasUI"] } }],
+		},
+		{ op: "createRunner" },
+		{
+			op: "bindCore",
+			actions: { activeTools: [] },
+			contextActions: { isIdle: true, isProjectTrusted: false, model: { providerId: "p", modelId: "m" } },
+		},
+		{ op: "emit", event: { type: "custom", payload: 1 } },
+	]),
+	exr("emit-pre-bind-context-defaults", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "on", event: "custom", handler: { id: 1, reads: ["isIdle", "isProjectTrusted", "model", "thinkingLevel"] } },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "emit", event: { type: "custom" } },
+	]),
+	exr("emit-handler-throw", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "on", event: "custom", handler: { id: 1, throws: "h1 blew up" } },
+				{ step: "on", event: "custom", handler: { id: 2 } },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "emit", event: { type: "custom" } },
+	]),
+	exr("emit-no-handlers", [
+		{ op: "load", path: "/ext/a.js", script: [] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emit", event: { type: "nobody_listens" } },
+	]),
+	exr("emit-session-before-cancel", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "on", event: "session_before_switch", handler: { id: 1, returns: { cancel: true } } },
+				{ step: "on", event: "session_before_switch", handler: { id: 2 } },
+			],
+		},
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [{ step: "on", event: "session_before_fork", handler: { id: 3, returns: { entryId: "e1" } } }],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emit", event: { type: "session_before_switch", sessionPath: "/x" } },
+		{ op: "emit", event: { type: "session_before_fork", entryId: "e0" } },
+		{ op: "emit", event: { type: "session_before_compact" } },
+	]),
+	exr("emit-message-end", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "on", event: "message_end", handler: { id: 1, returns: { message: { role: "assistant", content: [{ type: "text", text: "changed" }] } } } },
+				{ step: "on", event: "message_end", handler: { id: 2, returns: { message: { role: "user" } } } },
+				{ step: "on", event: "message_end", handler: { id: 3 } },
+			],
+		},
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [{ step: "on", event: "message_end", handler: { id: 4, returns: { message: { role: "assistant", content: [{ type: "text", text: "final" }] } } } }],
+		},
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "emitMessageEnd", event: { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "orig" }] } } },
+	]),
+	exr("emit-message-end-unmodified", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "on", event: "message_end", handler: { id: 1 } }],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitMessageEnd", event: { type: "message_end", message: { role: "assistant", content: [] } } },
+	]),
+	exr("error-listener-remove", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "on", event: "custom", handler: { id: 1, throws: "x" } }],
+		},
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "onError" },
+		{ op: "removeErrorListener", id: 0 },
+		{ op: "bindCore" },
+		{ op: "emit", event: { type: "custom" } },
+	]),
+
+	// -- flags ---------------------------------------------------------------
+	exr("flags", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "registerFlag", name: "alpha", options: { type: "string", default: "one", description: "First" } },
+				{ step: "registerFlag", name: "beta", options: { type: "number" } },
+				{ step: "captureApi", key: "a" },
+			],
+		},
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [
+				{ step: "registerFlag", name: "alpha", options: { type: "string", default: "two" } },
+				{ step: "registerFlag", name: "gamma", options: { type: "boolean", default: false } },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "getFlags" },
+		{ op: "setFlagValue", name: "beta", value: 7 },
+		{ op: "getFlagValues" },
+		{ op: "api", key: "a", steps: [{ step: "getFlag", name: "beta" }, { step: "getFlag", name: "gamma" }, { step: "getFlag", name: "alpha" }] },
+		{ op: "setFlagValue", name: "delta", value: true },
+		{
+			op: "load",
+			path: "/ext/c.js",
+			script: [
+				{ step: "registerFlag", name: "delta", options: { type: "boolean", default: false } },
+				{ step: "getFlag", name: "delta" },
+			],
+		},
+		{ op: "getFlagValues" },
+	]),
+	exr("flags-invalid-default", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "try", steps: [{ step: "registerFlag", name: "bad1", options: { type: "boolean", default: "nope" } }] },
+				{ step: "try", steps: [{ step: "registerFlag", name: "bad2", options: { default: true } }] },
+				{ step: "registerFlag", name: "ok", options: { type: "number", default: 5 } },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "getFlags" },
+	]),
+
+	// -- commands / tools -----------------------------------------------------
+	exr("commands", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "registerCommand", name: "greet", options: { handler: true, description: "Say hi" } },
+				{ step: "registerCommand", name: "run", options: { handler: true } },
+				{ step: "try", steps: [{ step: "registerCommand", name: "", options: { handler: true } }] },
+				{ step: "try", steps: [{ step: "registerCommand", name: "nohandler", options: {} }] },
+			],
+		},
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [{ step: "registerCommand", name: "greet", options: { handler: true, description: "Also hi" } }],
+		},
+		{ op: "createRunner" },
+		{ op: "getRegisteredCommands" },
+		{ op: "getCommand", name: "greet:2" },
+		{ op: "getCommand", name: "greet" },
+		{ op: "getCommand", name: "run" },
+		{ op: "getCommand", name: "missing" },
+	]),
+	exr("tools", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "registerTool", tool: { name: "t1", description: "d", parameters: { type: "object", properties: {} } } },
+				{ step: "try", steps: [{ step: "registerTool", tool: { name: "bad" } }] },
+				{ step: "try", steps: [{ step: "registerTool", tool: { name: "bad2", parameters: [1] } }] },
+				{ step: "captureApi", key: "a" },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore", actions: { activeTools: ["read"] } },
+		{ op: "getActiveTools" },
+		{ op: "api", key: "a", steps: [{ step: "registerTool", tool: { name: "t2", parameters: { type: "object" } } }] },
+		{ op: "getActiveTools" },
+	]),
+
+	// -- shortcuts ------------------------------------------------------------
+	exr("shortcuts", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "registerShortcut", shortcut: "ctrl+g", options: { description: "Go" } },
+				{ step: "registerShortcut", shortcut: "ctrl+c", options: {} },
+				{ step: "registerShortcut", shortcut: "ctrl+k", options: { description: "K" } },
+			],
+		},
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [{ step: "registerShortcut", shortcut: "ctrl+g", options: { description: "B go" } }],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "getShortcuts", keybindings: { "app.interrupt": "ctrl+c", "app.custom.thing": "ctrl+k" } },
+		{ op: "setUIContext", ui: true, mode: "interactive" },
+		{ op: "getShortcuts", keybindings: {} },
+	]),
+
+	// -- MCP servers ------------------------------------------------------------
+	exr("mcp-post-bind-register", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "captureApi", key: "a" }],
+		},
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [{ step: "captureApi", key: "b" }],
+		},
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "api", key: "a", steps: [{ step: "registerMcpServer", name: "alpha", config: { command: "node", args: ["-e", ""] } }] },
+		{ op: "mcpList" },
+		{ op: "reportUnhandledMcpServers" },
+		{ op: "api", key: "a", steps: [{ step: "registerMcpServer", name: "alpha", config: { command: "other" } }] },
+		{ op: "mcpList" },
+		{ op: "api", key: "b", steps: [{ step: "registerMcpServer", name: "beta", config: { command: "node" } }] },
+		{ op: "api", key: "a", steps: [{ step: "unregisterMcpServer", name: "beta" }] },
+		{ op: "mcpList" },
+		{ op: "api", key: "a", steps: [{ step: "unregisterMcpServer", name: "alpha" }] },
+		{ op: "mcpList" },
+	]),
+	exr("mcp-validation-errors", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "try", steps: [{ step: "registerMcpServer", name: "bad name!", config: { command: "x" } }] },
+				{ step: "try", steps: [{ step: "registerMcpServer", name: "s1", config: { command: 123 } }] },
+				{ step: "try", steps: [{ step: "registerMcpServer", name: "s2", config: { type: "sse", url: "https://x" } }] },
+				{ step: "try", steps: [{ step: "registerMcpServer", name: "s3", config: { command: "x", args: [1] } }] },
+				{ step: "try", steps: [{ step: "registerMcpServer", name: "s4", config: { url: "ftp://x" } }] },
+				{ step: "captureApi", key: "a" },
+			],
+		},
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [{ step: "captureApi", key: "b" }],
+		},
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "api", key: "a", steps: [{ step: "registerMcpServer", name: "my-srv", config: { command: "x" } }] },
+		{ op: "api", key: "a", steps: [{ step: "registerMcpServer", name: "my_srv", config: { command: "x" } }] },
+		{ op: "api", key: "b", steps: [{ step: "registerMcpServer", name: "my-srv", config: { command: "y" } }] },
+		{ op: "mcpList" },
+	]),
+	exr("mcp-handled-change", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "on", event: "mcp_servers_change", handler: { id: 1 } },
+				{ step: "captureApi", key: "a" },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "api", key: "a", steps: [{ step: "registerMcpServer", name: "gamma", config: { command: "node" } }] },
+		{ op: "mcpList" },
+		{ op: "reportUnhandledMcpServers" },
+	]),
+	exr("mcp-pre-bind-report", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "registerMcpServer", name: "early", config: { command: "node" } }],
+		},
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "reportUnhandledMcpServers" },
+		{ op: "reportUnhandledMcpServers" },
+		{ op: "mcpList" },
+	]),
+
+	// -- invalidate / stale ctx -----------------------------------------------
+	exr("invalidate-stale", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "captureApi", key: "a" },
+				{ step: "on", event: "custom", handler: { id: 1, reads: ["cwd"] } },
+				{ step: "eventsOn", channel: "chan", handler: { id: 9 } },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore", actions: { activeTools: ["read"] } },
+		{ op: "busEmit", channel: "chan", data: { n: 1 } },
+		{ op: "emit", event: { type: "custom" } },
+		{ op: "invalidate", message: "custom stale" },
+		{ op: "busEmit", channel: "chan", data: { n: 2 } },
+		{ op: "emit", event: { type: "custom" } },
+		{
+			op: "api",
+			key: "a",
+			steps: [{ step: "getFlag", name: "x" }, { step: "getActiveTools" }, { step: "eventsEmit", channel: "chan", data: { n: 3 } }],
+		},
+		{ op: "getActiveTools" },
+		{ op: "invalidate", message: "second message" },
+		{ op: "api", key: "a", steps: [{ step: "getFlag", name: "x" }] },
+	]),
+	exr("invalidate-default-message", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "captureApi", key: "a" }],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "invalidate" },
+		{ op: "api", key: "a", steps: [{ step: "getFlag", name: "x" }] },
+		{ op: "getActiveTools" },
+	]),
+
+	// -- UI context / shutdown ---------------------------------------------------
+	exr("ui-context", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "on", event: "custom", handler: { id: 1, reads: ["mode", "hasUI"] } }],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "hasUI" },
+		{ op: "emit", event: { type: "custom" } },
+		{ op: "setUIContext", ui: true, mode: "interactive" },
+		{ op: "hasUI" },
+		{ op: "emit", event: { type: "custom" } },
+		{ op: "setUIContext", ui: false },
+		{ op: "hasUI" },
+		{ op: "emit", event: { type: "custom" } },
+	]),
+	exr("shutdown", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "on", event: "custom", handler: { id: 1, calls: ["shutdown"] } }],
+		},
+		{ op: "createRunner" },
+		{ op: "shutdown" },
+		{ op: "bindCore", contextActions: { isIdle: true } },
+		{ op: "emit", event: { type: "custom" } },
+		{ op: "shutdown" },
+	]),
+	exr("session-shutdown", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "on", event: "session_shutdown", handler: { id: 1 } }],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitSessionShutdown", event: { type: "session_shutdown" } },
+	]),
+	exr("session-shutdown-no-handlers", [
+		{ op: "load", path: "/ext/a.js", script: [] },
+		{ op: "createRunner" },
+		{ op: "emitSessionShutdown", event: { type: "session_shutdown" } },
+	]),
+
+	// -- project trust ---------------------------------------------------------
+	exr("project-trust-decided", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "on", event: "project_trust", handler: { id: 1, returns: { trusted: "undecided" }, reads: ["isProjectTrusted"] } },
+				{ step: "on", event: "project_trust", handler: { id: 2, returns: { trusted: "yes", reason: "trusted by a" } } },
+			],
+		},
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [
+				{ step: "on", event: "project_trust", handler: { id: 3 } },
+				{ step: "on", event: "project_trust", handler: { id: 4, returns: { trusted: "no" } } },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "emitProjectTrust", event: { type: "project_trust", path: "/proj" }, ctx: { isProjectTrusted: true, mode: "print" } },
+	]),
+	exr("project-trust-error", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "on", event: "project_trust", handler: { id: 1, returns: { trusted: "undecided" } } }],
+		},
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [{ step: "on", event: "project_trust", handler: { id: 2, throws: "trust error" } }],
+		},
+		{ op: "createRunner" },
+		{ op: "emitProjectTrust", event: { type: "project_trust", path: "/proj" }, ctx: {} },
+	]),
+	exr("project-trust-all-undecided", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [{ step: "on", event: "project_trust", handler: { id: 1, returns: { trusted: "undecided" } } }],
+		},
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [{ step: "on", event: "project_trust", handler: { id: 2 } }],
+		},
+		{ op: "createRunner" },
+		{ op: "emitProjectTrust", event: { type: "project_trust", path: "/proj" }, ctx: {} },
+	]),
+
+	// -- events bus --------------------------------------------------------------
+	exr("events-bus", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "eventsOn", channel: "chan", handler: { id: 1 } },
+				{ step: "eventsOn", channel: "chan", handler: { id: 9, throws: "bus boom" } },
+				{ step: "eventsEmit", channel: "chan", data: { n: 0 } },
+				{ step: "captureApi", key: "a" },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "busEmit", channel: "chan", data: { n: 1 } },
+		{ op: "busEmit", channel: "other", data: { n: 2 } },
+		{ op: "api", key: "a", steps: [{ step: "eventsEmit", channel: "chan", data: { n: 3 } }] },
+	]),
+
+	// -- harness error paths --------------------------------------------------------
+	{ tool: "extension-runner", name: "exr/missing-ops", args: {} },
+);

@@ -37,6 +37,8 @@
  *   scripted base/extension/modelConfig inputs
  * - "event-bus": core/event-bus.js script-driven bus with numbered handlers
  *   and captured console.error handler-error reports
+ * - "extension-runner": core/extensions loader + runner driven via inline
+ *   factory scripts (real dist implementations)
  * - "timings": core/timings.js script-driven timings with an injected
  *   Date.now clock and captured console.error print stream
  * - "slash-commands": core/slash-commands.js builtin list + serde round-trip
@@ -2928,6 +2930,270 @@ async function runModule(tool, args, cwd) {
 
 	// ---- landed core-module wave (event-bus, timings, slash-commands, -------
 	// settings-defaults, settings-schema); mirrors pi-cli core_harness.rs.
+
+	if (tool === "extension-runner") {
+		// dist/core/extensions — the REAL loader + runner: loadExtensionFromFactory
+		// with scripted factories, ExtensionRunner core slice, emitSessionShutdown/
+		// ProjectTrust helpers. Mirrors crates/pi-cli/src/extension_runner_harness.rs.
+		const { createEventBus } = require(path.join(distDir, "core", "event-bus.js"));
+		const { loadExtensionFromFactory, createExtensionRuntime } = require(path.join(distDir, "core", "extensions", "loader.js"));
+		const { ExtensionRunner, emitSessionShutdownEvent, emitProjectTrustEvent } = require(path.join(distDir, "core", "extensions", "runner.js"));
+		const ops = args.ops;
+		if (!Array.isArray(ops)) throw new Error("missing ops");
+		const log = [];
+		const warns = [];
+		const jstr = (v) => JSON.stringify(v === undefined ? null : v);
+		const realError = console.error;
+		const realWarn = console.warn;
+		console.error = (...m) => log.push(m.join(" "));
+		console.warn = (...m) => warns.push(m.join(" "));
+		// Handlers defer their first log to a microtask so the fire-and-forget
+		// `mcp_servers_change` emit settles entirely after the op boundary on
+		// both sides (the Rust harness drains after each op).
+		const makeHandler = (spec) => {
+			const id = spec.id;
+			if (typeof id !== "number") throw new Error("missing handler id");
+			return async (event, ctx) => {
+				await Promise.resolve();
+				log.push(`h${id}:${event.type}`);
+				for (const field of spec.reads || []) {
+					try {
+						const v = ctx[field];
+						log.push(`h${id}.${field}=${jstr(typeof v === "function" ? v() : v)}`);
+					} catch (e) {
+						log.push(`h${id}.${field}!${e.message}`);
+					}
+				}
+				for (const method of spec.calls || []) {
+					try {
+						ctx[method]();
+						log.push(`h${id}.${method}:ok`);
+					} catch (e) {
+						log.push(`h${id}.${method}!${e.message}`);
+					}
+				}
+				if (spec.throws !== undefined) throw spec.throws;
+				return spec.returns;
+			};
+		};
+		const makeBusHandler = (spec) => {
+			const id = spec.id;
+			if (typeof id !== "number") throw new Error("missing bus handler id");
+			return (data) => {
+				log.push(`bus:${id}:${jstr(data)}`);
+				// Throw the raw string (not an Error) so the captured bus
+				// error report matches the Rust sink byte-for-byte.
+				if (spec.throws !== undefined) throw spec.throws;
+			};
+		};
+		const bus = createEventBus();
+		const runtime = createExtensionRuntime();
+		const extensions = [];
+		const captured = new Map();
+		const unsubs = [];
+		let runner = null;
+		let nextErrorId = 0;
+		const errorUnsubs = [];
+		const runScript = (pi, script) => {
+			for (const step of script) {
+				if (step === null || typeof step !== "object") throw new Error("missing step");
+				const strArg = (key) => {
+					if (typeof step[key] !== "string") throw new Error(`missing ${key}`);
+					return step[key];
+				};
+				switch (step.step) {
+					case "on":
+						unsubs.push(pi.on(strArg("event"), makeHandler(step.handler)));
+						break;
+					case "off": {
+						const token = unsubs[step.index];
+						if (!token) throw new Error("bad off index");
+						token();
+						break;
+					}
+					case "registerFlag": pi.registerFlag(strArg("name"), step.options || {}); break;
+					case "registerTool": pi.registerTool(step.tool); break;
+					case "registerCommand": {
+						// `handler: true` in the script stands in for a handler
+						// function (JSON cannot carry one); the Rust harness
+						// mirrors this convention.
+						const commandOptions = { ...(step.options || {}) };
+						if (commandOptions.handler === true) commandOptions.handler = () => {};
+						pi.registerCommand(strArg("name"), commandOptions);
+						break;
+					}
+					case "registerShortcut": pi.registerShortcut(strArg("shortcut"), step.options || {}); break;
+					case "registerProvider": pi.registerProvider(strArg("name"), step.config); break;
+					case "registerProviderNative": pi.registerProvider(step.provider); break;
+					case "unregisterProvider": pi.unregisterProvider(strArg("name")); break;
+					case "registerVirtualModel": pi.registerVirtualModel(step.definition); break;
+					case "unregisterVirtualModel": pi.unregisterVirtualModel(strArg("provider"), strArg("id")); break;
+					case "registerMcpServer": pi.registerMcpServer(strArg("name"), step.config); break;
+					case "unregisterMcpServer": pi.unregisterMcpServer(strArg("name")); break;
+					case "getMcpServers": log.push("api.getMcpServers:" + jstr(pi.getMcpServers())); break;
+					case "eventsEmit": pi.events.emit(strArg("channel"), step.data === undefined ? null : step.data); break;
+					case "eventsOn": pi.events.on(strArg("channel"), makeBusHandler(step.handler)); break;
+					case "getFlag": log.push("api.getFlag:" + jstr(pi.getFlag(strArg("name")))); break;
+					case "getActiveTools": log.push("api.getActiveTools:" + jstr(pi.getActiveTools())); break;
+					case "captureApi": captured.set(strArg("key"), pi); break;
+					case "throw": throw new Error(strArg("message"));
+					case "try":
+						try {
+							runScript(pi, step.steps || []);
+						} catch (e) {
+							log.push("caught:" + e.message);
+						}
+						break;
+					default: throw new Error("unknown step: " + step.step);
+				}
+			}
+		};
+		try {
+			for (const op of ops) {
+				const kind = op.op;
+				if (typeof kind !== "string") throw new Error("missing op");
+				switch (kind) {
+					case "load": {
+						if (typeof op.path !== "string") throw new Error("missing path");
+						const script = op.script;
+						if (!Array.isArray(script)) throw new Error("missing script");
+						try {
+							const extension = await loadExtensionFromFactory(
+								async (pi) => runScript(pi, script),
+								"/proj",
+								bus,
+								runtime,
+								op.path,
+							);
+							log.push(`load:${op.path}:ok`);
+							extensions.push(extension);
+						} catch (e) {
+							log.push(`load:${op.path}:thrown:${e.message}`);
+						}
+						break;
+					}
+					case "createRunner": {
+						const throwOn = op.throwOn || [];
+						const throwMsg = op.throwMsg || "mr boom";
+						const rec = (m, a) => {
+							if (throwOn.includes(m)) throw new Error(throwMsg);
+							log.push(`mr.${m}:${JSON.stringify(a)}`);
+						};
+						const modelRegistry = {
+							registerProvider: (...a) => rec("registerProvider", a),
+							registerVirtualModel: (...a) => rec("registerVirtualModel", a),
+							unregisterProvider: (...a) => rec("unregisterProvider", a),
+							unregisterVirtualModel: (...a) => rec("unregisterVirtualModel", a),
+						};
+						runner = new ExtensionRunner([...extensions], runtime, "/proj", null, modelRegistry);
+						log.push("runner:created");
+						break;
+					}
+					case "bindCore": {
+						const a = op.actions || {};
+						const c = op.contextActions || {};
+						const pa = op.providerActions;
+						const paCall = (m, mode, args) => {
+							if (mode === "throw") throw new Error("pa boom");
+							log.push(`pa.${m}:${JSON.stringify(args)}`);
+						};
+						runner.bindCore(
+							{
+								getActiveTools: () => a.activeTools || [],
+								getThinkingLevel: () => a.thinkingLevel === undefined ? null : a.thinkingLevel,
+								refreshTools: () => log.push("actions.refreshTools"),
+							},
+							{
+								isIdle: () => c.isIdle === true,
+								isProjectTrusted: () => c.isProjectTrusted === true,
+								getModel: () => (c.model === undefined ? undefined : c.model),
+								shutdown: () => log.push("contextActions.shutdown"),
+							},
+							pa === undefined
+								? undefined
+								: {
+										registerProvider: pa.registerProvider === undefined ? undefined : (n, cfg) => paCall("registerProvider", pa.registerProvider, [n, cfg]),
+										registerNativeProvider: pa.registerNativeProvider === undefined ? undefined : (p) => paCall("registerNativeProvider", pa.registerNativeProvider, [p]),
+										unregisterProvider: pa.unregisterProvider === undefined ? undefined : (n) => paCall("unregisterProvider", pa.unregisterProvider, [n]),
+										registerVirtualModel: pa.registerVirtualModel === undefined ? undefined : (d) => paCall("registerVirtualModel", pa.registerVirtualModel, [d]),
+										unregisterVirtualModel: pa.unregisterVirtualModel === undefined ? undefined : (p, i) => paCall("unregisterVirtualModel", pa.unregisterVirtualModel, [p, i]),
+									},
+						);
+						break;
+					}
+					case "onError": {
+						const id = nextErrorId++;
+						errorUnsubs.push(runner.onError((error) => {
+							log.push(`err${id}:${jstr({ extensionPath: error.extensionPath, event: error.event, error: error.error })}`);
+						}));
+						break;
+					}
+					case "removeErrorListener": if (errorUnsubs[op.id]) errorUnsubs[op.id](); break;
+					case "hasHandlers": log.push(`hasHandlers:${op.event}:${runner.hasHandlers(op.event)}`); break;
+					case "emit": log.push("emit:return:" + jstr(await runner.emit(op.event))); break;
+					case "emitMessageEnd": log.push("emitMessageEnd:return:" + jstr(await runner.emitMessageEnd(op.event))); break;
+					case "getFlags":
+						log.push("flags:" + jstr([...runner.getFlags()].map(([n, f]) => [n, { name: f.name, extensionPath: f.extensionPath, ...(f.description !== undefined ? { description: f.description } : {}), ...(f.type !== undefined ? { type: f.type } : {}), ...(f.default !== undefined ? { default: f.default } : {}) }])));
+						break;
+					case "setFlagValue": runner.setFlagValue(op.name, op.value); break;
+					case "getFlagValues": log.push("flagValues:" + jstr([...runner.getFlagValues()])); break;
+					case "getRegisteredCommands":
+						log.push("commands:" + jstr(runner.getRegisteredCommands().map((c) => ({ name: c.name, invocationName: c.invocationName, ...(c.description !== undefined ? { description: c.description } : {}), sourceInfo: c.sourceInfo }))));
+						break;
+					case "getCommand": {
+						const c = runner.getCommand(op.name);
+						log.push("command:" + jstr(c === undefined ? null : { name: c.name, invocationName: c.invocationName, ...(c.description !== undefined ? { description: c.description } : {}), sourceInfo: c.sourceInfo }));
+						break;
+					}
+					case "getShortcuts": {
+						const m = runner.getShortcuts(op.keybindings || {});
+						log.push("shortcuts:" + jstr([...m].map(([k, s]) => [k, { shortcut: s.shortcut, extensionPath: s.extensionPath, ...(s.description !== undefined ? { description: s.description } : {}) }])));
+						log.push("shortcutDiag:" + jstr(runner.getShortcutDiagnostics()));
+						break;
+					}
+					case "reportUnhandledMcpServers": runner.reportUnhandledMcpServers(); break;
+					case "invalidate": runner.invalidate(op.message); break;
+					case "getActiveTools":
+						try {
+							log.push("runner.getActiveTools:" + jstr(runner.getActiveTools()));
+						} catch (e) {
+							log.push("runner.getActiveTools!" + e.message);
+						}
+						break;
+					case "setUIContext": runner.setUIContext(op.ui ? {} : undefined, op.mode || "print"); break;
+					case "hasUI": log.push(`hasUI:${runner.hasUI()}`); break;
+					case "shutdown": runner.shutdown(); break;
+					case "emitSessionShutdown": log.push(`sessionShutdown:${await emitSessionShutdownEvent(runner, op.event)}`); break;
+					case "emitProjectTrust": {
+						const r = await emitProjectTrustEvent({ extensions }, op.event, op.ctx || {});
+						log.push("projectTrust:" + jstr({ result: r.result, errors: r.errors.map((e) => ({ extensionPath: e.extensionPath, event: e.event, error: e.error })) }));
+						break;
+					}
+					case "api": {
+						const pi = captured.get(op.key);
+						if (!pi) throw new Error(`unknown api key: ${op.key}`);
+						for (const step of op.steps || []) {
+							try {
+								runScript(pi, [step]);
+							} catch (e) {
+								log.push(`api:${op.key}:${step.step}!${e.message}`);
+							}
+						}
+						break;
+					}
+					case "busEmit": bus.emit(op.channel, op.data === undefined ? null : op.data); break;
+					case "mcpList": log.push("mcpServers:" + jstr(runtime.mcpServers.list())); break;
+					default: throw new Error("unknown op: " + kind);
+				}
+				// Settle fire-and-forget mcp_servers_change emits.
+				await new Promise((r) => setImmediate(r));
+			}
+		} finally {
+			console.error = realError;
+			console.warn = realWarn;
+		}
+		return { result: { log, warns } };
+	}
 
 	if (tool === "event-bus") {
 		// Script-driven createEventBus() with numbered handlers. The safe

@@ -1455,6 +1455,42 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       symmetrically (TS created it, Rust didn't); runtime harness
       validates all `files` values before any fixture write (TS
       throws before fs mutation; Rust wrote initial.jsonl first).
-- [ ] Remaining roadmap after phase 3 (see docs/plans/): extensions
-      (extension-runner real port, Phase 4+), tools/* slices,
-      shared typebox-walker refactor.
+- [x] **Phase 4 tranche 1 — extension runner core (loader + runner
+      slice).** extension_runner.rs (~1800 LOC): port of
+      core/extensions/loader.ts (ExtensionRuntime,
+      ExtensionAPI registration/commit/discard lifecycle via
+      PendingChange + apply_runtime_change, NOT_INITIALIZED action
+      stubs, load_extension_from_factory) and the core slice of
+      runner.ts (ExtensionRunner: bind_core pending-registration
+      flush over ProviderSink — providerActions hooks with
+      modelRegistry fallback —, hasHandlers, generic emit loop
+      with handler-error capture, emitMessageEnd, onError,
+      flags/tools/commands/shortcuts queries + reserved-keybinding
+      conflict diagnostics, queued mcp_servers_change drain,
+      reportUnhandledMcpServers, invalidate + DEFAULT_STALE_MESSAGE,
+      setUIContext/hasUI, shutdown), emit_session_shutdown_event,
+      emit_project_trust_event (first-decided-wins, undecided
+      fallthrough). Documented divergences in module doc:
+      factory-based loading (loadExtensionFromFactory mirrors TS
+      API), CtxView instead of live ExtensionContext getters, no
+      stack on ExtensionError. Provider unregister hooks/seam
+      return Result (TS propagates registry/hook throws through
+      applyRuntimeChange). mcp_servers.rs: change_listener is
+      Send+Sync. Parity harness `extension-runner` (both sides use
+      the real implementations; scripted factories + op
+      sequences), 41 cases (exr/): load lifecycle, bindCore
+      flush + throwOn, provider hooks incl. partial fallback and
+      throw propagation, api-provider immediate post-bind, emit
+      ordering/throws, message-end, error-listener removal, flags
+      (incl. invalid default), commands, tools, shortcuts,
+      mcp register/unregister/validation/handled-change/pre-bind
+      report, invalidate stale + default message, UI context,
+      shutdown, session-shutdown, project-trust decided/error/
+      undecided, events-bus. Suite **2643/2643** (full parity
+      incl. filesystem snapshots). Harness fix found during
+      smoke: projectTrust omits the `result` key when undefined
+      (JS undefined-omitted JSON).
+- [ ] Remaining roadmap (see docs/plans/): rest of extension-runner
+      real port (jiti/path discovery, command/tool execution,
+      ExtensionContext construction — replacing remaining fakes),
+      tools/* slices, shared typebox-walker refactor.

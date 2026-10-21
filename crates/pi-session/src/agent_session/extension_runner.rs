@@ -1,0 +1,1822 @@
+//! Extension runner core (Phase 4, tranche 1): port of
+//! `core/extensions/loader.ts` (factory-based loading + the `ExtensionAPI`
+//! registration/commit/discard lifecycle) and the core slice of
+//! `core/extensions/runner.ts` (`ExtensionRunner`: constructor, `bindCore`
+//! pending-registration flush, `hasHandlers`, the generic `emit` loop,
+//! `emitMessageEnd`, `emitError`/`onError`, flags/tools/commands/shortcuts
+//! queries, `reportUnhandledMcpServers`, `invalidate`).
+//!
+//! Divergences from the TS (documented, observably preserved):
+//! - jiti module loading is out of scope: extensions load from `FactoryFn`
+//!   closures (`loadExtensionFromFactory`); path discovery is a later
+//!   tranche.
+//! - Handlers receive a cloned event snapshot per invocation (TS passes the
+//!   same live object; the parity scripts never mutate it) and a `CtxView`
+//!   standing in for the lazy `ExtensionContext` getters.
+//! - `ExtensionError.stack` is never populated (the harness records errors
+//!   without it).
+//! - The `mcp_servers_change` listener queues its emit; the host drains it
+//!   (the TS fires it with `void this.emit(...)`, settled by the harness).
+//! - `getShortcuts` console.warn side channel: the TS warns per diagnostic
+//!   when `!hasUI()`; the port records diagnostics only (the parity harness
+//!   derives the warn stream from them).
+//! - `providerActions` mirrors the TS per-method optionality
+//!   ([`ProviderHooks`]); a missing hook falls through to the model
+//!   registry seam.
+
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use pi_agent::types::BoxFuture;
+use pi_core::event_bus::{EventBusController, Subscription};
+use pi_core::mcp_servers::{
+	mcp_namespace, validate_mcp_server_config, McpServerRegistry, RegisteredMcpServer,
+};
+use serde_json::{json, Map, Value};
+
+use super::ExtensionHost;
+
+/// TS default `invalidate()` message (loader.ts L192 / runner.ts L729).
+pub const DEFAULT_STALE_MESSAGE: &str = "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().";
+/// Thrown by the pre-`bindCore` action stubs (loader.ts L161).
+const NOT_INITIALIZED: &str =
+	"Extension runtime not initialized. Action methods cannot be called during extension loading.";
+
+/// `RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS` (runner.ts L84).
+const RESERVED_KEYBINDINGS: [&str; 17] = [
+	"app.interrupt",
+	"app.clear",
+	"app.exit",
+	"app.suspend",
+	"app.thinking.cycle",
+	"app.model.cycleForward",
+	"app.model.cycleBackward",
+	"app.model.select",
+	"app.tools.expand",
+	"app.thinking.toggle",
+	"app.editor.external",
+	"app.message.copy",
+	"app.message.followUp",
+	"tui.input.submit",
+	"tui.select.confirm",
+	"tui.select.cancel",
+	"tui.input.copy",
+];
+
+/// One event handler: `(event, ctx) -> Ok(Some(result)) | Ok(None)
+/// (undefined) | Err(thrown)`.
+pub type ExtensionHandler =
+	Arc<dyn Fn(Value, CtxView) -> BoxFuture<'static, Result<Option<Value>, String>> + Send + Sync>;
+
+/// A command handler (`(args, ctx) -> Result<(), String>`); execution is a
+/// later tranche, the type keeps registrations 1:1.
+pub type CommandHandler = Arc<dyn Fn(String, CtxView) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+
+/// An extension factory (`(pi) => void | Promise<void>`); `Err` models a
+/// throw.
+pub type FactoryFn = Arc<dyn Fn(&ExtensionApi) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+
+type ErrorListener = Arc<dyn Fn(&Value) + Send + Sync>;
+
+/// JS truthiness for JSON values (`null`/`false`/`0`/`""` falsy).
+fn js_truthy(value: &Value) -> bool {
+	match value {
+		Value::Null => false,
+		Value::Bool(b) => *b,
+		Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
+		Value::String(s) => !s.is_empty(),
+		_ => true,
+	}
+}
+
+/// JS `typeof` for the flag-default error message.
+fn js_typeof(value: &Value) -> &'static str {
+	match value {
+		Value::Null => "object",
+		Value::Bool(_) => "boolean",
+		Value::Number(_) => "number",
+		Value::String(_) => "string",
+		_ => "object",
+	}
+}
+
+// ============================================================================
+// CtxView — the lazy `ExtensionContext` getter slice
+// ============================================================================
+
+/// The context handed to handlers. `Runner` mirrors `createContext()`
+/// (guarded getters resolved at read time); `Raw` is a plain value (the
+/// `project_trust` ctx).
+#[derive(Clone)]
+pub enum CtxView {
+	Runner(Arc<RunnerShared>),
+	Raw(Value),
+}
+
+impl CtxView {
+	/// Read one context field, mirroring the TS guarded getter/method.
+	/// `Err` = the getter threw (stale ctx, unbound runtime action).
+	pub fn read(&self, field: &str) -> Result<Value, String> {
+		match self {
+			CtxView::Raw(value) => Ok(value.get(field).cloned().unwrap_or(Value::Null)),
+			CtxView::Runner(shared) => ExtensionRunner { shared: Arc::clone(shared) }.ctx_read(field),
+		}
+	}
+
+	/// Invoke one context method (TS `ctx.shutdown()`); `Err` = the guarded
+	/// call threw (stale ctx).
+	pub fn call(&self, method: &str) -> Result<Value, String> {
+		match self {
+			CtxView::Raw(_) => Err("not a function".to_string()),
+			CtxView::Runner(shared) => ExtensionRunner { shared: Arc::clone(shared) }.ctx_call(method),
+		}
+	}
+}
+
+// ============================================================================
+// Runtime actions seams (bindCore inputs)
+// ============================================================================
+
+/// The `ExtensionActions` slice bound by `bindCore`.
+pub trait RuntimeActions: Send + Sync {
+	fn get_active_tools(&self) -> Vec<String>;
+	fn get_thinking_level(&self) -> Value;
+	fn refresh_tools(&self);
+}
+
+/// The `ExtensionContextActions` slice bound by `bindCore`.
+pub trait ContextActions: Send + Sync {
+	fn is_idle(&self) -> bool;
+	fn is_project_trusted(&self) -> bool;
+	fn get_model(&self) -> Option<Value>;
+	fn shutdown(&self);
+}
+
+/// Provider registration hook aliases: `Err` models a throw (TS propagates
+/// hook and registry errors to the extension API caller).
+pub type RegisterProviderHook = Arc<dyn for<'a, 'b> Fn(&'a str, &'b Value) -> Result<(), String> + Send + Sync>;
+pub type ProviderValueHook = Arc<dyn for<'a> Fn(&'a Value) -> Result<(), String> + Send + Sync>;
+pub type ProviderNameHook = Arc<dyn for<'a> Fn(&'a str) -> Result<(), String> + Send + Sync>;
+pub type UnregisterVirtualModelHook = Arc<dyn for<'a, 'b> Fn(&'a str, &'b str) -> Result<(), String> + Send + Sync>;
+
+/// `bindCore`'s optional `providerActions` — one hook per method, mirroring
+/// the TS per-method optionality: a missing hook falls through to the model
+/// registry.
+#[derive(Default)]
+pub struct ProviderHooks {
+	pub register_provider: Option<RegisterProviderHook>,
+	pub register_native_provider: Option<ProviderValueHook>,
+	pub unregister_provider: Option<ProviderNameHook>,
+	pub register_virtual_model: Option<ProviderValueHook>,
+	pub unregister_virtual_model: Option<UnregisterVirtualModelHook>,
+}
+
+/// The `ModelRegistry` registration seam (the `bindCore` fallback).
+pub trait ModelRegistrySeam: Send + Sync {
+	fn register_provider(&self, name: &str, config: &Value) -> Result<(), String>;
+	fn register_native_provider(&self, provider: &Value) -> Result<(), String>;
+	fn unregister_provider(&self, name: &str) -> Result<(), String>;
+	fn register_virtual_model(&self, definition: &Value) -> Result<(), String>;
+	fn unregister_virtual_model(&self, provider: &str, id: &str) -> Result<(), String>;
+}
+
+struct ProviderSink {
+	hooks: ProviderHooks,
+	model_registry: Option<Arc<dyn ModelRegistrySeam>>,
+}
+
+impl ProviderSink {
+	fn register_provider(&self, name: &str, config: &Value) -> Result<(), String> {
+		if let Some(hook) = &self.hooks.register_provider {
+			return hook(name, config);
+		}
+		match &self.model_registry {
+			Some(registry) => registry.register_provider(name, config),
+			None => Ok(()),
+		}
+	}
+	fn register_native_provider(&self, provider: &Value) -> Result<(), String> {
+		if let Some(hook) = &self.hooks.register_native_provider {
+			return hook(provider);
+		}
+		match &self.model_registry {
+			Some(registry) => registry.register_native_provider(provider),
+			None => Ok(()),
+		}
+	}
+	fn register_virtual_model(&self, definition: &Value) -> Result<(), String> {
+		if let Some(hook) = &self.hooks.register_virtual_model {
+			return hook(definition);
+		}
+		match &self.model_registry {
+			Some(registry) => registry.register_virtual_model(definition),
+			None => Ok(()),
+		}
+	}
+	fn unregister_provider(&self, name: &str) -> Result<(), String> {
+		if let Some(hook) = &self.hooks.unregister_provider {
+			return hook(name);
+		}
+		match &self.model_registry {
+			Some(registry) => registry.unregister_provider(name),
+			None => Ok(()),
+		}
+	}
+	fn unregister_virtual_model(&self, provider: &str, id: &str) -> Result<(), String> {
+		if let Some(hook) = &self.hooks.unregister_virtual_model {
+			return hook(provider, id);
+		}
+		match &self.model_registry {
+			Some(registry) => registry.unregister_virtual_model(provider, id),
+			None => Ok(()),
+		}
+	}
+}
+
+// ============================================================================
+// ExtensionRuntime (loader.ts createExtensionRuntime)
+// ============================================================================
+
+struct RuntimeInner {
+	/// JS `Map<string, boolean|string>` (insertion order, last write wins).
+	flag_values: Vec<(String, Value)>,
+	pending_providers: Vec<(String, Value, String)>,
+	pending_native: Vec<(Value, String)>,
+	pending_virtual: Vec<(Value, String)>,
+	stale_message: Option<String>,
+	/// Event-bus subscriptions retained until invalidation
+	/// (`trackEventBusSubscription`); `None` = already unsubscribed.
+	bus_subscriptions: Vec<Option<Subscription>>,
+	actions: Option<Arc<dyn RuntimeActions>>,
+	/// Set by `bindCore`: registrations take effect immediately.
+	provider_sink: Option<ProviderSink>,
+}
+
+/// The shared runtime created by the loader (`createExtensionRuntime()`).
+#[derive(Clone)]
+pub struct ExtensionRuntime {
+	inner: Arc<Mutex<RuntimeInner>>,
+	mcp_servers: Arc<Mutex<McpServerRegistry>>,
+}
+
+impl Default for ExtensionRuntime {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl ExtensionRuntime {
+	pub fn new() -> ExtensionRuntime {
+		ExtensionRuntime {
+			inner: Arc::new(Mutex::new(RuntimeInner {
+				flag_values: Vec::new(),
+				pending_providers: Vec::new(),
+				pending_native: Vec::new(),
+				pending_virtual: Vec::new(),
+				stale_message: None,
+				bus_subscriptions: Vec::new(),
+				actions: None,
+				provider_sink: None,
+			})),
+			mcp_servers: Arc::new(Mutex::new(McpServerRegistry::new())),
+		}
+	}
+
+	fn set_flag_value(&self, name: &str, value: Value) {
+		let mut inner = self.inner.lock().unwrap();
+		if let Some(slot) = inner.flag_values.iter_mut().find(|(k, _)| k == name) {
+			slot.1 = value;
+		} else {
+			inner.flag_values.push((name.to_string(), value));
+		}
+	}
+
+	fn has_flag_value(&self, name: &str) -> bool {
+		self.inner.lock().unwrap().flag_values.iter().any(|(k, _)| k == name)
+	}
+
+	/// `runtime.assertActive()` — `Err` carries the stale message.
+	pub fn assert_active(&self) -> Result<(), String> {
+		match self.inner.lock().unwrap().stale_message.clone() {
+			Some(message) => Err(message),
+			None => Ok(()),
+		}
+	}
+
+	/// `runtime.invalidate(message?)` — first call wins; drops tracked
+	/// event-bus subscriptions.
+	pub fn invalidate(&self, message: Option<&str>) {
+		let mut inner = self.inner.lock().unwrap();
+		if inner.stale_message.is_some() {
+			return;
+		}
+		inner.stale_message = Some(message.unwrap_or(DEFAULT_STALE_MESSAGE).to_string());
+		for subscription in inner.bus_subscriptions.iter_mut() {
+			if let Some(subscription) = subscription.take() {
+				subscription.unsubscribe();
+			}
+		}
+	}
+
+	/// `runtime.trackEventBusSubscription(unsubscribe)`.
+	pub fn track_event_bus_subscription(&self, subscription: Subscription) {
+		self.inner.lock().unwrap().bus_subscriptions.push(Some(subscription));
+	}
+
+	/// Number of tracked subscriptions (the discard-range start).
+	pub fn tracked_count(&self) -> usize {
+		self.inner.lock().unwrap().bus_subscriptions.len()
+	}
+
+	/// Unsubscribe every subscription tracked at or after `start` (the
+	/// loading-range discard in `createExtensionAPI.discard`).
+	pub fn unsubscribe_from(&self, start: usize) {
+		let mut inner = self.inner.lock().unwrap();
+		for subscription in inner.bus_subscriptions.iter_mut().skip(start) {
+			if let Some(subscription) = subscription.take() {
+				subscription.unsubscribe();
+			}
+		}
+	}
+
+	/// Pre-`bindCore` `registerProvider` — queues the registration.
+	pub fn register_provider(&self, name: &str, config: &Value, extension_path: &str) -> Result<(), String> {
+		let mut inner = self.inner.lock().unwrap();
+		if let Some(sink) = &inner.provider_sink {
+			let sink_register = sink.register_provider(name, config);
+			drop(inner);
+			return sink_register;
+		}
+		inner
+			.pending_providers
+			.push((name.to_string(), config.clone(), extension_path.to_string()));
+		Ok(())
+	}
+
+	pub fn register_native_provider(&self, provider: &Value, extension_path: &str) -> Result<(), String> {
+		let mut inner = self.inner.lock().unwrap();
+		if let Some(sink) = &inner.provider_sink {
+			let result = sink.register_native_provider(provider);
+			drop(inner);
+			return result;
+		}
+		inner.pending_native.push((provider.clone(), extension_path.to_string()));
+		Ok(())
+	}
+
+	/// `unregisterProvider(name)` — filters both pending queues (pre-bind) or
+	/// calls through (post-bind, propagating registry/hook throws).
+	pub fn unregister_provider(&self, name: &str) -> Result<(), String> {
+		let bound = self.inner.lock().unwrap().provider_sink.is_some();
+		if bound {
+			let inner = self.inner.lock().unwrap();
+			if let Some(sink) = &inner.provider_sink {
+				return sink.unregister_provider(name);
+			}
+			return Ok(());
+		}
+		let mut inner = self.inner.lock().unwrap();
+		inner.pending_providers.retain(|(n, _, _)| n != name);
+		inner
+			.pending_native
+			.retain(|(p, _)| p.get("id").and_then(Value::as_str) != Some(name));
+		Ok(())
+	}
+
+	pub fn register_virtual_model(&self, definition: &Value, extension_path: &str) -> Result<(), String> {
+		let mut inner = self.inner.lock().unwrap();
+		if let Some(sink) = &inner.provider_sink {
+			let result = sink.register_virtual_model(definition);
+			drop(inner);
+			return result;
+		}
+		inner
+			.pending_virtual
+			.push((definition.clone(), extension_path.to_string()));
+		Ok(())
+	}
+
+	pub fn unregister_virtual_model(&self, provider: &str, id: &str) -> Result<(), String> {
+		if self.inner.lock().unwrap().provider_sink.is_some() {
+			let inner = self.inner.lock().unwrap();
+			if let Some(sink) = &inner.provider_sink {
+				return sink.unregister_virtual_model(provider, id);
+			}
+			return Ok(());
+		}
+		let mut inner = self.inner.lock().unwrap();
+		inner
+			.pending_virtual
+			.retain(|(d, _)| d.get("provider").and_then(Value::as_str) != Some(provider) || d.get("id").and_then(Value::as_str) != Some(id));
+		Ok(())
+	}
+
+	/// `runtime.getActiveTools()` — pre-bind stub throws.
+	pub fn get_active_tools(&self) -> Result<Vec<String>, String> {
+		let actions = self.inner.lock().unwrap().actions.clone();
+		match actions {
+			Some(actions) => Ok(actions.get_active_tools()),
+			None => Err(NOT_INITIALIZED.to_string()),
+		}
+	}
+
+	/// `runtime.getThinkingLevel()` — pre-bind stub throws.
+	pub fn get_thinking_level(&self) -> Result<Value, String> {
+		let actions = self.inner.lock().unwrap().actions.clone();
+		match actions {
+			Some(actions) => Ok(actions.get_thinking_level()),
+			None => Err(NOT_INITIALIZED.to_string()),
+		}
+	}
+
+	/// `runtime.refreshTools()` — no-op pre-bind.
+	pub fn refresh_tools(&self) {
+		if let Some(actions) = self.inner.lock().unwrap().actions.clone() {
+			actions.refresh_tools();
+		}
+	}
+
+	pub fn mcp_servers(&self) -> Arc<Mutex<McpServerRegistry>> {
+		Arc::clone(&self.mcp_servers)
+	}
+
+	pub fn flag_values(&self) -> Vec<(String, Value)> {
+		self.inner.lock().unwrap().flag_values.clone()
+	}
+
+	pub fn pending_provider_registrations(&self) -> Vec<(String, Value, String)> {
+		self.inner.lock().unwrap().pending_providers.clone()
+	}
+
+	pub fn pending_native_provider_registrations(&self) -> Vec<(Value, String)> {
+		self.inner.lock().unwrap().pending_native.clone()
+	}
+
+	pub fn pending_virtual_model_registrations(&self) -> Vec<(Value, String)> {
+		self.inner.lock().unwrap().pending_virtual.clone()
+	}
+}
+
+// ============================================================================
+// Pending runtime changes (applyRuntimeChange)
+// ============================================================================
+
+enum PendingChange {
+	RegisterProvider { name: String, config: Value, extension_path: String },
+	RegisterNativeProvider { provider: Value, extension_path: String },
+	UnregisterProvider { name: String },
+	RegisterVirtualModel { definition: Value, extension_path: String },
+	UnregisterVirtualModel { provider: String, id: String },
+	RegisterMcpServer { server: RegisteredMcpServer },
+	UnregisterMcpServer { name: String, extension_path: String },
+}
+
+impl PendingChange {
+	fn apply(&self, runtime: &ExtensionRuntime) -> Result<(), String> {
+		match self {
+			PendingChange::RegisterProvider { name, config, extension_path } => {
+				runtime.register_provider(name, config, extension_path)
+			}
+			PendingChange::RegisterNativeProvider { provider, extension_path } => {
+				runtime.register_native_provider(provider, extension_path)
+			}
+			PendingChange::UnregisterProvider { name } => runtime.unregister_provider(name),
+			PendingChange::RegisterVirtualModel { definition, extension_path } => {
+				runtime.register_virtual_model(definition, extension_path)
+			}
+			PendingChange::UnregisterVirtualModel { provider, id } => {
+				runtime.unregister_virtual_model(provider, id)
+			}
+			PendingChange::RegisterMcpServer { server } => {
+				runtime.mcp_servers().lock().unwrap().register(server.clone());
+				Ok(())
+			}
+			PendingChange::UnregisterMcpServer { name, extension_path } => {
+				runtime.mcp_servers().lock().unwrap().unregister(name, extension_path);
+				Ok(())
+			}
+		}
+	}
+}
+
+// ============================================================================
+// Extension + registrations
+// ============================================================================
+
+/// TS `RegisteredCommand` (handler kept for later tranches).
+pub struct RegisteredCommand {
+	pub name: String,
+	pub source_info: Value,
+	pub description: Option<String>,
+	pub handler: Option<CommandHandler>,
+}
+
+/// TS `ExtensionFlag`.
+#[derive(Clone)]
+pub struct ExtensionFlag {
+	pub name: String,
+	pub description: Option<String>,
+	pub flag_type: String,
+	pub default: Option<Value>,
+	pub extension_path: String,
+}
+
+/// TS `ExtensionShortcut` (handler invocation is a later tranche).
+#[derive(Clone)]
+pub struct ExtensionShortcut {
+	pub shortcut: String,
+	pub description: Option<String>,
+	pub extension_path: String,
+}
+
+/// TS `Extension` — one loaded extension's registrations.
+pub struct Extension {
+	pub path: String,
+	pub resolved_path: String,
+	pub hidden: bool,
+	pub replaceable: bool,
+	pub source_info: Value,
+	/// event type -> handlers in registration order.
+	pub handlers: Vec<(String, Vec<(u64, ExtensionHandler)>)>,
+	/// tool name -> (definition, sourceInfo).
+	pub tools: Vec<(String, Value, Value)>,
+	pub message_renderers: Vec<String>,
+	pub entry_renderers: Vec<String>,
+	pub markdown_transformer: bool,
+	pub tool_renderers: usize,
+	pub commands: Vec<(String, RegisteredCommand)>,
+	pub flags: Vec<(String, ExtensionFlag)>,
+	pub shortcuts: Vec<(String, ExtensionShortcut)>,
+}
+
+fn synthetic_source(path: &str) -> String {
+	if let Some(rest) = path.strip_prefix("builtin:") {
+		let _ = rest;
+		"builtin".to_string()
+	} else if path.starts_with('<') && path.ends_with('>') {
+		let inner = &path[1..path.len() - 1];
+		let prefix = inner.split(':').next().unwrap_or("");
+		if prefix.is_empty() {
+			"temporary".to_string()
+		} else {
+			prefix.to_string()
+		}
+	} else {
+		"local".to_string()
+	}
+}
+
+fn is_synthetic_path(path: &str) -> bool {
+	path.starts_with("builtin:") || path.starts_with('<')
+}
+
+/// TS `createSyntheticSourceInfo` projection (key order matches).
+fn source_info_value(path: &str, resolved_path: &str) -> Value {
+	let mut object = Map::new();
+	object.insert("path".to_string(), json!(path));
+	object.insert("source".to_string(), json!(synthetic_source(path)));
+	object.insert("scope".to_string(), json!("temporary"));
+	object.insert("origin".to_string(), json!("top-level"));
+	if !is_synthetic_path(path) {
+		let base_dir = std::path::Path::new(resolved_path)
+			.parent()
+			.map(|p| p.to_string_lossy().to_string())
+			.unwrap_or_default();
+		object.insert("baseDir".to_string(), json!(base_dir));
+	}
+	Value::Object(object)
+}
+
+// ============================================================================
+// ExtensionApi (loader.ts createExtensionAPI)
+// ============================================================================
+
+struct LoadingState {
+	/// "loading" | "active" | "failed".
+	state: String,
+	pending_flag_values: Vec<(String, Value)>,
+	pending_changes: Vec<PendingChange>,
+	/// `runtime.tracked_count()` at API creation.
+	bus_start: usize,
+	next_handler_id: u64,
+}
+
+/// The `pi` API handed to a factory. Cloning shares the loading state.
+#[derive(Clone)]
+pub struct ExtensionApi {
+	extension: Arc<Mutex<Extension>>,
+	runtime: ExtensionRuntime,
+	loading: Arc<Mutex<LoadingState>>,
+	bus: Option<Arc<EventBusController>>,
+}
+
+/// Unsubscribe handle for `pi.on` (the returned function).
+pub struct HandlerToken {
+	extension: Arc<Mutex<Extension>>,
+	event: String,
+	id: u64,
+}
+
+impl HandlerToken {
+	/// The `pi.on` unsubscribe function.
+	pub fn unsubscribe(&self) {
+		let mut extension = self.extension.lock().unwrap();
+		if let Some((_, handlers)) = extension.handlers.iter_mut().find(|(e, _)| e == &self.event) {
+			if let Some(index) = handlers.iter().position(|(id, _)| *id == self.id) {
+				handlers.remove(index);
+			}
+		}
+	}
+}
+
+impl ExtensionApi {
+	fn assert_active(&self) -> Result<(), String> {
+		let extension_path = self.extension.lock().unwrap().path.clone();
+		let state = self.loading.lock().unwrap().state.clone();
+		if state == "failed" {
+			return Err(format!(
+				"Extension \"{}\" failed to load and its API is no longer active.",
+				extension_path
+			));
+		}
+		self.runtime.assert_active()
+	}
+
+	fn apply_runtime_change(&self, change: PendingChange) -> Result<(), String> {
+		let mut loading = self.loading.lock().unwrap();
+		if loading.state == "loading" {
+			loading.pending_changes.push(change);
+			Ok(())
+		} else {
+			drop(loading);
+			change.apply(&self.runtime)
+		}
+	}
+
+	/// `pi.on(event, handler)` — returns the unsubscribe token.
+	pub fn on(&self, event: &str, handler: ExtensionHandler) -> Result<HandlerToken, String> {
+		self.assert_active()?;
+		let mut loading = self.loading.lock().unwrap();
+		let id = loading.next_handler_id;
+		loading.next_handler_id += 1;
+		drop(loading);
+		let mut extension = self.extension.lock().unwrap();
+		let token = HandlerToken {
+			extension: Arc::clone(&self.extension),
+			event: event.to_string(),
+			id,
+		};
+		if let Some((_, handlers)) = extension.handlers.iter_mut().find(|(e, _)| e == event) {
+			handlers.push((id, handler));
+		} else {
+			extension.handlers.push((event.to_string(), vec![(id, handler)]));
+		}
+		Ok(token)
+	}
+
+	/// `pi.registerTool(tool)`.
+	pub fn register_tool(&self, tool: &Value) -> Result<(), String> {
+		self.assert_active()?;
+		let extension_path = self.extension.lock().unwrap().path.clone();
+		let name = tool.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+		let valid = matches!(tool.get("parameters"), Some(Value::Object(_)));
+		if !valid {
+			return Err(format!(
+				"Tool \"{}\" registered by extension \"{}\" must define an object parameter schema.",
+				name, extension_path
+			));
+		}
+		let source_info = self.extension.lock().unwrap().source_info.clone();
+		{
+			let mut extension = self.extension.lock().unwrap();
+			let entry = (name.clone(), tool.clone(), source_info);
+			if let Some(slot) = extension.tools.iter_mut().find(|(n, _, _)| *n == name) {
+				*slot = entry;
+			} else {
+				extension.tools.push(entry);
+			}
+		}
+		self.runtime.refresh_tools();
+		Ok(())
+	}
+
+	/// `pi.registerCommand(name, options)`.
+	pub fn register_command(&self, name: &str, options: &Value, handler: Option<CommandHandler>) -> Result<(), String> {
+		self.assert_active()?;
+		let extension_path = self.extension.lock().unwrap().path.clone();
+		if name.is_empty() {
+			return Err(format!(
+				"Command registered by extension \"{}\" must have a non-empty string name. Use pi.registerCommand(\"name\", {{ description, handler }}).",
+				extension_path
+			));
+		}
+		if handler.is_none() {
+			return Err(format!(
+				"Command \"/{}\" registered by extension \"{}\" must define handler().",
+				name, extension_path
+			));
+		}
+		let source_info = self.extension.lock().unwrap().source_info.clone();
+		let description = options
+			.get("description")
+			.and_then(Value::as_str)
+			.map(|s| s.to_string());
+		let command = RegisteredCommand { name: name.to_string(), source_info, description, handler };
+		let mut extension = self.extension.lock().unwrap();
+		if let Some(slot) = extension.commands.iter_mut().find(|(n, _)| n == name) {
+			slot.1 = command;
+		} else {
+			extension.commands.push((name.to_string(), command));
+		}
+		Ok(())
+	}
+
+	/// `pi.registerShortcut(shortcut, options)`.
+	pub fn register_shortcut(&self, shortcut: &str, options: &Value) -> Result<(), String> {
+		self.assert_active()?;
+		let extension_path = self.extension.lock().unwrap().path.clone();
+		let description = options
+			.get("description")
+			.and_then(Value::as_str)
+			.map(|s| s.to_string());
+		let entry = ExtensionShortcut {
+			shortcut: shortcut.to_string(),
+			description,
+			extension_path,
+		};
+		let mut extension = self.extension.lock().unwrap();
+		if let Some(slot) = extension.shortcuts.iter_mut().find(|(k, _)| k == shortcut) {
+			slot.1 = entry;
+		} else {
+			extension.shortcuts.push((shortcut.to_string(), entry));
+		}
+		Ok(())
+	}
+
+	/// `pi.registerFlag(name, options)`.
+	pub fn register_flag(&self, name: &str, options: &Value) -> Result<(), String> {
+		self.assert_active()?;
+		let flag_type = options.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+		let type_display = if flag_type.is_empty() { "undefined" } else { flag_type.as_str() };
+		let default = options.get("default").cloned();
+		if let Some(default) = &default {
+			// TS: `typeof options.default !== options.type` (undefined type
+			// never matches).
+			if js_typeof(default) != type_display {
+				return Err(format!(
+					"Invalid default for flag \"{}\": expected {}, got {}",
+					name,
+					type_display,
+					js_typeof(default)
+				));
+			}
+		}
+		let extension_path = self.extension.lock().unwrap().path.clone();
+		let description = options
+			.get("description")
+			.and_then(Value::as_str)
+			.map(|s| s.to_string());
+		let flag = ExtensionFlag {
+			name: name.to_string(),
+			description,
+			flag_type,
+			default: default.clone(),
+			extension_path,
+		};
+		{
+			let mut extension = self.extension.lock().unwrap();
+			if let Some(slot) = extension.flags.iter_mut().find(|(n, _)| n == name) {
+				slot.1 = flag;
+			} else {
+				extension.flags.push((name.to_string(), flag));
+			}
+		}
+		if let Some(default) = default {
+			if !self.runtime.has_flag_value(name) {
+				let mut loading = self.loading.lock().unwrap();
+				if loading.state == "loading" {
+					if !loading.pending_flag_values.iter().any(|(n, _)| n == name) {
+						loading.pending_flag_values.push((name.to_string(), default));
+					}
+				} else {
+					drop(loading);
+					self.runtime.set_flag_value(name, default);
+				}
+			}
+		}
+		Ok(())
+	}
+
+	pub fn register_message_renderer(&self, custom_type: &str) -> Result<(), String> {
+		self.assert_active()?;
+		let mut extension = self.extension.lock().unwrap();
+		if !extension.message_renderers.iter().any(|t| t == custom_type) {
+			extension.message_renderers.push(custom_type.to_string());
+		}
+		Ok(())
+	}
+
+	pub fn register_entry_renderer(&self, custom_type: &str) -> Result<(), String> {
+		self.assert_active()?;
+		let mut extension = self.extension.lock().unwrap();
+		if !extension.entry_renderers.iter().any(|t| t == custom_type) {
+			extension.entry_renderers.push(custom_type.to_string());
+		}
+		Ok(())
+	}
+
+	pub fn register_markdown_transformer(&self) -> Result<(), String> {
+		self.assert_active()?;
+		self.extension.lock().unwrap().markdown_transformer = true;
+		Ok(())
+	}
+
+	pub fn register_tool_renderer(&self) -> Result<(), String> {
+		self.assert_active()?;
+		self.extension.lock().unwrap().tool_renderers += 1;
+		Ok(())
+	}
+
+	/// `pi.getFlag(name)` — pending defaults are visible during loading.
+	pub fn get_flag(&self, name: &str) -> Result<Option<Value>, String> {
+		self.assert_active()?;
+		let registered = self.extension.lock().unwrap().flags.iter().any(|(n, _)| n == name);
+		if !registered {
+			return Ok(None);
+		}
+		if let Some((_, value)) = self.runtime.flag_values().into_iter().find(|(n, _)| n == name) {
+			return Ok(Some(value));
+		}
+		let loading = self.loading.lock().unwrap();
+		Ok(loading
+			.pending_flag_values
+			.iter()
+			.find(|(n, _)| n == name)
+			.map(|(_, v)| v.clone()))
+	}
+
+	pub fn get_active_tools(&self) -> Result<Vec<String>, String> {
+		self.assert_active()?;
+		self.runtime.get_active_tools()
+	}
+
+	/// `pi.registerProvider(name, config)`.
+	pub fn register_provider(&self, name: &str, config: Option<&Value>) -> Result<(), String> {
+		self.assert_active()?;
+		let config = match config {
+			Some(config) => config,
+			None => return Err("Provider config is required when registering by name".to_string()),
+		};
+		let extension_path = self.extension.lock().unwrap().path.clone();
+		self.apply_runtime_change(PendingChange::RegisterProvider {
+			name: name.to_string(),
+			config: config.clone(),
+			extension_path,
+		})
+	}
+
+	/// `pi.registerProvider(provider)`.
+	pub fn register_native_provider(&self, provider: &Value) -> Result<(), String> {
+		self.assert_active()?;
+		let extension_path = self.extension.lock().unwrap().path.clone();
+		self.apply_runtime_change(PendingChange::RegisterNativeProvider {
+			provider: provider.clone(),
+			extension_path,
+		})
+	}
+
+	pub fn unregister_provider(&self, name: &str) -> Result<(), String> {
+		self.assert_active()?;
+		self.apply_runtime_change(PendingChange::UnregisterProvider { name: name.to_string() })
+	}
+
+	pub fn register_virtual_model(&self, definition: &Value) -> Result<(), String> {
+		self.assert_active()?;
+		let extension_path = self.extension.lock().unwrap().path.clone();
+		self.apply_runtime_change(PendingChange::RegisterVirtualModel {
+			definition: definition.clone(),
+			extension_path,
+		})
+	}
+
+	pub fn unregister_virtual_model(&self, provider: &str, id: &str) -> Result<(), String> {
+		self.assert_active()?;
+		self.apply_runtime_change(PendingChange::UnregisterVirtualModel {
+			provider: provider.to_string(),
+			id: id.to_string(),
+		})
+	}
+
+	/// `pi.registerMcpServer(name, config)`.
+	pub fn register_mcp_server(&self, name: &str, config: &Value) -> Result<(), String> {
+		self.assert_active()?;
+		let extension_path = self.extension.lock().unwrap().path.clone();
+		let validated = validate_mcp_server_config(name, config).map_err(|error| {
+			format!("Invalid MCP server registered by extension \"{}\": {}", extension_path, error)
+		})?;
+		let owner = self
+			.runtime
+			.mcp_servers()
+			.lock()
+			.unwrap()
+			.get(name)
+			.map(|server| server.extension_path.clone());
+		if let Some(owner) = owner.filter(|owner| owner != &extension_path) {
+			return Err(format!("MCP server \"{}\" is already registered by extension \"{}\"", name, owner));
+		}
+		let clash = self
+			.runtime
+			.mcp_servers()
+			.lock()
+			.unwrap()
+			.list()
+			.into_iter()
+			.find(|server| server.name != name && mcp_namespace(&server.name) == mcp_namespace(name))
+			.map(|server| server.name);
+		if let Some(clash) = clash {
+			return Err(format!("MCP server \"{}\" conflicts with registered server \"{}\"", name, clash));
+		}
+		self.apply_runtime_change(PendingChange::RegisterMcpServer {
+			server: RegisteredMcpServer {
+				name: name.to_string(),
+				config: validated,
+				extension_path,
+			},
+		})
+	}
+
+	pub fn unregister_mcp_server(&self, name: &str) -> Result<(), String> {
+		self.assert_active()?;
+		let extension_path = self.extension.lock().unwrap().path.clone();
+		self.apply_runtime_change(PendingChange::UnregisterMcpServer {
+			name: name.to_string(),
+			extension_path,
+		})
+	}
+
+	pub fn get_mcp_servers(&self) -> Result<Vec<RegisteredMcpServer>, String> {
+		self.assert_active()?;
+		Ok(self.runtime.mcp_servers().lock().unwrap().list())
+	}
+
+	/// `pi.events.emit(channel, data)`.
+	pub fn events_emit(&self, channel: &str, data: &Value) -> Result<(), String> {
+		self.assert_active()?;
+		match &self.bus {
+			Some(bus) => {
+				bus.emit(channel, data);
+				Ok(())
+			}
+			None => Ok(()),
+		}
+	}
+
+	/// `pi.events.on(channel, handler)` — tracked until invalidation.
+	pub fn events_on(&self, channel: &str, handler: pi_core::event_bus::EventHandler) -> Result<(), String> {
+		self.assert_active()?;
+		let subscription = match &self.bus {
+			Some(bus) => bus.on(channel, move |data| handler(data)),
+			None => return Ok(()),
+		};
+		self.runtime.track_event_bus_subscription(subscription);
+		Ok(())
+	}
+
+	/// `commit()` — flush pending flags and runtime changes.
+	pub fn commit(&self) -> Result<(), String> {
+		let mut loading = self.loading.lock().unwrap();
+		if loading.state != "loading" {
+			return Ok(());
+		}
+		// TS asserts before flushing; a stale runtime leaves the API in
+		// `loading` so `discard()` still runs.
+		self.runtime.assert_active()?;
+		let pending_flags = std::mem::take(&mut loading.pending_flag_values);
+		let pending_changes = std::mem::take(&mut loading.pending_changes);
+		loading.state = "active".to_string();
+		drop(loading);
+		for (name, value) in pending_flags {
+			if !self.runtime.has_flag_value(&name) {
+				self.runtime.set_flag_value(&name, value);
+			}
+		}
+		for change in &pending_changes {
+			change.apply(&self.runtime)?;
+		}
+		Ok(())
+	}
+
+	/// `discard()` — failed state; loading bus subscriptions are dropped.
+	pub fn discard(&self) {
+		let mut loading = self.loading.lock().unwrap();
+		if loading.state != "loading" {
+			return;
+		}
+		loading.state = "failed".to_string();
+		let bus_start = loading.bus_start;
+		loading.pending_flag_values.clear();
+		loading.pending_changes.clear();
+		drop(loading);
+		self.runtime.unsubscribe_from(bus_start);
+	}
+}
+
+/// TS `loadExtensionFromFactory(factory, cwd, eventBus, runtime,
+/// extensionPath = "<inline>")` — `Err` rethrows the factory (or commit)
+/// error after discarding. Returns the live extension handle: the runner
+/// and any captured API share it, so post-load `pi.on`/unsubscribes are
+/// visible to both (TS object reference semantics).
+pub async fn load_extension_from_factory(
+	factory: FactoryFn,
+	_cwd: &str,
+	bus: Option<Arc<EventBusController>>,
+	runtime: &ExtensionRuntime,
+	extension_path: &str,
+) -> Result<Arc<Mutex<Extension>>, String> {
+	let mut extension = Extension {
+		path: extension_path.to_string(),
+		resolved_path: extension_path.to_string(),
+		hidden: false,
+		replaceable: false,
+		source_info: source_info_value(extension_path, extension_path),
+		handlers: Vec::new(),
+		tools: Vec::new(),
+		message_renderers: Vec::new(),
+		entry_renderers: Vec::new(),
+		markdown_transformer: false,
+		tool_renderers: 0,
+		commands: Vec::new(),
+		flags: Vec::new(),
+		shortcuts: Vec::new(),
+	};
+	if let Some(name) = extension_path.strip_prefix("<inline:") {
+		let _ = name;
+	}
+	extension.replaceable = extension_path.starts_with("<inline:");
+	let api = ExtensionApi {
+		extension: Arc::new(Mutex::new(extension)),
+		runtime: runtime.clone(),
+		loading: Arc::new(Mutex::new(LoadingState {
+			state: "loading".to_string(),
+			pending_flag_values: Vec::new(),
+			pending_changes: Vec::new(),
+			bus_start: runtime.tracked_count(),
+			next_handler_id: 0,
+		})),
+		bus,
+	};
+	match factory(&api).await {
+		Ok(()) => match api.commit() {
+			// A commit failure discards like the TS `initializeExtension`
+			// catch block.
+			Ok(()) => Ok(Arc::clone(&api.extension)),
+			Err(error) => {
+				api.discard();
+				Err(error)
+			}
+		},
+		Err(error) => {
+			api.discard();
+			Err(error)
+		}
+	}
+}
+
+// ============================================================================
+// ExtensionRunner (runner.ts core slice)
+// ============================================================================
+
+pub struct RunnerShared {
+	pub(crate) extensions: Mutex<Vec<Arc<Mutex<Extension>>>>,
+	runtime: ExtensionRuntime,
+	cwd: String,
+	mode: Mutex<String>,
+	ui: Mutex<bool>,
+	error_listeners: Mutex<Vec<(u64, ErrorListener)>>,
+	next_listener_id: AtomicU64,
+	reported_mcp_servers: Mutex<HashSet<String>>,
+	stale_message: Mutex<Option<String>>,
+	context_actions: Mutex<Option<Arc<dyn ContextActions>>>,
+	/// `mcp_servers_change` events queued by the registry listener; drained
+	/// by [`ExtensionRunner::drain_mcp_events`].
+	mcp_event_queue: Mutex<Vec<Value>>,
+	shortcut_diagnostics: Mutex<Vec<Value>>,
+	model_registry: Option<Arc<dyn ModelRegistrySeam>>,
+}
+
+/// TS `ExtensionRunner` — the tranche-1 core slice.
+#[derive(Clone)]
+pub struct ExtensionRunner {
+	shared: Arc<RunnerShared>,
+}
+
+impl ExtensionRunner {
+	/// `new ExtensionRunner(extensions, runtime, cwd, sessionManager,
+	/// modelRegistry)`. `session_manager` is not consumed by this slice.
+	pub fn new(
+		extensions: Vec<Arc<Mutex<Extension>>>,
+		runtime: ExtensionRuntime,
+		cwd: &str,
+		model_registry: Option<Arc<dyn ModelRegistrySeam>>,
+	) -> ExtensionRunner {
+		ExtensionRunner {
+			shared: Arc::new(RunnerShared {
+				extensions: Mutex::new(extensions),
+				runtime,
+				cwd: cwd.to_string(),
+				mode: Mutex::new("print".to_string()),
+				ui: Mutex::new(false),
+				error_listeners: Mutex::new(Vec::new()),
+				next_listener_id: AtomicU64::new(0),
+				reported_mcp_servers: Mutex::new(HashSet::new()),
+				stale_message: Mutex::new(None),
+				context_actions: Mutex::new(None),
+				mcp_event_queue: Mutex::new(Vec::new()),
+				shortcut_diagnostics: Mutex::new(Vec::new()),
+				model_registry,
+			}),
+		}
+	}
+
+	pub fn runtime(&self) -> &ExtensionRuntime {
+		&self.shared.runtime
+	}
+
+	fn snapshot_handlers(&self, event_type: &str) -> Vec<(String, Vec<(u64, ExtensionHandler)>)> {
+		self.shared
+			.extensions
+			.lock()
+			.unwrap()
+			.iter()
+			.map(|ext| {
+				let ext = ext.lock().unwrap();
+				(
+					ext.path.clone(),
+					ext.handlers
+						.iter()
+						.find(|(e, _)| e == event_type)
+						.map(|(_, handlers)| handlers.clone())
+						.unwrap_or_default(),
+				)
+			})
+			.collect()
+	}
+
+	/// `bindCore(actions, contextActions, providerActions?)`.
+	pub fn bind_core(
+		&self,
+		actions: Arc<dyn RuntimeActions>,
+		context_actions: Arc<dyn ContextActions>,
+		provider_hooks: ProviderHooks,
+	) {
+		{
+			let mut inner = self.shared.runtime.inner.lock().unwrap();
+			inner.actions = Some(actions);
+			inner.provider_sink = Some(ProviderSink {
+				hooks: provider_hooks,
+				model_registry: self.shared.model_registry.clone(),
+			});
+		}
+		*self.shared.context_actions.lock().unwrap() = Some(context_actions);
+		// The MCP change listener: queue the `mcp_servers_change` emit (the
+		// host drains it) and report unhandled servers synchronously.
+		let shared = Arc::clone(&self.shared);
+		self.shared
+			.runtime
+			.mcp_servers()
+			.lock()
+			.unwrap()
+			.set_change_listener(Some(Box::new(move |servers: &[RegisteredMcpServer]| {
+				let event_servers = servers
+					.iter()
+					.map(|server| serde_json::to_value(server).unwrap_or(Value::Null))
+					.collect::<Vec<_>>();
+				shared
+					.mcp_event_queue
+					.lock()
+					.unwrap()
+					.push(json!({ "type": "mcp_servers_change", "servers": event_servers }));
+				// The listener runs with the registry lock held (it fires
+				// inside register/unregister), so the unhandled-server report
+				// consumes the passed list instead of re-locking.
+				ExtensionRunner { shared: Arc::clone(&shared) }.report_unhandled_from(servers);
+			})));
+		// Flush provider registrations queued during extension loading
+		// (per-item error capture; the loop never aborts).
+		let pending_providers = self.shared.runtime.pending_provider_registrations();
+		for (name, config, extension_path) in pending_providers {
+			if let Err(error) = self.shared.runtime.register_provider(&name, &config, &extension_path) {
+				self.emit_error(&json!({
+					"extensionPath": extension_path,
+					"event": "register_provider",
+					"error": error,
+				}));
+			}
+		}
+		self.shared.runtime.inner.lock().unwrap().pending_providers.clear();
+		let pending_native = self.shared.runtime.pending_native_provider_registrations();
+		for (provider, extension_path) in pending_native {
+			if let Err(error) = self.shared.runtime.register_native_provider(&provider, &extension_path) {
+				self.emit_error(&json!({
+					"extensionPath": extension_path,
+					"event": "register_provider",
+					"error": error,
+				}));
+			}
+		}
+		self.shared.runtime.inner.lock().unwrap().pending_native.clear();
+		let pending_virtual = self.shared.runtime.pending_virtual_model_registrations();
+		for (definition, extension_path) in pending_virtual {
+			if let Err(error) = self.shared.runtime.register_virtual_model(&definition, &extension_path) {
+				self.emit_error(&json!({
+					"extensionPath": extension_path,
+					"event": "register_virtual_model",
+					"error": error,
+				}));
+			}
+		}
+		self.shared.runtime.inner.lock().unwrap().pending_virtual.clear();
+	}
+
+	/// Drain queued `mcp_servers_change` emits (the TS fires them with `void
+	/// this.emit(...)`; the harness settles symmetrically).
+	pub async fn drain_mcp_events(&self) {
+		loop {
+			let event = {
+				let mut queue = self.shared.mcp_event_queue.lock().unwrap();
+				if queue.is_empty() {
+					None
+				} else {
+					Some(queue.remove(0))
+				}
+			};
+			match event {
+				Some(event) => {
+					self.emit(event).await;
+				}
+				None => break,
+			}
+		}
+	}
+
+	fn ctx_read(&self, field: &str) -> Result<Value, String> {
+		if let Some(message) = self.shared.stale_message.lock().unwrap().clone() {
+			return Err(message);
+		}
+		match field {
+			"cwd" => Ok(json!(self.shared.cwd)),
+			"mode" => Ok(json!(*self.shared.mode.lock().unwrap())),
+			"hasUI" => Ok(json!(*self.shared.ui.lock().unwrap())),
+			// TS class-field defaults are `() => true`; `bindCore` replaces
+			// them with the bound context actions.
+			"isIdle" => Ok(json!(self
+				.shared
+				.context_actions
+				.lock()
+				.unwrap()
+				.as_ref()
+				.map(|actions| actions.is_idle())
+				.unwrap_or(true))),
+			"isProjectTrusted" => Ok(json!(self
+				.shared
+				.context_actions
+				.lock()
+				.unwrap()
+				.as_ref()
+				.map(|actions| actions.is_project_trusted())
+				.unwrap_or(true))),
+			"model" => Ok(self
+				.shared
+				.context_actions
+				.lock()
+				.unwrap()
+				.as_ref()
+				.and_then(|actions| actions.get_model())
+				.unwrap_or(Value::Null)),
+			"thinkingLevel" => self.shared.runtime.get_thinking_level(),
+			_ => Ok(Value::Null),
+		}
+	}
+
+	/// Guarded context method invocation (`ctx.shutdown()`).
+	fn ctx_call(&self, method: &str) -> Result<Value, String> {
+		if let Some(message) = self.shared.stale_message.lock().unwrap().clone() {
+			return Err(message);
+		}
+		match method {
+			"shutdown" => {
+				self.shutdown();
+				Ok(Value::Null)
+			}
+			_ => Ok(Value::Null),
+		}
+	}
+
+	/// `hasHandlers(eventType)`.
+	pub fn has_handlers(&self, event_type: &str) -> bool {
+		self.snapshot_handlers(event_type).iter().any(|(_, handlers)| !handlers.is_empty())
+	}
+
+	/// The generic `emit(event)` — session_before_* results accumulate and
+	/// `cancel` short-circuits; handler errors go to `emitError`.
+	pub async fn emit(&self, event: Value) -> Option<Value> {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let event_type = event.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+		let is_session_before = matches!(
+			event_type.as_str(),
+			"session_before_switch" | "session_before_fork" | "session_before_compact" | "session_before_tree"
+		);
+		let mut result: Option<Value> = None;
+		for (extension_path, handlers) in self.snapshot_handlers(&event_type) {
+			for (_, handler) in handlers {
+				match handler(event.clone(), ctx.clone()).await {
+					Ok(handler_result) => {
+						if is_session_before && handler_result.as_ref().is_some_and(js_truthy) {
+							result = handler_result;
+							if result.as_ref().and_then(|r| r.get("cancel")) == Some(&Value::Bool(true)) {
+								return result;
+							}
+						}
+					}
+					Err(error) => {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": event_type,
+							"error": error,
+						}));
+					}
+				}
+			}
+		}
+		result
+	}
+
+	/// `emitMessageEnd(event)` — last same-role replacement wins.
+	pub async fn emit_message_end(&self, event: Value) -> Option<Value> {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let mut current_message = event.get("message").cloned().unwrap_or(Value::Null);
+		let mut modified = false;
+		for (extension_path, handlers) in self.snapshot_handlers("message_end") {
+			for (_, handler) in handlers {
+				let mut current_event = event.clone();
+				if let Some(object) = current_event.as_object_mut() {
+					object.insert("message".to_string(), current_message.clone());
+				}
+				match handler(current_event, ctx.clone()).await {
+					Ok(handler_result) => {
+						let replacement = handler_result
+							.as_ref()
+							.and_then(|result| result.get("message"))
+							.filter(|message| js_truthy(message))
+						 .cloned();
+						let Some(replacement) = replacement else { continue };
+						if replacement.get("role") != current_message.get("role") {
+							self.emit_error(&json!({
+								"extensionPath": extension_path,
+								"event": "message_end",
+								"error": "message_end handlers must return a message with the same role",
+							}));
+							continue;
+						}
+						current_message = replacement;
+						modified = true;
+					}
+					Err(error) => {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": "message_end",
+							"error": error,
+						}));
+					}
+				}
+			}
+		}
+		if modified {
+			Some(current_message)
+		} else {
+			None
+		}
+	}
+
+	/// `onError(listener)` — returns the removal id.
+	pub fn on_error(&self, listener: ErrorListener) -> u64 {
+		let id = self.shared.next_listener_id.fetch_add(1, Ordering::SeqCst);
+		self.shared.error_listeners.lock().unwrap().push((id, listener));
+		id
+	}
+
+	pub fn remove_error_listener(&self, id: u64) {
+		self.shared.error_listeners.lock().unwrap().retain(|(i, _)| *i != id);
+	}
+
+	/// `emitError(error)`.
+	pub fn emit_error(&self, error: &Value) {
+		for (_, listener) in self.shared.error_listeners.lock().unwrap().iter() {
+			listener(error);
+		}
+	}
+
+	/// `reportUnhandledMcpServers()`.
+	pub fn report_unhandled_mcp_servers(&self) {
+		if self.has_handlers("mcp_servers_change") {
+			return;
+		}
+		let servers = self.shared.runtime.mcp_servers().lock().unwrap().list();
+		self.report_unhandled_from(&servers);
+	}
+
+	/// The report over an already-snapshotted server list (used by the MCP
+	/// change listener, which runs with the registry lock held).
+	fn report_unhandled_from(&self, servers: &[RegisteredMcpServer]) {
+		if self.has_handlers("mcp_servers_change") {
+			return;
+		}
+		for server in servers {
+			let mut reported = self.shared.reported_mcp_servers.lock().unwrap();
+			if reported.contains(&server.name) {
+				continue;
+			}
+			reported.insert(server.name.clone());
+			drop(reported);
+			self.emit_error(&json!({
+				"extensionPath": server.extension_path,
+				"event": "register_mcp_server",
+				"error": format!("MCP server \"{}\" is registered, but no loaded extension connects MCP servers; another extension may have replaced the built-in MCP support", server.name),
+			}));
+		}
+	}
+
+	/// `getExtensionPaths()`.
+	pub fn get_extension_paths(&self) -> Vec<String> {
+		self.shared.extensions.lock().unwrap().iter().map(|ext| ext.lock().unwrap().path.clone()).collect()
+	}
+
+	/// `getAllRegisteredTools()` — first registration per name wins.
+	pub fn get_all_registered_tools(&self) -> Vec<(Value, Value)> {
+		let mut tools: Vec<(String, Value, Value)> = Vec::new();
+		for extension_handle in self.shared.extensions.lock().unwrap().iter() {
+			let extension = extension_handle.lock().unwrap();
+			for (name, definition, source_info) in &extension.tools {
+				if !tools.iter().any(|(n, _, _)| n == name) {
+					tools.push((name.clone(), definition.clone(), source_info.clone()));
+				}
+			}
+		}
+		tools.into_iter().map(|(_, definition, source_info)| (definition, source_info)).collect()
+	}
+
+	/// `getToolDefinition(toolName)`.
+	pub fn get_tool_definition(&self, tool_name: &str) -> Option<Value> {
+		let extensions = self.shared.extensions.lock().unwrap();
+		extensions
+			.iter()
+			.find_map(|ext| {
+				let ext = ext.lock().unwrap();
+				ext.tools.iter().find(|(name, _, _)| name == tool_name).map(|(_, definition, _)| definition.clone())
+			})
+			.or(None)
+	}
+
+	/// `getFlags()` — first registration per name wins.
+	pub fn get_flags(&self) -> Vec<ExtensionFlag> {
+		let mut names: Vec<String> = Vec::new();
+		let mut flags: Vec<ExtensionFlag> = Vec::new();
+		for extension_handle in self.shared.extensions.lock().unwrap().iter() {
+			let extension = extension_handle.lock().unwrap();
+			for (name, flag) in &extension.flags {
+				if !names.contains(name) {
+					names.push(name.clone());
+					flags.push(flag.clone());
+				}
+			}
+		}
+		flags
+	}
+
+	/// `setFlagValue(name, value)`.
+	pub fn set_flag_value(&self, name: &str, value: Value) {
+		self.shared.runtime.set_flag_value(name, value);
+	}
+
+	/// `getFlagValues()`.
+	pub fn get_flag_values(&self) -> Vec<(String, Value)> {
+		self.shared.runtime.flag_values()
+	}
+
+	/// `resolveRegisteredCommands()` — duplicate names get
+	/// `name:occurrence` invocation names.
+	fn resolve_registered_commands(&self) -> Vec<(String, String, Option<String>, Value)> {
+		let mut commands: Vec<(String, Option<String>, Value)> = Vec::new();
+		let mut counts: Vec<(String, usize)> = Vec::new();
+		for extension_handle in self.shared.extensions.lock().unwrap().iter() {
+			let extension = extension_handle.lock().unwrap();
+			for (name, command) in &extension.commands {
+				commands.push((command.name.clone(), command.description.clone(), command.source_info.clone()));
+				match counts.iter_mut().find(|(n, _)| n == name) {
+					Some((_, count)) => *count += 1,
+					None => counts.push((command.name.clone(), 1)),
+				}
+			}
+		}
+		let mut seen: Vec<(String, usize)> = Vec::new();
+		let mut taken: Vec<String> = Vec::new();
+		commands
+			.into_iter()
+			.map(|(name, description, source_info)| {
+				let occurrence = match seen.iter_mut().find(|(n, _)| n == &name) {
+					Some((_, count)) => {
+						*count += 1;
+						*count
+					}
+					None => {
+						seen.push((name.clone(), 1));
+						1
+					}
+				};
+				let total = counts.iter().find(|(n, _)| n == &name).map(|(_, c)| *c).unwrap_or(0);
+				let mut invocation_name =
+					if total > 1 { format!("{}:{}", name, occurrence) } else { name.clone() };
+				if taken.contains(&invocation_name) {
+					let mut suffix = occurrence;
+					loop {
+						suffix += 1;
+						invocation_name = format!("{}:{}", name, suffix);
+						if !taken.contains(&invocation_name) {
+							break;
+						}
+					}
+				}
+				taken.push(invocation_name.clone());
+				(name, invocation_name, description, source_info)
+			})
+			.collect()
+	}
+
+	/// `getRegisteredCommands()`.
+	pub fn get_registered_commands(&self) -> Vec<(String, String, Option<String>, Value)> {
+		self.resolve_registered_commands()
+	}
+
+	/// `getCommand(name)` — matched by invocation name.
+	pub fn get_command(&self, name: &str) -> Option<(String, String, Option<String>, Value)> {
+		self.resolve_registered_commands().into_iter().find(|(_, invocation, _, _)| invocation == name)
+	}
+
+	/// `getShortcuts(resolvedKeybindings)` — reserved-keybinding conflict
+	/// logic; diagnostics recorded for `getShortcutDiagnostics()`.
+	pub fn get_shortcuts(&self, resolved_keybindings: &Value) -> Vec<(String, ExtensionShortcut)> {
+		*self.shared.shortcut_diagnostics.lock().unwrap() = Vec::new();
+		// buildBuiltinKeybindings
+		let mut builtin: Vec<(String, String, bool)> = Vec::new();
+		if let Some(object) = resolved_keybindings.as_object() {
+			for (keybinding, keys) in object {
+				let key_list: Vec<Value> = match keys {
+					Value::Array(list) => list.clone(),
+					value => vec![value.clone()],
+				};
+				let restrict_override = RESERVED_KEYBINDINGS.contains(&keybinding.as_str());
+				for key in key_list {
+					let Some(key) = key.as_str() else { continue };
+					let normalized_key = key.to_lowercase();
+					if let Some((_, _, existing_restrict)) =
+						builtin.iter_mut().find(|(k, _, _)| *k == normalized_key)
+					{
+						if *existing_restrict && !restrict_override {
+							continue;
+						}
+						*existing_restrict = restrict_override;
+					} else {
+						builtin.push((normalized_key, keybinding.clone(), restrict_override));
+					}
+				}
+			}
+		}
+		let mut shortcuts: Vec<(String, ExtensionShortcut)> = Vec::new();
+		for extension_handle in self.shared.extensions.lock().unwrap().iter() {
+			let extension = extension_handle.lock().unwrap();
+			for (key, shortcut) in &extension.shortcuts {
+				let normalized_key = key.to_lowercase();
+				let builtin_entry = builtin.iter().find(|(k, _, _)| *k == normalized_key);
+				if let Some((_, _keybinding, true)) = builtin_entry {
+					self.push_shortcut_diagnostic(
+						format!(
+							"Extension shortcut '{}' from {} conflicts with built-in shortcut. Skipping.",
+							key, shortcut.extension_path
+						),
+						&shortcut.extension_path,
+					);
+					continue;
+				}
+				if let Some((_, keybinding, false)) = builtin_entry {
+					self.push_shortcut_diagnostic(
+						format!(
+							"Extension shortcut conflict: '{}' is built-in shortcut for {} and {}. Using {}.",
+							key, keybinding, shortcut.extension_path, shortcut.extension_path
+						),
+						&shortcut.extension_path,
+					);
+				}
+				if let Some((_, existing)) = shortcuts.iter().find(|(k, _)| *k == normalized_key) {
+					self.push_shortcut_diagnostic(
+						format!(
+							"Extension shortcut conflict: '{}' registered by both {} and {}. Using {}.",
+							key, existing.extension_path, shortcut.extension_path, shortcut.extension_path
+						),
+						&shortcut.extension_path,
+					);
+				}
+				match shortcuts.iter_mut().find(|(k, _)| *k == normalized_key) {
+					Some(slot) => slot.1 = shortcut.clone(),
+					None => shortcuts.push((normalized_key, shortcut.clone())),
+				}
+			}
+		}
+		shortcuts
+	}
+
+	fn push_shortcut_diagnostic(&self, message: String, path: &str) {
+		self.shared
+			.shortcut_diagnostics
+			.lock()
+			.unwrap()
+			.push(json!({ "type": "warning", "message": message, "path": path }));
+	}
+
+	/// `getShortcutDiagnostics()`.
+	pub fn get_shortcut_diagnostics(&self) -> Vec<Value> {
+		self.shared.shortcut_diagnostics.lock().unwrap().clone()
+	}
+
+	/// `invalidate(message?)` — first call wins.
+	pub fn invalidate(&self, message: Option<&str>) {
+		let mut stale = self.shared.stale_message.lock().unwrap();
+		if stale.is_some() {
+			return;
+		}
+		*stale = Some(message.unwrap_or(DEFAULT_STALE_MESSAGE).to_string());
+		drop(stale);
+		self.shared.runtime.invalidate(message);
+	}
+
+	/// `getActiveTools()` — `Err` is the stale/unbound throw.
+	pub fn get_active_tools(&self) -> Result<Vec<String>, String> {
+		if let Some(message) = self.shared.stale_message.lock().unwrap().clone() {
+			return Err(message);
+		}
+		self.shared.runtime.get_active_tools()
+	}
+
+	/// `hasUI()`.
+	pub fn has_ui(&self) -> bool {
+		*self.shared.ui.lock().unwrap()
+	}
+
+	/// `setUIContext(uiContext?, mode = "print")`.
+	pub fn set_ui_context(&self, ui: bool, mode: &str) {
+		*self.shared.ui.lock().unwrap() = ui;
+		*self.shared.mode.lock().unwrap() = mode.to_string();
+	}
+
+	/// `shutdown()`.
+	pub fn shutdown(&self) {
+		if let Some(actions) = self.shared.context_actions.lock().unwrap().clone() {
+			actions.shutdown();
+		}
+	}
+}
+
+/// TS `emitSessionShutdownEvent(extensionRunner, event)`.
+pub async fn emit_session_shutdown_event(runner: &ExtensionRunner, event: Value) -> bool {
+	if runner.has_handlers("session_shutdown") {
+		runner.emit(event).await;
+		return true;
+	}
+	false
+}
+
+/// TS `emitProjectTrustEvent(extensionsResult, event, ctx)` — the first
+/// non-`undecided` handler wins.
+pub async fn emit_project_trust_event(
+	runner: &ExtensionRunner,
+	event: Value,
+	ctx: Value,
+) -> (Option<Value>, Vec<Value>) {
+	let mut errors: Vec<Value> = Vec::new();
+	let event_type = event.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+	let ctx = CtxView::Raw(ctx);
+	for (extension_path, handlers) in runner.snapshot_handlers("project_trust") {
+		for (_, handler) in handlers {
+			match handler(event.clone(), ctx.clone()).await {
+				Ok(handler_result) => {
+					// TS reads `handlerResult.trusted` inside the try: an
+					// undefined/null result throws a TypeError that is
+					// recorded as a handler error.
+					let undecided = match handler_result.as_ref() {
+						Some(result) if !result.is_null() => {
+							result.get("trusted").and_then(Value::as_str) == Some("undecided")
+						}
+						_ => {
+							errors.push(json!({
+								"extensionPath": extension_path,
+								"event": event_type,
+								"error": "Cannot read properties of undefined (reading 'trusted')",
+							}));
+							continue;
+						}
+					};
+					if undecided {
+						continue;
+					}
+					return (handler_result, errors);
+				}
+				Err(error) => {
+					errors.push(json!({
+						"extensionPath": extension_path,
+						"event": event_type,
+						"error": error,
+					}));
+				}
+			}
+		}
+	}
+	(None, errors)
+}
+
+// ============================================================================
+// ExtensionHost bridge — the real runner behind the agent-session seam
+// ============================================================================
+
+impl ExtensionHost for ExtensionRunner {
+	fn has_handlers(&self, event: &str) -> bool {
+		ExtensionRunner::has_handlers(self, event)
+	}
+	fn emit_session_before_switch<'a>(&'a self, event: Value) -> BoxFuture<'a, Option<Value>> {
+		Box::pin(async move { self.emit(event).await })
+	}
+	fn emit_session_before_fork<'a>(&'a self, event: Value) -> BoxFuture<'a, Option<Value>> {
+		Box::pin(async move { self.emit(event).await })
+	}
+	fn emit<'a>(&'a self, event: Value) -> BoxFuture<'a, ()> {
+		Box::pin(async move {
+			self.emit(event).await;
+		})
+	}
+	fn emit_message_end<'a>(&'a self, event: Value) -> BoxFuture<'a, Option<Value>> {
+		Box::pin(async move { self.emit_message_end(event).await })
+	}
+	fn emit_error(&self, error: Value) {
+		ExtensionRunner::emit_error(self, &error);
+	}
+	fn invalidate(&self, message: &str) {
+		ExtensionRunner::invalidate(self, Some(message));
+	}
+	fn get_command(&self, name: &str) -> bool {
+		ExtensionRunner::get_command(self, name).is_some()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn flags_commit_and_discard() {
+		let runtime = ExtensionRuntime::new();
+		let ok = Arc::new(|_pi: &ExtensionApi| Box::pin(async { Ok(()) }) as BoxFuture<'static, Result<(), String>>);
+		let extension =
+			load_extension_from_factory(ok, "/proj", None, &runtime, "<inline:a>").await.unwrap();
+		assert_eq!(extension.lock().unwrap().path, "<inline:a>");
+
+		let spec = Arc::new(|pi: &ExtensionApi| {
+			let pi = pi.clone();
+			Box::pin(async move {
+				pi.register_flag("verbose", &json!({"type": "boolean", "default": true})).unwrap();
+				Err("boom".to_string())
+			}) as BoxFuture<'static, Result<(), String>>
+		});
+		let failed = load_extension_from_factory(spec, "/proj", None, &runtime, "<inline:b>").await;
+		assert_eq!(failed.err(), Some("boom".to_string()));
+		assert!(runtime.flag_values().is_empty());
+	}
+
+	#[tokio::test]
+	async fn emit_cancel_short_circuits() {
+		let runtime = ExtensionRuntime::new();
+		let factory: FactoryFn = Arc::new(|pi: &ExtensionApi| {
+			let pi = pi.clone();
+			Box::pin(async move {
+				let handler: ExtensionHandler = Arc::new(|_event, _ctx| {
+					Box::pin(async { Ok(Some(json!({"cancel": true}))) })
+				});
+				pi.on("session_before_switch", handler).unwrap();
+				Ok(())
+			})
+		});
+		let extension = load_extension_from_factory(factory, "/proj", None, &runtime, "<inline>").await.unwrap();
+		let runner = ExtensionRunner::new(vec![extension], runtime, "/proj", None);
+		assert!(runner.has_handlers("session_before_switch"));
+		let result = runner.emit(json!({"type": "session_before_switch", "sessionPath": "/x"})).await;
+		assert_eq!(result, Some(json!({"cancel": true})));
+	}
+}

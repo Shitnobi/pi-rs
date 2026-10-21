@@ -34,6 +34,7 @@ mod session_tree_harness;
 mod session_runtime_harness;
 mod session_services_harness;
 mod session_stats_harness;
+mod extension_runner_harness;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = run(&args);
@@ -204,6 +205,7 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "agent-loop" => {
             return agent_loop_harness::run_agent_loop_harness(&input, std::path::Path::new(cwd))
         }
+        "extension-runner" => return extension_runner_harness::run(&input),
         "agent-session-events" => return session_harness::run_agent_session_events_harness(&input),
         "agent-session-tools" => {
             return session_tools_harness::run_agent_session_tools_harness(&input)

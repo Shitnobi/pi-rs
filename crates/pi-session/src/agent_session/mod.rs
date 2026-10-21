@@ -20,6 +20,7 @@ pub mod stats;
 pub mod system_prompt;
 pub mod tree;
 pub mod tools;
+pub mod extension_runner;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
