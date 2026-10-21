@@ -18,3 +18,4 @@ pi-tools = { path = "../pi-tools" }
 pi-tui = { path = "../pi-tui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }

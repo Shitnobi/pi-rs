@@ -32,11 +32,12 @@
 //! - `{op:"peek"}` → array of messages (verbatim values)
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
 use pi_agent::agent_surface::AgentQueues;
-use pi_agent::types::QueueMode;
+use pi_agent::types::{AgentTool, AgentToolResult, BoxFuture, QueueMode, ToolExecutionMode};
 
 pub fn run_agent_queue_harness(args: &Value, _cwd: &Path) -> Result<Value, String> {
     // Validation order mirrors the TS entry exactly: ops array, then the
@@ -184,13 +185,10 @@ pub fn run_declare_tool_changes_harness(args: &Value, _cwd: &Path) -> Result<Val
 // ============================================================================
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use pi_agent::host::Clock;
 use pi_agent::tool_call::{AfterToolCallInput, ToolUpdateSink};
-use pi_agent::types::{
-    AgentContext, AgentTool, AgentToolResult, BeforeToolCallResult, ToolExecutionMode,
-};
+use pi_agent::types::{AgentContext, BeforeToolCallResult};
 
 /// Scripted tool driven by the harness `execute` script (update/return/throw
 /// steps) and the shared perf clock. Each step with `perfNow` advances the
@@ -433,6 +431,432 @@ pub fn run_run_tool_call_harness(args: &Value, _cwd: &Path) -> Result<Value, Str
         "result": {
             "outcome": serde_json::to_value(&outcome).expect("outcome serializes"),
             "updates": updates,
+        }
+    }))
+}
+
+// ============================================================================
+// agent (class Agent parity)
+// ============================================================================
+
+/// Shared environment for the agent-entry scripted tools: the perf clock,
+/// the snapshot log, and the agent cell (the tools are constructed before
+/// the `Agent`, so they reach it through this shared cell — the tool
+/// snapshot/steer/followUp/abort steps observe and drive the live agent).
+struct AgentToolEnv {
+    perf: Arc<Mutex<f64>>,
+    snapshots: Arc<Mutex<Vec<Value>>>,
+    agent: Arc<Mutex<Option<pi_agent::Agent>>>,
+}
+
+/// Scripted tool: the agent-loop ScriptedTool shape plus the
+/// steer/followUp/abort/snapshot step kinds. Step processing order:
+/// perfNow, steer/followUp/abort/snapshot, update, then (last step)
+/// throw/return.
+struct AgentScriptedTool {
+    spec: Value,
+    env: Arc<AgentToolEnv>,
+}
+
+impl AgentTool for AgentScriptedTool {
+    fn name(&self) -> &str {
+        self.spec.get("name").and_then(Value::as_str).unwrap_or("")
+    }
+    fn description(&self) -> &str {
+        self.spec.get("description").and_then(Value::as_str).unwrap_or("")
+    }
+    fn label(&self) -> &str {
+        match self.spec.get("label").and_then(Value::as_str) {
+            Some(label) => label,
+            None => self.name(),
+        }
+    }
+    fn parameters(&self) -> &Value {
+        self.spec.get("parameters").unwrap_or(&Value::Null)
+    }
+    fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        self.spec
+            .get("executionMode")
+            .and_then(Value::as_str)
+            .and_then(ToolExecutionMode::parse)
+    }
+    fn prepare_arguments(&self, args: &Value) -> Option<Value> {
+        let prepare = self.spec.get("prepareArguments")?;
+        match prepare.get("mode").and_then(Value::as_str) {
+            Some("script") => {
+                let pairs = prepare.get("script").and_then(Value::as_array)?;
+                for pair in pairs {
+                    if pair.get("in") == Some(args) {
+                        return pair.get("out").cloned();
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    fn execute<'a>(
+        &'a self,
+        _tool_call_id: &'a str,
+        _args: &'a Value,
+        _signal: Option<&'a pi_agent::host::AbortHandle>,
+        on_update: Option<&'a pi_agent::types::AgentToolUpdateCallback<'a>>,
+    ) -> BoxFuture<'a, Result<AgentToolResult, String>> {
+        let script = self
+            .spec
+            .get("execute")
+            .and_then(|e| e.get("script"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let env = Arc::clone(&self.env);
+        Box::pin(async move {
+            let mut steps = script.iter().peekable();
+            while let Some(step) = steps.next() {
+                if let Some(perf_now) = step.get("perfNow").and_then(Value::as_f64) {
+                    *env.perf.lock().expect("perf clock") = perf_now;
+                }
+                if let Some(steer) = step.get("steer") {
+                    if let Some(agent) = env.agent.lock().expect("agent cell").as_ref() {
+                        agent.steer(steer.clone());
+                    }
+                }
+                if let Some(follow_up) = step.get("followUp") {
+                    if let Some(agent) = env.agent.lock().expect("agent cell").as_ref() {
+                        agent.follow_up(follow_up.clone());
+                    }
+                }
+                if step.get("abort") == Some(&Value::Bool(true)) {
+                    if let Some(agent) = env.agent.lock().expect("agent cell").as_ref() {
+                        agent.abort();
+                    }
+                }
+                if let Some(tag) = step.get("snapshot") {
+                    let state = env
+                        .agent
+                        .lock()
+                        .expect("agent cell")
+                        .as_ref()
+                        .map(|agent| agent.state_snapshot())
+                        .unwrap_or(Value::Null);
+                    env.snapshots
+                        .lock()
+                        .expect("snapshot log")
+                        .push(json!({ "tag": tag, "state": state }));
+                }
+                if let Some(update) = step.get("update") {
+                    if let Some(sink) = on_update {
+                        sink(crate::agent_loop_harness::parse_tool_result(update));
+                    }
+                }
+                if steps.peek().is_none() {
+                    if let Some(message) = step.get("throw").and_then(Value::as_str) {
+                        return Err(message.to_string());
+                    }
+                    if let Some(result) = step.get("return") {
+                        return Ok(crate::agent_loop_harness::parse_tool_result(result));
+                    }
+                }
+            }
+            Ok(AgentToolResult::default())
+        })
+    }
+}
+
+/// A settle:false op: either a spawned run (polled concurrently on the
+/// current-thread runtime, mirroring the un-awaited JS promise) or an
+/// immediate start error (the JS rejected promise); the error, if any,
+/// becomes a thrown entry once awaited at script end.
+enum PendingRun {
+    Spawned(tokio::task::JoinHandle<Option<String>>),
+    Failed(String),
+}
+
+/// The `agent` harness entry (shared wire protocol in
+/// /home/shinobi/agent-t5-protocol.md): the real `Agent` (crates/pi-agent
+/// agent.rs, port of packages/agent agent.ts) over scripted provider
+/// turns, scripted tools (snapshot/steer/followUp/abort steps), one
+/// event-recording listener, and a script of harness ops.
+pub fn run_agent_harness(args: &Value, _cwd: &Path) -> Result<Value, String> {
+    use pi_agent::host::Clock;
+    use pi_agent::r#loop::LoopStreamFn;
+    use pi_agent::types::{AgentEvent, QueueMode};
+
+    // Validation order per the shared protocol spec (byte-exact errors):
+    // script, providerTurns, nowMs, initialState, then tool shape.
+    let script: Vec<Value> = args
+        .get("script")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing script".to_string())?
+        .clone();
+    let provider_turns: Vec<Value> = args
+        .get("providerTurns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "missing providerTurns".to_string())?
+        .clone();
+    let now_ms = args
+        .get("nowMs")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "missing nowMs".to_string())?;
+    let initial_state: Value = match args.get("initialState") {
+        None | Some(Value::Null) => json!({}),
+        Some(state) if state.is_object() => state.clone(),
+        _ => return Err("initialState must be an object".to_string()),
+    };
+    if let Some(messages) = initial_state.get("messages") {
+        if !messages.is_array() {
+            return Err("initialState.messages must be an array".to_string());
+        }
+    }
+    if let Some(tools) = initial_state.get("tools") {
+        if !tools.is_array() {
+            return Err("initialState.tools must be an array".to_string());
+        }
+    }
+    if let Some(tools) = args.get("tools") {
+        if !tools.is_array() {
+            return Err("tools must be an array".to_string());
+        }
+    }
+    let tool_specs: Vec<Value> = match args.get("tools").and_then(Value::as_array) {
+        Some(specs) => specs.clone(),
+        None => initial_state
+            .get("tools")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    // Tool/step shape errors (same list as the agent-loop entry).
+    for tool in &tool_specs {
+        if !tool.is_object() {
+            return Err("tools entries must be objects".to_string());
+        }
+        if tool.get("name").and_then(Value::as_str).is_none() {
+            return Err("missing tool name".to_string());
+        }
+    }
+    let perf_seq: Vec<f64> = args
+        .get("perfSeq")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_f64).collect())
+        .unwrap_or_default();
+
+    // Pinned clocks: Date.now → nowMs, performance.now → a single settable
+    // value starting at perfSeq[0] (or 0); execute steps set it via perfNow.
+    let perf = Arc::new(Mutex::new(perf_seq.first().copied().unwrap_or(0.0)));
+    let clock: Arc<dyn Clock> =
+        Arc::new(crate::agent_loop_harness::RunClock { now_ms, perf: Arc::clone(&perf) });
+    let snapshots: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let agent_cell: Arc<Mutex<Option<pi_agent::Agent>>> = Arc::new(Mutex::new(None));
+    let env = Arc::new(AgentToolEnv {
+        perf: Arc::clone(&perf),
+        snapshots: Arc::clone(&snapshots),
+        agent: Arc::clone(&agent_cell),
+    });
+    let make_tool = {
+        let env = Arc::clone(&env);
+        move |spec: &Value| -> Arc<dyn AgentTool> {
+            Arc::new(AgentScriptedTool { spec: spec.clone(), env: Arc::clone(&env) })
+        }
+    };
+    let tools: Vec<Arc<dyn AgentTool>> = tool_specs.iter().map(make_tool).collect();
+
+    // Fake provider popping providerTurns[i] per stream call; exhaustion
+    // throws (the in-band error path reaching handleRunFailure).
+    let provider_cursor = Arc::new(Mutex::new(0usize));
+    let stream_fn: Arc<LoopStreamFn> = {
+        let turns = provider_turns;
+        let cursor = Arc::clone(&provider_cursor);
+        Arc::new(move |_model: &Value, _context: &Value, _options: &Value| {
+            let turns = turns.clone();
+            let cursor = Arc::clone(&cursor);
+            Box::pin(async move {
+                let index = {
+                    let mut cursor = cursor.lock().expect("provider cursor");
+                    let value = *cursor;
+                    *cursor += 1;
+                    value
+                };
+                let turn = match turns.get(index) {
+                    Some(turn) => turn.clone(),
+                    None => return Err("provider script exhausted".to_string()),
+                };
+                Ok(pi_agent::provider::StreamOutput {
+                    events: turn
+                        .get("events")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into(),
+                    result: turn.get("result").cloned().unwrap_or(Value::Null),
+                })
+            }) as BoxFuture<'static, Result<pi_agent::provider::StreamOutput, String>>
+        })
+    };
+
+    // TS createMutableAgentState + constructor defaults.
+    let parse_mode = |key: &str| -> QueueMode {
+        initial_state
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(QueueMode::parse)
+            .unwrap_or_default()
+    };
+    let agent = pi_agent::Agent::new(pi_agent::AgentOptions {
+        messages: initial_state
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        tools,
+        system_prompt: initial_state
+            .get("systemPrompt")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        model: initial_state
+            .get("model")
+            .cloned()
+            .unwrap_or_else(pi_agent::default_model),
+        thinking_level: initial_state
+            .get("thinkingLevel")
+            .and_then(Value::as_str)
+            .unwrap_or("off")
+            .to_string(),
+        steering_mode: parse_mode("steeringMode"),
+        follow_up_mode: parse_mode("followUpMode"),
+        stream_fn,
+        tool_execution: ToolExecutionMode::default(),
+        clock: Arc::clone(&clock),
+    });
+    *agent_cell.lock().expect("agent cell") = Some(agent.clone());
+
+    // One listener recording every event.
+    let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let sink = Arc::clone(&events);
+        agent.subscribe(Arc::new(
+            move |event: AgentEvent, _signal: pi_agent::host::AbortHandle| {
+                sink.lock().expect("event recorder").push(event.to_value());
+                Box::pin(async {}) as BoxFuture<'static, ()>
+            },
+        ));
+    }
+
+    let (results, state_messages) = pi_agent::run_current_thread(async {
+        let mut results: Vec<Value> = Vec::with_capacity(script.len());
+        let mut pending: Vec<PendingRun> = Vec::new();
+        for op in &script {
+            let obj = match op.as_object() {
+                Some(obj) => obj,
+                None => {
+                    results.push(json!({ "thrown": "ops entries must be objects" }));
+                    continue;
+                }
+            };
+            let name = match obj.get("op").and_then(Value::as_str) {
+                Some(name) => name,
+                None => {
+                    results.push(json!({ "thrown": "missing op" }));
+                    continue;
+                }
+            };
+            let settle_false = obj.get("settle") == Some(&Value::Bool(false));
+            match name {
+                "prompt" | "continue" => {
+                    let started = if name == "prompt" {
+                        // normalizePromptInput: messages array | input string
+                        // (user message with timestamp nowMs) | single message.
+                        let input = obj.get("messages").or_else(|| obj.get("input"));
+                        match input {
+                            Some(Value::Array(messages)) => agent.prompt(messages.clone()),
+                            Some(Value::String(text)) => {
+                                agent.prompt(vec![agent.normalize_prompt_input(text)])
+                            }
+                            Some(single) => agent.prompt(vec![single.clone()]),
+                            None => agent.prompt(Vec::new()),
+                        }
+                    } else {
+                        agent.continue_run()
+                    };
+                    match started {
+                        Ok(run) => {
+                            if settle_false {
+                                pending.push(PendingRun::Spawned(tokio::spawn(async move {
+                                    run.await.err()
+                                })));
+                                results.push(Value::Null);
+                            } else {
+                                match run.await {
+                                    Ok(()) => results.push(Value::Null),
+                                    Err(message) => results.push(json!({ "thrown": message })),
+                                }
+                            }
+                        }
+                        Err(message) => {
+                            if settle_false {
+                                pending.push(PendingRun::Failed(message));
+                                results.push(Value::Null);
+                            } else {
+                                results.push(json!({ "thrown": message }));
+                            }
+                        }
+                    }
+                }
+                "steer" | "followUp" => {
+                    let outcome = match obj.get("message") {
+                        Some(message) => {
+                            if name == "steer" {
+                                agent.steer(message.clone());
+                            } else {
+                                agent.follow_up(message.clone());
+                            }
+                            Ok(())
+                        }
+                        None => Err("missing message".to_string()),
+                    };
+                    results.push(match outcome {
+                        Ok(()) => Value::Null,
+                        Err(message) => json!({ "thrown": message }),
+                    });
+                }
+                "abort" => {
+                    agent.abort();
+                    results.push(Value::Null);
+                }
+                "waitForIdle" => {
+                    agent.wait_for_idle().await;
+                    results.push(Value::Null);
+                }
+                "reset" => match agent.reset() {
+                    Ok(()) => results.push(Value::Null),
+                    Err(message) => results.push(json!({ "thrown": message })),
+                },
+                "getState" => results.push(agent.state_snapshot()),
+                other => results.push(json!({ "thrown": format!("unknown op: {other}") })),
+            }
+        }
+        // Await the pending settle:false ops; rejected ones surface as
+        // thrown entries (in pending order).
+        for run in pending {
+            let thrown = match run {
+                PendingRun::Spawned(handle) => handle.await.unwrap_or_default(), // the wrapper never panics
+                PendingRun::Failed(message) => Some(message),
+            };
+            if let Some(message) = thrown {
+                results.push(json!({ "thrown": message }));
+            }
+        }
+        (results, agent.messages())
+    });
+
+    let events = events.lock().expect("event recorder").clone();
+    let snapshots = snapshots.lock().expect("snapshot log").clone();
+    Ok(json!({
+        "result": {
+            "events": events,
+            "stateMessages": state_messages,
+            "results": results,
+            "snapshots": snapshots,
         }
     }))
 }

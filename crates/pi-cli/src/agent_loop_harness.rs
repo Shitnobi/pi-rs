@@ -74,9 +74,9 @@ fn parse_now_ms(args: &Value) -> Result<f64, String> {
 /// Pinned clocks: `Date.now` → nowMs, `performance.now` → a single
 /// settable value starting at `perfSeq[0]` (or 0); execute steps set it
 /// via `perfNow`.
-struct RunClock {
-    now_ms: f64,
-    perf: Arc<Mutex<f64>>,
+pub(crate) struct RunClock {
+    pub(crate) now_ms: f64,
+    pub(crate) perf: Arc<Mutex<f64>>,
 }
 
 impl Clock for RunClock {
@@ -90,7 +90,7 @@ impl Clock for RunClock {
 
 /// Shared harness state the scripted tools and hooks operate on.
 struct ToolEnv {
-    perf: Arc<Mutex<f64>>,
+    pub(crate) perf: Arc<Mutex<f64>>,
     steer_buffer: Arc<Mutex<Vec<Value>>>,
     follow_up_buffer: Arc<Mutex<Vec<Value>>>,
     abort_handle: AbortHandle,
@@ -217,7 +217,7 @@ impl AgentTool for LoopScriptedTool {
     }
 }
 
-fn parse_tool_result(value: &Value) -> AgentToolResult {
+pub(crate) fn parse_tool_result(value: &Value) -> AgentToolResult {
     AgentToolResult {
         content: value.get("content").and_then(Value::as_array).cloned().unwrap_or_default(),
         details: value.get("details").cloned().unwrap_or(Value::Null),

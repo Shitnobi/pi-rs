@@ -474,6 +474,7 @@ dependencies = [
  "pi-tui",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

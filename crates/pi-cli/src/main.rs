@@ -178,6 +178,7 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "compaction-utils" => return run_compaction_utils_harness(&input),
         "compaction" => return run_compaction_harness(&input),
         "nested-calls" => return run_nested_calls_harness(&input),
+        "agent" => return agent_harness::run_agent_harness(&input, std::path::Path::new(cwd)),
         "agent-queue" => {
             return agent_harness::run_agent_queue_harness(&input, std::path::Path::new(cwd))
         }

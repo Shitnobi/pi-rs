@@ -9112,6 +9112,303 @@ export const cases = [
 
 	return c.filter(Boolean);
 })(),
+
+...(() => {
+	// ========================================================================
+	// agent — the REAL Agent class (packages/agent) over scripted provider
+	// turns with scripted tools (snapshot/steer/followUp/abort steps) and a
+	// script of harness ops (prompt/continue with optional settle:false,
+	// steer/followUp/abort/waitForIdle/reset/getState). Mirrors the Rust
+	// harness entry (agent_harness.rs run_agent_harness). Messages carry
+	// literal numeric timestamps.
+	// ========================================================================
+	const ag = (name, args) => ({ tool: "agent", name: "ag-" + name, args });
+	const NOW = 1780000000000;
+	const agUser = (text, timestamp) => ({ role: "user", content: [{ type: "text", text }], timestamp });
+	const agMsg = (o = {}) => ({
+		role: "assistant",
+		content: o.content ?? [{ type: "text", text: "done" }],
+		api: o.api ?? "unknown",
+		provider: o.provider ?? "unknown",
+		model: o.model ?? "unknown",
+		usage: o.usage ?? {
+			input: 3,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 8,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: o.stopReason ?? "stop",
+		...(o.errorMessage !== undefined ? { errorMessage: o.errorMessage } : {}),
+		timestamp: o.timestamp ?? 4400,
+	});
+	const agToolCall = (id, name, callArgs) => ({ type: "toolCall", id, name, arguments: callArgs });
+	const agParams = () => ({
+		type: "object",
+		properties: { path: { type: "string" } },
+		required: ["path"],
+		additionalProperties: false,
+	});
+	const agTool = (name, extra = {}) => ({
+		name,
+		description: "Tool " + name,
+		parameters: agParams(),
+		label: name,
+		...extra,
+	});
+	const agTurn = (result, events = []) => ({ events, result });
+	const agOk = (text = "ok") => ({ content: [{ type: "text", text }], details: {} });
+
+	const c = [];
+	// Baseline: single awaited prompt turn, no tools, stopReason "stop".
+	c.push(ag("prompt-happy-path", {
+		script: [{ op: "prompt", messages: [agUser("hi", 1000)] }],
+		providerTurns: [agTurn(agMsg())],
+		nowMs: NOW,
+	}));
+	// prompt with an input string: normalizePromptInput produces a user
+	// message with timestamp = pinned Date.now (nowMs).
+	c.push(ag("prompt-input-string", {
+		script: [{ op: "prompt", input: "hello there" }],
+		providerTurns: [agTurn(agMsg())],
+		nowMs: NOW,
+	}));
+	// initialState without a leading system message: createInitialSystemMessage
+	// is unshifted (system content + toolsAdded from the scripted tools).
+	c.push(ag("initial-state-unshifts-system", {
+		initialState: { systemPrompt: "be helpful" },
+		tools: [agTool("read", { execute: { script: [{ perfNow: 1050, return: agOk() }] } })],
+		script: [{ op: "prompt", messages: [agUser("hi", 1000)] }],
+		providerTurns: [agTurn(agMsg())],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// initialState with a leading system message: kept as-is (no unshift).
+	c.push(ag("initial-state-keeps-leading-system", {
+		initialState: {
+			messages: [
+				{ role: "system", content: "custom base", timestamp: 1 },
+				agUser("hi", 1000),
+			],
+		},
+		script: [{ op: "prompt", messages: [agUser("more", 1000)] }],
+		providerTurns: [agTurn(agMsg())],
+		nowMs: NOW,
+	}));
+	// Tool call turn then final turn: the tool `snapshot` step observes
+	// mid-run state (isStreaming true, pendingToolCalls populated).
+	c.push(ag("tool-call-snapshot-mid-run", {
+		tools: [agTool("read", { execute: { script: [
+			{ snapshot: "during-tool" },
+			{ perfNow: 1050, return: agOk() },
+		] } })],
+		script: [{ op: "prompt", messages: [agUser("read x", 1000)] }],
+		providerTurns: [
+			agTurn(agMsg({ content: [agToolCall("call-1", "read", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+			agTurn(agMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// steer before the prompt: the steering queue is drained by the loop's
+	// first steering poll, so the steered message joins the first turn.
+	c.push(ag("steer-before-prompt", {
+		script: [
+			{ op: "steer", message: agUser("steered", 1500) },
+			{ op: "prompt", messages: [agUser("hi", 1000)] },
+		],
+		providerTurns: [agTurn(agMsg())],
+		nowMs: NOW,
+	}));
+	// followUp queued before the prompt: drained when the loop would stop,
+	// driving an extra provider turn.
+	c.push(ag("follow-up-pre-queued", {
+		script: [
+			{ op: "followUp", message: agUser("and then?", 1500) },
+			{ op: "prompt", messages: [agUser("hi", 1000)] },
+		],
+		providerTurns: [agTurn(agMsg()), agTurn(agMsg({ timestamp: 5000 }))],
+		nowMs: NOW,
+	}));
+	// continue from a toolResult tail (terminate ends the first run after
+	// the tool batch) → runContinuation (agentLoopContinue).
+	c.push(ag("continue-from-tool-result", {
+		tools: [agTool("read", { execute: { script: [{ perfNow: 1050, return: { content: [{ type: "text", text: "stop" }], details: {}, terminate: true } }] } })],
+		script: [
+			{ op: "prompt", messages: [agUser("read x", 1000)] },
+			{ op: "continue" },
+		],
+		providerTurns: [
+			agTurn(agMsg({ content: [agToolCall("call-1", "read", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+			agTurn(agMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// continue from an assistant tail with steering queued: the steering is
+	// drained and run as a prompt with skipInitialSteeringPoll.
+	c.push(ag("continue-from-assistant-steering", {
+		script: [
+			{ op: "prompt", messages: [agUser("hi", 1000)] },
+			{ op: "steer", message: agUser("steered", 1500) },
+			{ op: "continue" },
+		],
+		providerTurns: [agTurn(agMsg()), agTurn(agMsg({ timestamp: 5000 }))],
+		nowMs: NOW,
+	}));
+	// continue from an assistant tail with follow-ups queued: the follow-ups
+	// are drained and run as a prompt.
+	c.push(ag("continue-from-assistant-follow-up", {
+		script: [
+			{ op: "prompt", messages: [agUser("hi", 1000)] },
+			{ op: "followUp", message: agUser("and then?", 1500) },
+			{ op: "continue" },
+		],
+		providerTurns: [agTurn(agMsg()), agTurn(agMsg({ timestamp: 5000 }))],
+		nowMs: NOW,
+	}));
+	// continue from an assistant tail with nothing queued → thrown.
+	c.push(ag("continue-assistant-nothing-queued", {
+		script: [
+			{ op: "prompt", messages: [agUser("hi", 1000)] },
+			{ op: "continue" },
+			{ op: "getState" },
+		],
+		providerTurns: [agTurn(agMsg())],
+		nowMs: NOW,
+	}));
+	// continue on an empty state → thrown "No messages to continue from".
+	c.push(ag("continue-empty-state", {
+		script: [{ op: "continue" }],
+		providerTurns: [],
+		nowMs: NOW,
+	}));
+	// continue when every message is a system message → thrown.
+	c.push(ag("continue-all-system", {
+		initialState: { messages: [{ role: "system", content: "only system", timestamp: 1 }] },
+		script: [{ op: "continue" }, { op: "getState" }],
+		providerTurns: [],
+		nowMs: NOW,
+	}));
+	// Re-entrancy: prompt settle:false then prompt → the second throws the
+	// byte-exact re-entrancy error; after waitForIdle the state is
+	// consistent (only the first prompt ran).
+	c.push(ag("reentrant-prompt", {
+		script: [
+			{ op: "prompt", messages: [agUser("first", 1000)], settle: false },
+			{ op: "prompt", messages: [agUser("second", 1000)] },
+			{ op: "waitForIdle" },
+			{ op: "getState" },
+		],
+		providerTurns: [agTurn(agMsg())],
+		nowMs: NOW,
+	}));
+	// Re-entrancy with both prompts unsettled: the second start rejects and
+	// its error is collected as a thrown entry once awaited at script end.
+	c.push(ag("prompt-settle-false-rejection", {
+		script: [
+			{ op: "prompt", messages: [agUser("first", 1000)], settle: false },
+			{ op: "prompt", messages: [agUser("second", 1000)], settle: false },
+			{ op: "waitForIdle" },
+			{ op: "getState" },
+		],
+		providerTurns: [agTurn(agMsg())],
+		nowMs: NOW,
+	}));
+	// reset mid-run → thrown "Agent is already processing. Wait for
+	// completion before resetting.".
+	c.push(ag("reset-mid-run", {
+		script: [
+			{ op: "prompt", messages: [agUser("hi", 1000)], settle: false },
+			{ op: "reset" },
+			{ op: "waitForIdle" },
+			{ op: "getState" },
+		],
+		providerTurns: [agTurn(agMsg())],
+		nowMs: NOW,
+	}));
+	// reset when idle: messages reduced to the system baseline, queues
+	// cleared.
+	c.push(ag("reset-idle", {
+		initialState: { systemPrompt: "base prompt" },
+		script: [
+			{ op: "prompt", messages: [agUser("hi", 1000)] },
+			{ op: "steer", message: agUser("queued", 1500) },
+			{ op: "followUp", message: agUser("later", 1500) },
+			{ op: "reset" },
+			{ op: "getState" },
+		],
+		providerTurns: [agTurn(agMsg())],
+		nowMs: NOW,
+	}));
+	// Provider exhausted during prompt: handleRunFailure emits the synthetic
+	// assistant error message (stopReason "error", errorMessage "provider
+	// script exhausted"); the prompt itself still resolves (results null).
+	c.push(ag("provider-exhausted", {
+		script: [
+			{ op: "prompt", messages: [agUser("hi", 1000)] },
+			{ op: "getState" },
+		],
+		providerTurns: [],
+		nowMs: NOW,
+	}));
+	// abort mid-run (tool abort step) + provider exhaustion while aborted:
+	// the synthetic message carries stopReason "aborted".
+	c.push(ag("abort-mid-run", {
+		tools: [agTool("read", { execute: { script: [
+			{ abort: true },
+			{ perfNow: 1050, return: agOk() },
+		] } })],
+		script: [
+			{ op: "prompt", messages: [agUser("read x", 1000)] },
+			{ op: "getState" },
+		],
+		providerTurns: [
+			agTurn(agMsg({ content: [agToolCall("call-1", "read", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// steer injected mid-run by a tool execute step: agent.steer feeds the
+	// Agent's steering queue, drained by the next poll (extra turn).
+	c.push(ag("steer-tool-step-mid-run", {
+		tools: [agTool("read", { execute: { script: [
+			{ steer: agUser("steered mid-run", 1500) },
+			{ perfNow: 1050, return: agOk() },
+		] } })],
+		script: [{ op: "prompt", messages: [agUser("read x", 1000)] }],
+		providerTurns: [
+			agTurn(agMsg({ content: [agToolCall("call-1", "read", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+			agTurn(agMsg({ timestamp: 4000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// followUp injected mid-run by a tool execute step: drained when the
+	// loop would stop, driving a third provider turn.
+	c.push(ag("follow-up-tool-step-mid-run", {
+		tools: [agTool("read", { execute: { script: [
+			{ followUp: agUser("follow up mid-run", 1500) },
+			{ perfNow: 1050, return: agOk() },
+		] } })],
+		script: [{ op: "prompt", messages: [agUser("read x", 1000)] }],
+		providerTurns: [
+			agTurn(agMsg({ content: [agToolCall("call-1", "read", { path: "x" })], stopReason: "toolUse", timestamp: 2000 })),
+			agTurn(agMsg({ timestamp: 4000 })),
+			agTurn(agMsg({ timestamp: 6000 })),
+		],
+		perfSeq: [1000],
+		nowMs: NOW,
+	}));
+	// Protocol-misuse cases: in-band {error} with byte-identical messages.
+	c.push(ag("err-missing-script", { providerTurns: [], nowMs: NOW }));
+	c.push(ag("err-missing-provider-turns", { script: [], nowMs: NOW }));
+	c.push(ag("err-missing-now-ms", { script: [], providerTurns: [] }));
+	c.push(ag("err-initial-state-not-object", { script: [], providerTurns: [], nowMs: NOW, initialState: "nope" }));
+
+	return c.filter(Boolean);
+})(),
 ];
 
 // config-value sub-case builder (hoisted; used by the cases above).

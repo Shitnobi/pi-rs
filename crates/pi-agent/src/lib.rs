@@ -17,6 +17,7 @@
 //! (awaits), keeping parity replays bit-deterministic. No `tokio::spawn`
 //! inside the loop; sleeps go through the [`host::Sleeper`] seam.
 
+pub mod agent;
 pub mod agent_surface;
 pub mod conversion;
 pub mod host;
@@ -28,6 +29,7 @@ pub mod tool_call;
 pub mod types;
 pub mod validation;
 
+pub use agent::{default_model, empty_usage, Agent, AgentListener, AgentOptions, AgentRun};
 pub use agent_surface::AgentQueues;
 pub use host::{AbortHandle, Aborted, Clock, FixedClock, Sleeper, TokioSleeper};
 pub use provider::{ScriptedProvider, ScriptedTurn, StreamFn, StreamOutput};

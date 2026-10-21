@@ -4665,6 +4665,249 @@ async function runModule(tool, args, cwd) {
 		return { result: { events, newMessages, streamCalls } };
 	}
 
+	if (tool === "agent") {
+		// packages/agent/dist/agent.js — the REAL Agent class over scripted
+		// provider turns (fake provider pops providerTurns[i] per stream
+		// call; exhaustion throws "provider script exhausted", which the
+		// Agent's runWithLifecycle converts into the synthetic assistant
+		// error message). Tools are the agent-loop ScriptedTool shape plus
+		// steer/followUp/abort/snapshot execute steps (snapshot records
+		// {tag, state} mid-run — the tool has closure access to the agent).
+		// The harness subscribes ONE event-recording listener at
+		// construction and drives a script of ops (prompt/continue with
+		// optional settle:false, steer/followUp/abort/waitForIdle/reset/
+		// getState). Date.now + performance.now are pinned. Mirrors the
+		// Rust harness entry (agent_harness.rs run_agent_harness); shared
+		// wire protocol documented in agent-t5-protocol.md.
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		// Validation order per the shared protocol spec (byte-exact errors).
+		if (!Array.isArray(args.script)) throw new Error("missing script");
+		if (!Array.isArray(args.providerTurns)) throw new Error("missing providerTurns");
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		if (args.initialState !== undefined && args.initialState !== null) {
+			if (typeof args.initialState !== "object" || Array.isArray(args.initialState)) {
+				throw new Error("initialState must be an object");
+			}
+			if (args.initialState.messages !== undefined && !Array.isArray(args.initialState.messages)) {
+				throw new Error("initialState.messages must be an array");
+			}
+			if (args.initialState.tools !== undefined && !Array.isArray(args.initialState.tools)) {
+				throw new Error("initialState.tools must be an array");
+			}
+		}
+		if (args.tools !== undefined && !Array.isArray(args.tools)) throw new Error("tools must be an array");
+		const initialState = args.initialState ?? {};
+		const toolSpecs = Array.isArray(args.tools)
+			? args.tools
+			: Array.isArray(initialState.tools)
+				? initialState.tools
+				: [];
+		// Tool/step shape errors (same list as the agent-loop entry).
+		for (const t of toolSpecs) {
+			if (t === null || typeof t !== "object" || Array.isArray(t)) throw new Error("tools entries must be objects");
+			if (typeof t.name !== "string") throw new Error("missing tool name");
+		}
+		const perfSeq = (Array.isArray(args.perfSeq) ? args.perfSeq : []).filter((v) => typeof v === "number");
+
+		// Pinned clocks: Date.now → nowMs (message timestamps), performance.now
+		// → the scripted monotonic clock (starts at perfSeq[0] or 0; execute
+		// steps may set perfNow).
+		let perfValue = perfSeq.length > 0 ? perfSeq[0] : 0;
+		const realPerfNow = performance.now.bind(performance);
+		const realDateNow = Date.now;
+		performance.now = () => perfValue;
+		Date.now = () => args.nowMs;
+
+		const events = [];
+		const snapshots = [];
+		const results = [];
+		// settle:false ops: started without awaiting; their rejections are
+		// collected (as thrown entries) once awaited at script end.
+		const pending = [];
+		let agentRef = null;
+
+		// State snapshot (getState op + the tool `snapshot` step): exact
+		// shape from the protocol spec; arrays copied so mid-run snapshots
+		// observe mid-run state.
+		const snapshotState = () => {
+			const a = agentRef;
+			return {
+				messages: a.state.messages.slice(),
+				isStreaming: a.state.isStreaming,
+				streamingMessage: a.state.streamingMessage ?? null,
+				pendingToolCalls: [...a.state.pendingToolCalls],
+				errorMessage: a.state.errorMessage ?? null,
+				model: a.state.model,
+				thinkingLevel: a.state.thinkingLevel,
+				toolNames: a.state.tools.map((t) => t.name),
+				steeringMode: a.steeringMode,
+				followUpMode: a.followUpMode,
+			};
+		};
+
+		// Scripted tool: the agent-loop ScriptedTool shape plus the
+		// steer/followUp/abort/snapshot step kinds (steer/followUp/abort hit
+		// the live agent; snapshot records {tag, state}). Step processing
+		// order: perfNow, steer/followUp/abort/snapshot, update, then (last
+		// step) throw/return.
+		const makeTool = (spec) => {
+			const name = typeof spec.name === "string" ? spec.name : "";
+			const tool = {
+				name,
+				description: typeof spec.description === "string" ? spec.description : "",
+				label: typeof spec.label === "string" ? spec.label : name,
+				parameters: spec.parameters === undefined ? null : spec.parameters,
+				execute: async (_toolCallId, _args, _signal, onUpdate) => {
+					const script = spec.execute && Array.isArray(spec.execute.script) ? spec.execute.script : [];
+					for (let i = 0; i < script.length; i++) {
+						const step = script[i];
+						const last = i === script.length - 1;
+						if (typeof step.perfNow === "number") perfValue = step.perfNow;
+						if (step.steer !== undefined) agentRef.steer(step.steer);
+						if (step.followUp !== undefined) agentRef.followUp(step.followUp);
+						if (step.abort === true) agentRef.abort();
+						if (step.snapshot !== undefined) snapshots.push({ tag: step.snapshot, state: snapshotState() });
+						if (step.update !== undefined) onUpdate(parityParseToolResult(step.update));
+						if (last) {
+							if (typeof step.throw === "string") throw new Error(step.throw);
+							if (step.return !== undefined) return parityParseToolResult(step.return);
+						}
+					}
+					return parityParseToolResult(undefined);
+				},
+			};
+			if (spec.executionMode !== undefined) tool.executionMode = spec.executionMode;
+			if (spec.prepareArguments !== undefined) {
+				tool.prepareArguments = (callArgs) => {
+					const prep = spec.prepareArguments;
+					if (prep && prep.mode === "script" && Array.isArray(prep.script)) {
+						for (const pair of prep.script) {
+							if (pair && parityJsonEq(pair.in, callArgs)) return pair.out;
+						}
+					}
+					return callArgs;
+				};
+			}
+			return tool;
+		};
+
+		// Fake provider popping providerTurns[i] per stream call.
+		let providerIdx = 0;
+		const fakeStreamFn = (_m, _context, _options) => {
+			const turn = args.providerTurns[providerIdx];
+			if (turn === undefined) throw new Error("provider script exhausted");
+			providerIdx++;
+			return {
+				async *[Symbol.asyncIterator]() {
+					for (const event of turn.events ?? []) yield event;
+				},
+				result() {
+					return Promise.resolve(turn.result);
+				},
+			};
+		};
+
+		const agent = new Agent({
+			initialState: {
+				messages: Array.isArray(initialState.messages) ? initialState.messages : [],
+				...(initialState.systemPrompt !== undefined ? { systemPrompt: initialState.systemPrompt } : {}),
+				tools: toolSpecs.map(makeTool),
+				...(initialState.model !== undefined ? { model: initialState.model } : {}),
+				...(initialState.thinkingLevel !== undefined ? { thinkingLevel: initialState.thinkingLevel } : {}),
+				...(initialState.steeringMode !== undefined ? { steeringMode: initialState.steeringMode } : {}),
+				...(initialState.followUpMode !== undefined ? { followUpMode: initialState.followUpMode } : {}),
+			},
+			streamFn: fakeStreamFn,
+		});
+		agentRef = agent;
+		agent.subscribe((event) => {
+			events.push(event);
+		});
+
+		// Start a settle:false op: track the promise without awaiting it;
+		// its rejection (if any) becomes a thrown entry at script end.
+		const startUnsettled = (promise) => {
+			const record = { thrown: undefined };
+			const tracked = promise.then(
+				() => {},
+				(e) => {
+					record.thrown = e && e.message !== undefined ? e.message : String(e);
+				},
+			);
+			pending.push({ tracked, record });
+			results.push(null);
+		};
+
+		try {
+			for (const op of args.script) {
+				if (op === null || typeof op !== "object" || Array.isArray(op)) {
+					throw new Error("ops entries must be objects");
+				}
+				if (typeof op.op !== "string") throw new Error("missing op");
+				try {
+					switch (op.op) {
+						case "prompt": {
+							const input = op.messages !== undefined ? op.messages : op.input;
+							if (op.settle === false) startUnsettled(agent.prompt(input));
+							else {
+								await agent.prompt(input);
+								results.push(null);
+							}
+							break;
+						}
+						case "continue": {
+							if (op.settle === false) startUnsettled(agent.continue());
+							else {
+								await agent.continue();
+								results.push(null);
+							}
+							break;
+						}
+						case "steer":
+							if (op.message === undefined) throw new Error("missing message");
+							agent.steer(op.message);
+							results.push(null);
+							break;
+						case "followUp":
+							if (op.message === undefined) throw new Error("missing message");
+							agent.followUp(op.message);
+							results.push(null);
+							break;
+						case "abort":
+							agent.abort();
+							results.push(null);
+							break;
+						case "waitForIdle":
+							await agent.waitForIdle();
+							results.push(null);
+							break;
+						case "reset":
+							agent.reset();
+							results.push(null);
+							break;
+						case "getState":
+							results.push(snapshotState());
+							break;
+						default:
+							throw new Error("unknown op: " + op.op);
+					}
+				} catch (e) {
+					results.push({ thrown: e && e.message !== undefined ? e.message : String(e) });
+				}
+			}
+			// Await the pending settle:false ops; rejected ones surface as
+			// thrown entries (in pending order).
+			for (const { tracked, record } of pending) {
+				await tracked;
+				if (record.thrown !== undefined) results.push({ thrown: record.thrown });
+			}
+		} finally {
+			performance.now = realPerfNow;
+			Date.now = realDateNow;
+		}
+		return { result: { events, stateMessages: agent.state.messages, results, snapshots } };
+	}
+
 	return undefined;
 }
 
