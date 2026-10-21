@@ -512,6 +512,7 @@ dependencies = [
  "pi-agent",
  "pi-core",
  "pi-providers",
+ "pi-tools",
  "serde",
  "serde_json",
  "tokio",

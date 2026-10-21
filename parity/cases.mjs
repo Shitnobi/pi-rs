@@ -10904,3 +10904,225 @@ cases.push(
 		],
 	}),
 );
+
+// ======================================================= agent-session-bash
+// The bash slice of AgentSession (executeBash / recordBashResult /
+// abortBash / isBashRunning / hasPendingBashMessages /
+// _flushPendingBashMessages) over a scripted provider and scripted
+// BashOperations. bashScript feeds the operations fake (one entry per
+// exec call; `delay` steps yield on the harness event loop; `abortAfter`
+// steps fire session.abortBash()).
+const asbh = (name, args) => ({
+	name: "agent-session-bash/" + name,
+	tool: "agent-session-bash",
+	args: {
+		...args,
+		config: { systemPrompt: "You are the parity assistant.", ...(args.config ?? {}) },
+	},
+});
+const ASBH_NOW = 1748000000000;
+const asbhHeader = () => [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }];
+const asbhModel = {
+	id: "m-a",
+	name: "Model A",
+	api: "anthropic",
+	provider: "anthropic",
+	baseUrl: "",
+	reasoning: false,
+	input: [],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	contextWindow: 100000,
+	maxTokens: 8192,
+};
+const asbhMsg = (o = {}) => ({
+	role: "assistant",
+	content: o.content ?? [{ type: "text", text: "ok" }],
+	api: "anthropic",
+	provider: "anthropic",
+	model: o.model ?? "m-a",
+	usage: {
+		input: 3,
+		output: 5,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 8,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	},
+	stopReason: o.stopReason ?? "stop",
+	...(o.errorMessage !== undefined ? { errorMessage: o.errorMessage } : {}),
+	timestamp: ASBH_NOW,
+});
+cases.push(
+	// Arg validation mirrors the Rust entry byte-for-byte.
+	asbh("missing-args", {}),
+	asbh("missing-bashscript", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		script: [],
+	}),
+	asbh("invalid-settings", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader(), settings: { shellCommandPrefix: 5 } },
+		bashScript: [],
+		script: [],
+	}),
+	asbh("invalid-bashscript", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [{ chunks: "nope" }],
+		script: [],
+	}),
+	asbh("unknown-op", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [],
+		script: [{ op: "bogus" }],
+	}),
+	asbh("awaitbash-no-pending", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [],
+		script: [{ op: "awaitBash" }],
+	}),
+	asbh("invalid-result", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [],
+		script: [{ op: "recordBashResult", command: "c", result: { output: 5 } }],
+	}),
+	// executeBash happy path: streamed bash_execution_update chunks (with
+	// id), the user onChunk callback, the recorded bashExecution entry, and
+	// controller cleanup (isBashRunning false afterwards).
+	asbh("execute-happy", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [{ chunks: [{ data: "hello " }, { data: "world\n", delay: true }], exitCode: 0 }],
+		script: [
+			{ op: "executeBash", command: "echo hi", id: "b1", recordChunks: true },
+			{ op: "isBashRunning" },
+			{ op: "hasPendingBash" },
+		],
+	}),
+	// excludeFromContext (!! prefix semantics): the recorded bashExecution
+	// message carries excludeFromContext so convertToLlm skips it.
+	asbh("exclude-from-context", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [{ output: "secret\n", exitCode: 0 }],
+		script: [{ op: "executeBash", command: "c", excludeFromContext: true }],
+	}),
+	// Concurrent executions with ids: two bashStarts interleave on the
+	// harness event loop (single-threaded FIFO both sides); awaitAllBash
+	// settles both by input index with allSettled semantics.
+	asbh("concurrent-ids", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [
+			{ chunks: [{ data: "a1" }, { data: "a2", delay: true }], exitCode: 0 },
+			{
+				chunks: [{ data: "b1", delay: true }, { data: "b2", delay: true }, { data: "b3" }],
+				exitCode: 1,
+			},
+		],
+		script: [
+			{ op: "bashStart", command: "one", id: "b1" },
+			{ op: "bashStart", command: "two", id: "b2" },
+			{ op: "awaitAllBash" },
+			{ op: "isBashRunning" },
+		],
+	}),
+	// abortBash mid-execution: the signal is aborted while the exec is
+	// suspended at a delay; the remaining steps still stream, and the
+	// final result is cancelled with exitCode dropped.
+	asbh("abort-mid-execution", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [
+			{ chunks: [{ data: "x", delay: true }, { data: "y" }, { data: "z", delay: true }], exitCode: 0 },
+		],
+		script: [
+			{ op: "bashStart", command: "long", id: "b1" },
+			{ op: "abortBash" },
+			{ op: "awaitBash" },
+			{ op: "isBashRunning" },
+		],
+	}),
+	// abortAfter fires session.abortBash() from inside the exec; the
+	// aborted exec still returns its partial output.
+	asbh("abort-after-step", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [{ chunks: [{ data: "a" }, { data: "b", abortAfter: true }, { data: "c" }], exitCode: 0 }],
+		script: [{ op: "executeBash", command: "c", id: "b1" }],
+	}),
+	// shellCommandPrefix: the operations fake sees the prefixed command
+	// while the recorded message keeps the original command.
+	asbh("prefix-application", {
+		nowMs: ASBH_NOW,
+		config: {
+			model: asbhModel,
+			entries: asbhHeader(),
+			settings: { shellCommandPrefix: "shopt -s expand_aliases" },
+		},
+		bashScript: [{ output: "ok\n", exitCode: 0 }],
+		script: [{ op: "executeBash", command: "myalias" }],
+	}),
+	// A throwing script: the error propagates out of executeBash, the
+	// controller is cleaned up, and no bashExecution entry is recorded.
+	asbh("script-throws", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [{ output: "partial", throws: "kaboom" }],
+		script: [
+			{ op: "executeBash", command: "c" },
+			{ op: "isBashRunning" },
+			{ op: "hasPendingBash" },
+		],
+	}),
+	// Pending-flush ordering: while streaming, recordBashResult queues the
+	// message instead of appending; flushPending drains it in order.
+	asbh("pending-flush-ordering", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [{ output: "queued\n", exitCode: 0 }],
+		script: [
+			{ op: "setStreaming", value: true },
+			{ op: "executeBash", command: "c1" },
+			{ op: "hasPendingBash" },
+			{ op: "flushPending" },
+			{ op: "hasPendingBash" },
+		],
+	}),
+	// The _startRun checkpoint flushes queued bash messages before the
+	// agent turn appends its own messages.
+	asbh("pending-flush-on-prompt", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [{ output: "queued\n", exitCode: 0 }],
+		providerTurns: [{ events: [], result: asbhMsg() }],
+		script: [
+			{ op: "setStreaming", value: true },
+			{ op: "executeBash", command: "c1" },
+			{ op: "setStreaming", value: false },
+			{ op: "prompt", text: "go" },
+			{ op: "waitForIdle" },
+			{ op: "hasPendingBash" },
+		],
+	}),
+	// recordBashResult direct effects: message shape with exitCode omitted
+	// when absent and fullOutputPath included when present.
+	asbh("record-result-direct", {
+		nowMs: ASBH_NOW,
+		config: { model: asbhModel, entries: asbhHeader() },
+		bashScript: [],
+		script: [
+			{ op: "recordBashResult", command: "c1", result: { output: "o1", cancelled: true } },
+			{
+				op: "recordBashResult",
+				command: "c2",
+				result: { output: "o2", exitCode: 2, fullOutputPath: "/tmp/pi-bash-x.log" },
+			},
+			{ op: "hasPendingBash" },
+		],
+	}),
+);

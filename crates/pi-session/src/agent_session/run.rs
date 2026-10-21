@@ -43,13 +43,13 @@ impl AgentSession {
             Ok(messages) => messages,
             Err(error) => {
                 self.state.is_agent_run_active.store(false, Ordering::SeqCst);
-                // TODO(tranche 15): `_flushPendingBashMessages()`.
+                self.flush_pending_bash_messages();
                 self.flush_pending_custom_messages();
                 self.resolve_idle_wait_if_idle();
                 return Err(error);
             }
         };
-        // TODO(tranche 15): `_flushPendingBashMessages()`.
+        self.flush_pending_bash_messages();
         self.flush_pending_custom_messages();
         if let Some(callback) = &on_started {
             callback();
@@ -68,7 +68,7 @@ impl AgentSession {
         }
         self.state.failed_response = None;
         self.state.tools.run_system_prompt_options = None;
-        // TODO(tranche 15): `_flushPendingBashMessages()`.
+        self.flush_pending_bash_messages();
         self.flush_pending_custom_messages();
         self.emit_agent_settled().await?;
         result
@@ -637,8 +637,8 @@ impl AgentSession {
     }
 
     /// TS `abort()` — abort the current operation and wait for idle.
-    /// Retry/compaction/branch-summary/bash aborts arrive with their
-    /// tranches (TODOs below).
+    /// Branch-summary aborts arrive with their tranche; TS `abort()` never
+    /// aborts bash controllers (only `dispose()` does).
     pub async fn abort(&mut self) {
         if self.state.is_agent_run_active.load(Ordering::SeqCst) {
             self.state.agent_run_abort_requested.store(true, Ordering::SeqCst);
@@ -646,7 +646,7 @@ impl AgentSession {
         self.abort_retry();
         self.abort_compaction();
         // TODO(tranche 16): this.abortBranchSummary();
-        // TODO(tranche 15): this.abortBash();
+        // TS abort() does not abort bash controllers (only dispose() does).
         if self.state.is_before_settle.load(Ordering::SeqCst) {
             self.state.abort_during_before_settle.store(true, Ordering::SeqCst);
         }

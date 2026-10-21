@@ -37,6 +37,12 @@ pub const MAX_TIMEOUT_MS: f64 = 2_147_483_647.0;
 pub struct AbortSignal(Arc<AtomicBool>);
 
 impl AbortSignal {
+    /// Whether two handles refer to the same signal (controller-set
+    /// membership checks).
+    pub fn ptr_eq(&self, other: &AbortSignal) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

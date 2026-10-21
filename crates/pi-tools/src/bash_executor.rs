@@ -20,7 +20,7 @@ use pi_core::text_decoder::StreamingDecoder;
 use pi_core::truncate::{truncate_tail, TruncationOptions, TruncationResult, DEFAULT_MAX_BYTES};
 
 use crate::output_files::create_output_file_stream;
-use crate::shell::{AbortSignal, BashOperations, ShellExecError, ShellExecOptions, StreamKind};
+use crate::shell::{AbortSignal, BashOperations, ExecOutcome, ShellExecError, ShellExecOptions, StreamKind};
 
 /// Rolling-buffer limit: `DEFAULT_MAX_BYTES * 2` (in UTF-16 code units,
 /// matching JS `.length`).
@@ -29,7 +29,7 @@ const MAX_OUTPUT_BYTES: u64 = DEFAULT_MAX_BYTES * 2;
 #[derive(Default)]
 pub struct BashExecutorOptions<'a> {
     /// Callback for streaming output chunks (already sanitized).
-    pub on_chunk: Option<&'a mut dyn FnMut(&str)>,
+    pub on_chunk: Option<&'a mut (dyn FnMut(&str) + Send)>,
     pub signal: Option<&'a AbortSignal>,
 }
 
@@ -52,7 +52,7 @@ pub struct BashResult {
     pub full_output_path: Option<String>,
 }
 
-struct ExecutorState {
+pub struct ExecutorState {
     output_chunks: VecDeque<String>,
     /// Total UTF-16 length of `output_chunks` (JS `.length` semantics).
     output_bytes: u64,
@@ -66,7 +66,7 @@ struct ExecutorState {
 }
 
 impl ExecutorState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         ExecutorState {
             output_chunks: VecDeque::new(),
             output_bytes: 0,
@@ -92,9 +92,9 @@ impl ExecutorState {
         Ok(())
     }
 
-    fn on_data(
+    pub fn on_data(
         &mut self,
-        on_chunk: &mut Option<&mut dyn FnMut(&str)>,
+        on_chunk: &mut Option<&mut (dyn FnMut(&str) + Send)>,
         data: &[u8],
     ) -> Result<(), String> {
         self.total_bytes += data.len() as u64;
@@ -108,9 +108,9 @@ impl ExecutorState {
     /// `appendText`: sanitize (strip ANSI, remove binary garbage, drop \r),
     /// spill to the temp file past the threshold, keep the rolling buffer,
     /// and stream to the callback.
-    fn append_text(
+    pub fn append_text(
         &mut self,
-        on_chunk: &mut Option<&mut dyn FnMut(&str)>,
+        on_chunk: &mut Option<&mut (dyn FnMut(&str) + Send)>,
         raw_text: &str,
     ) -> Result<(), String> {
         let text = sanitize_binary_output(&strip_ansi(raw_text)).replace('\r', "");
@@ -158,7 +158,6 @@ pub fn execute_bash_with_operations(
     let signal = options.as_ref().and_then(|o| o.signal);
     let mut state = ExecutorState::new();
 
-    let mut exit_code: Option<i32> = None;
     let exec_result = {
         let mut on_data = |_kind: StreamKind, data: &[u8]| {
             // IO errors on the spill file surface as Other below.
@@ -167,6 +166,19 @@ pub fn execute_bash_with_operations(
         let opts = ShellExecOptions { on_data: Some(&mut on_data), signal, timeout: None, env: None };
         operations.exec(command, cwd, opts)
     };
+    finalize_bash_execution(state, on_chunk, exec_result, signal)
+}
+
+/// The post-exec tail shared by the sync executor entry and the async
+/// session seam (`flushOutput`, spill/truncation, the cancelled exit-code
+/// drop).
+pub fn finalize_bash_execution(
+    mut state: ExecutorState,
+    mut on_chunk: Option<&mut (dyn FnMut(&str) + Send)>,
+    exec_result: Result<ExecOutcome, ShellExecError>,
+    signal: Option<&AbortSignal>,
+) -> Result<BashResult, ShellExecError> {
+    let mut exit_code: Option<i32> = None;
     match exec_result {
         Ok(outcome) => exit_code = outcome.exit_code,
         Err(err) => {

@@ -7,6 +7,7 @@
 //! (marked `TODO(tranche N)`).
 
 pub mod compaction;
+pub mod bash;
 pub mod events;
 pub mod model;
 pub mod event_handler;
@@ -63,6 +64,14 @@ pub trait SessionSettingsStore: Send + Sync {
     }
     /// TS `settingsManager.getDefaultThinkingLevel()`.
     fn get_default_thinking_level(&self) -> Option<String> {
+        None
+    }
+    /// TS `settingsManager.getShellCommandPrefix()` (bash slice).
+    fn shell_command_prefix(&self) -> Option<String> {
+        None
+    }
+    /// TS `settingsManager.getShellPath()` (bash slice).
+    fn shell_path(&self) -> Option<String> {
         None
     }
 }
@@ -259,8 +268,10 @@ pub type SessionEventListener = Box<dyn FnMut(&Value) + Send + Sync>;
 
 /// The mutable half of `AgentSession` (TS private fields).
 struct SessionState {
-    /// TS `_eventListeners`.
-    listeners: Vec<(usize, SessionEventListener)>,
+    /// TS `_eventListeners` (shared — the bash slice's `onChunk` callback
+    /// emits `bash_execution_update` from a `'static` executor future via
+    /// [`AgentSession::emit_tap`]).
+    listeners: Arc<Mutex<Vec<(usize, SessionEventListener)>>>,
     /// TS `_isAgentRunActive` (shared — see [`AgentSession::shared`]).
     is_agent_run_active: Arc<AtomicBool>,
     /// TS `_agentRunAbortRequested` (shared).
@@ -274,6 +285,12 @@ struct SessionState {
     /// TS `_pendingCustomMessages` — context-only custom messages queued
     /// during a run, flushed once the current turn's tool results are in.
     pending_custom_messages: Vec<Value>,
+    /// TS `_bashAbortControllers` (shared — `abortBash()` is `&self` so
+    /// scripted operations and the abort taps can fire it mid-execution).
+    bash_signals: Arc<Mutex<Vec<pi_tools::shell::AbortSignal>>>,
+    /// TS `_pendingBashMessages` — bash results queued while streaming,
+    /// flushed at the run checkpoints ([`bash`] module).
+    pending_bash_messages: Vec<Value>,
     /// TS `_overflowRecoveryAttempted`.
     overflow_recovery_attempted: bool,
     /// TS `_retryAttempt`.
@@ -415,7 +432,7 @@ impl AgentSession {
             doc_paths: system_prompt::DocPaths::default(),
             agent_event_queue: Arc::clone(&agent_event_queue),
             state: SessionState {
-                listeners: Vec::new(),
+                listeners: Arc::new(Mutex::new(Vec::new())),
                 is_agent_run_active: Arc::new(AtomicBool::new(false)),
                 agent_run_abort_requested: Arc::new(AtomicBool::new(false)),
                 is_before_settle: Arc::new(AtomicBool::new(false)),
@@ -424,6 +441,8 @@ impl AgentSession {
                 follow_up_messages: Vec::new(),
                 pending_next_turn_messages: Vec::new(),
                 pending_custom_messages: Vec::new(),
+                bash_signals: Arc::new(Mutex::new(Vec::new())),
+                pending_bash_messages: Vec::new(),
                 overflow_recovery_attempted: false,
                 retry_attempt: 0.0,
                 turn_index: 0.0,
@@ -534,20 +553,32 @@ impl AgentSession {
     pub fn subscribe(&mut self, listener: SessionEventListener) -> usize {
         let id = self.next_listener_id;
         self.next_listener_id += 1;
-        self.state.listeners.push((id, listener));
+        self.state.listeners.lock().expect("listeners").push((id, listener));
         id
     }
 
     /// The TS returned unsubscribe function.
     pub fn unsubscribe(&mut self, id: usize) {
-        self.state.listeners.retain(|(i, _)| *i != id);
+        self.state.listeners.lock().expect("listeners").retain(|(i, _)| *i != id);
     }
 
     /// TS `_emit` — notify every listener in subscription order.
     fn emit(&mut self, event: Value) {
-        for (_, listener) in &mut self.state.listeners {
+        for (_, listener) in self.state.listeners.lock().expect("listeners").iter_mut() {
             listener(&event);
         }
+    }
+
+    /// Harness/`'static`-future seam for `_emit`: a shareable closure that
+    /// notifies every listener (the bash slice's `onChunk` callback emits
+    /// `bash_execution_update` from the executor future).
+    pub fn emit_tap(&self) -> Arc<dyn Fn(Value) + Send + Sync> {
+        let listeners = Arc::clone(&self.state.listeners);
+        Arc::new(move |event: Value| {
+            for (_, listener) in listeners.lock().expect("listeners").iter_mut() {
+                listener(&event);
+            }
+        })
     }
 
     /// TS `_emitQueueUpdate`.
@@ -721,13 +752,13 @@ impl AgentSession {
         self.abort_retry();
         self.abort_compaction();
         // TODO(tranche 16): this.abortBranchSummary();
-        // TODO(tranche 15): this.abortBash();
+        self.abort_bash();
         self.agent.abort();
         self.extension_host.invalidate(
             "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
         );
         // TODO(tranche 11): this._disconnectFromAgent();
-        self.state.listeners.clear();
+        self.state.listeners.lock().expect("listeners").clear();
         // TODO(tranche 13): cache warmer cleanup.
         // TODO(tranche 18): cleanupSessionResources(this.sessionId).
     }

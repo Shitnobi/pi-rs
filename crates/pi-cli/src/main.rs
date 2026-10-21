@@ -29,6 +29,7 @@ mod session_run_harness;
 mod session_retry_harness;
 mod session_compaction_harness;
 mod session_model_harness;
+mod session_bash_harness;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -215,6 +216,9 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         }
         "agent-session-model" => {
             return session_model_harness::run_agent_session_model_harness(&input)
+        }
+        "agent-session-bash" => {
+            return session_bash_harness::run_agent_session_bash_harness(&input)
         }
         "agent-session-compaction" => {
             return session_compaction_harness::run_agent_session_compaction_harness(&input)

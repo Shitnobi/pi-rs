@@ -7204,6 +7204,423 @@ async function runModule(tool, args, cwd) {
 		}
 	}
 
+	if (tool === "agent-session-bash") {
+		// dist/core/agent-session.js — the bash slice (executeBash /
+		// recordBashResult / abortBash / isBashRunning /
+		// hasPendingBashMessages / _flushPendingBashMessages) over a real
+		// AgentSession with a scripted provider and scripted BashOperations
+		// (one bashScript entry per exec call; `delay` steps yield via
+		// setImmediate — the Rust mirror yields via tokio yield_now; both
+		// single-threaded FIFO; `abortAfter` steps fire session.abortBash()).
+		// Mirrors the Rust harness (crates/pi-cli/src/session_bash_harness.rs).
+		// setTimeout is patched for the duration of the script (fast-forward,
+		// unrecorded) so the auto-retry backoff never parks.
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		const { AgentSession } = require(path.join(distDir, "core", "agent-session.js"));
+		const { SessionManager } = require(path.join(distDir, "core", "session-manager.js"));
+		const { SettingsManager } = require(path.join(distDir, "core", "settings-manager.js"));
+		// Validation order mirrors the Rust entry exactly.
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		const config = args.config ?? {};
+		if (typeof config !== "object" || config === null || Array.isArray(config)) {
+			throw new Error("invalid config");
+		}
+		if (typeof config.systemPrompt !== "string") throw new Error("missing systemPrompt");
+		if (
+			!Array.isArray(config.entries) ||
+			config.entries.length === 0 ||
+			config.entries[0].type !== "session"
+		) {
+			throw new Error("missing entries");
+		}
+		if (config.model !== undefined && config.model !== null) {
+			if (typeof config.model !== "object" || Array.isArray(config.model)) {
+				throw new Error("invalid model");
+			}
+		}
+		const settingsIn = config.settings ?? {};
+		if (typeof settingsIn !== "object" || settingsIn === null || Array.isArray(settingsIn)) {
+			throw new Error("invalid settings");
+		}
+		let shellCommandPrefix;
+		if (settingsIn.shellCommandPrefix !== undefined && settingsIn.shellCommandPrefix !== null) {
+			if (typeof settingsIn.shellCommandPrefix !== "string") throw new Error("invalid settings");
+			shellCommandPrefix = settingsIn.shellCommandPrefix;
+		}
+		if (!Array.isArray(args.bashScript)) throw new Error("missing bashScript");
+		const bashScript = [];
+		for (const entry of args.bashScript) {
+			if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+				throw new Error("invalid bashScript");
+			}
+			const truthyDelay = (value) =>
+				value !== undefined && value !== null && value !== false;
+			let steps;
+			if (entry.chunks !== undefined) {
+				if (!Array.isArray(entry.chunks)) throw new Error("invalid bashScript");
+				steps = [];
+				for (const chunk of entry.chunks) {
+					if (typeof chunk !== "object" || chunk === null || Array.isArray(chunk)) {
+						throw new Error("invalid bashScript");
+					}
+					if (typeof chunk.data !== "string") throw new Error("invalid bashScript");
+					if (
+						chunk.delay !== undefined &&
+						typeof chunk.delay !== "boolean" &&
+						typeof chunk.delay !== "number"
+					) {
+						throw new Error("invalid bashScript");
+					}
+					if (chunk.abortAfter !== undefined && typeof chunk.abortAfter !== "boolean") {
+						throw new Error("invalid bashScript");
+					}
+					steps.push({
+						data: chunk.data,
+						delay: truthyDelay(chunk.delay),
+						abortAfter: chunk.abortAfter === true,
+					});
+				}
+			} else {
+				if (entry.output !== undefined && typeof entry.output !== "string") {
+					throw new Error("invalid bashScript");
+				}
+				steps = [
+					{
+						data: entry.output ?? "",
+						delay: truthyDelay(entry.delay),
+						abortAfter: entry.abortAfter === true,
+					},
+				];
+			}
+			if (
+				entry.delay !== undefined &&
+				typeof entry.delay !== "boolean" &&
+				typeof entry.delay !== "number"
+			) {
+				throw new Error("invalid bashScript");
+			}
+			if (entry.exitCode !== undefined && entry.exitCode !== null) {
+				if (typeof entry.exitCode !== "number") throw new Error("invalid bashScript");
+			}
+			if (entry.throws !== undefined && typeof entry.throws !== "string") {
+				throw new Error("invalid bashScript");
+			}
+			if (entry.abortAfter !== undefined && typeof entry.abortAfter !== "boolean") {
+				throw new Error("invalid bashScript");
+			}
+			bashScript.push({ steps, exitCode: entry.exitCode, throws: entry.throws });
+		}
+		let providerTurns = [];
+		if (args.providerTurns !== undefined && args.providerTurns !== null) {
+			if (!Array.isArray(args.providerTurns)) throw new Error("invalid providerTurns");
+			providerTurns = args.providerTurns;
+		}
+		if (!Array.isArray(args.script)) throw new Error("missing script");
+
+		const realDateNow = Date.now;
+		Date.now = () => args.nowMs;
+		const RealDate = Date;
+		class PinnedDate extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(args.nowMs);
+				else super(...ctorArgs);
+			}
+		}
+		globalThis.Date = PinnedDate;
+		const realSetTimeout = globalThis.setTimeout;
+		globalThis.setTimeout = (fn, _ms, ...rest) => {
+			fn(...rest);
+			return { __piParityDummyTimeout: true };
+		};
+		let uuidI = 0;
+		const nextUuid = () => "uid" + String(++uuidI).padStart(5, "0");
+		const yieldOnce = () => new Promise((resolve) => setImmediate(resolve));
+		try {
+			const sessionManager = SessionManager.inMemory("/proj", undefined, config.entries);
+			const projected = sessionManager.buildSessionProjection().messages;
+			const providerCalls = [];
+			let providerIdx = 0;
+			const fakeStreamFn = (model, context, _options) => {
+				const turn = providerTurns[providerIdx];
+				if (turn === undefined) throw new Error("provider script exhausted");
+				providerIdx++;
+				providerCalls.push({
+					model: JSON.parse(JSON.stringify(model)),
+					messages: JSON.parse(JSON.stringify(context.messages ?? [])),
+				});
+				return {
+					async *[Symbol.asyncIterator]() {
+						for (const event of turn.events ?? []) yield event;
+					},
+					result() {
+						return Promise.resolve(turn.result);
+					},
+				};
+			};
+			const agent = new Agent({
+				streamFn: fakeStreamFn,
+				initialState: { messages: projected },
+			});
+			agent.state.model = config.model ?? undefined;
+			const settingsManager = SettingsManager.inMemory({ shellCommandPrefix });
+			const fakeLoader = {
+				getSkills: () => ({ skills: [], diagnostics: [] }),
+				getPrompts: () => ({ prompts: [], diagnostics: [] }),
+				getAgentsFiles: () => ({ agentsFiles: [] }),
+				getSystemPrompt: () => config.systemPrompt,
+				getAppendSystemPrompt: () => [],
+				getExtensions: () => ({
+					extensions: [],
+					runtime: {
+						mcpServers: { setChangeListener: () => {} },
+						pendingProviderRegistrations: [],
+						pendingNativeProviderRegistrations: [],
+						pendingVirtualModelRegistrations: [],
+					},
+					diagnostics: [],
+				}),
+				getThemes: () => ({ themes: [], diagnostics: [] }),
+			};
+			const modelRuntime = {
+				getModel: () => undefined,
+				getPhysicalModel: () => undefined,
+				hasConfiguredAuth: () => true,
+				checkAuth: async () => ({}),
+				isUsingOAuth: () => false,
+			};
+			const session = new AgentSession({
+				agent,
+				sessionManager,
+				settingsManager,
+				cwd: "/proj",
+				resourceLoader: fakeLoader,
+				modelRuntime,
+				usesDefaultTools: false,
+				baseToolsOverride: {},
+			});
+			const snapEvent = (event) => JSON.parse(JSON.stringify(event));
+			const extensionEvents = [];
+			const extensionErrors = [];
+			const fakeRunner = {
+				hasHandlers: () => false,
+				emit: async (event) => {
+					extensionEvents.push(snapEvent(event));
+				},
+				emitMessageEnd: async (event) => {
+					extensionEvents.push(snapEvent(event));
+					return undefined;
+				},
+				emitError: (error) => {
+					extensionErrors.push(error);
+				},
+				invalidate: () => {},
+				getAllRegisteredTools: () => [],
+				emitBeforeAgentStart: async (_trigger, options) => ({
+					messages: [],
+					systemPromptOptions: JSON.parse(JSON.stringify(options)),
+				}),
+			};
+			session._extensionRunner = fakeRunner;
+
+			const sessionEvents = [];
+			session.subscribe((event) => {
+				sessionEvents.push(snapEvent(event));
+			});
+			globalThis.__piParityUuidOverride = nextUuid;
+
+			const bashCalls = [];
+			let bashIdx = 0;
+			const scriptedOperations = {
+				exec: async (command, cwd, { onData }) => {
+					await yieldOnce();
+					const index = bashIdx++;
+					const entry = bashScript[index];
+					if (entry === undefined) throw new Error("bash script exhausted");
+					bashCalls.push({ command, cwd });
+					for (const step of entry.steps) {
+						if (step.delay) await yieldOnce();
+						onData(Buffer.from(step.data, "utf8"));
+						if (step.abortAfter) session.abortBash();
+					}
+					if (entry.throws !== undefined) throw new Error(entry.throws);
+					return { exitCode: entry.exitCode };
+				},
+			};
+
+			const bashOptionsOf = (op) => {
+				const options = {};
+				if (op.id !== undefined && op.id !== null) {
+					if (typeof op.id !== "string") throw new Error("invalid id");
+					options.id = op.id;
+				}
+				if (op.excludeFromContext !== undefined && op.excludeFromContext !== null) {
+					if (typeof op.excludeFromContext !== "boolean") {
+						throw new Error("invalid excludeFromContext");
+					}
+					options.excludeFromContext = op.excludeFromContext;
+				}
+				return options;
+			};
+			const pending = [];
+			const userChunks = [];
+			const results = [];
+			for (const op of args.script) {
+				try {
+					if (op === null || typeof op !== "object" || Array.isArray(op)) {
+						throw new Error("ops entries must be objects");
+					}
+					if (typeof op.op !== "string") throw new Error("missing op");
+					let v = null;
+					switch (op.op) {
+						case "executeBash":
+						case "bashStart": {
+							if (typeof op.command !== "string") throw new Error("missing command");
+							const options = bashOptionsOf(op);
+							options.operations = scriptedOperations;
+							const onChunk =
+								op.recordChunks === true ? (chunk) => userChunks.push(chunk) : undefined;
+							const promise = session.executeBash(op.command, onChunk, options);
+							if (op.op === "executeBash") {
+								v = await promise;
+							} else {
+								pending.push(promise);
+							}
+							break;
+						}
+						case "awaitBash": {
+							if (pending.length === 0) throw new Error("no pending bash");
+							v = await pending.shift();
+							break;
+						}
+						case "awaitAllBash": {
+							if (pending.length === 0) throw new Error("no pending bash");
+							const promises = pending.splice(0);
+							const settled = await Promise.allSettled(promises);
+							v = settled.map((outcome) =>
+								outcome.status === "fulfilled"
+									? { status: "fulfilled", value: outcome.value }
+									: {
+											status: "rejected",
+											reason:
+												outcome.reason && outcome.reason.message !== undefined
+													? String(outcome.reason.message)
+													: String(outcome.reason),
+										},
+							);
+							break;
+						}
+						case "abortBash":
+							session.abortBash();
+							break;
+						case "isBashRunning":
+							v = session.isBashRunning;
+							break;
+						case "hasPendingBash":
+							v = session.hasPendingBashMessages;
+							break;
+						case "flushPending":
+							session._flushPendingBashMessages();
+							break;
+						case "setStreaming": {
+							if (typeof op.value !== "boolean") throw new Error("missing value");
+							session._isAgentRunActive = op.value;
+							break;
+						}
+						case "recordBashResult": {
+							if (typeof op.command !== "string") throw new Error("missing command");
+							if (op.result === undefined) throw new Error("missing result");
+							const resultIn = op.result;
+							if (typeof resultIn !== "object" || resultIn === null || Array.isArray(resultIn)) {
+								throw new Error("invalid result");
+							}
+							if (typeof resultIn.output !== "string") throw new Error("invalid result");
+							if (
+								resultIn.exitCode !== undefined &&
+								resultIn.exitCode !== null &&
+								typeof resultIn.exitCode !== "number"
+							) {
+								throw new Error("invalid result");
+							}
+							if (
+								resultIn.cancelled !== undefined &&
+								resultIn.cancelled !== null &&
+								typeof resultIn.cancelled !== "boolean"
+							) {
+								throw new Error("invalid result");
+							}
+							if (
+								resultIn.truncated !== undefined &&
+								resultIn.truncated !== null &&
+								typeof resultIn.truncated !== "boolean"
+							) {
+								throw new Error("invalid result");
+							}
+							if (
+								resultIn.fullOutputPath !== undefined &&
+								resultIn.fullOutputPath !== null &&
+								typeof resultIn.fullOutputPath !== "string"
+							) {
+								throw new Error("invalid result");
+							}
+							let excludeFromContext;
+							if (op.excludeFromContext !== undefined && op.excludeFromContext !== null) {
+								if (typeof op.excludeFromContext !== "boolean") {
+									throw new Error("invalid excludeFromContext");
+								}
+								excludeFromContext = op.excludeFromContext;
+							}
+							session.recordBashResult(
+								op.command,
+								{
+									output: resultIn.output,
+									exitCode: resultIn.exitCode,
+									cancelled: resultIn.cancelled ?? false,
+									truncated: resultIn.truncated ?? false,
+									fullOutputPath: resultIn.fullOutputPath,
+								},
+								excludeFromContext === undefined ? undefined : { excludeFromContext },
+							);
+							break;
+						}
+						case "prompt": {
+							if (typeof op.text !== "string") throw new Error("missing text");
+							await session.prompt(op.text);
+							break;
+						}
+						case "waitForIdle": {
+							await session.waitForIdle();
+							break;
+						}
+						default:
+							throw new Error("unknown agent-session-bash op: " + op.op);
+					}
+					results.push(v === undefined ? null : v);
+				} catch (e) {
+					results.push({
+						thrown: e && e.message !== undefined ? String(e.message) : String(e),
+					});
+				}
+			}
+			const entries = sessionManager.getEntries();
+			return {
+				result: {
+					results,
+					bashEvents: sessionEvents,
+					entries,
+					pendingFlushed: session.hasPendingBashMessages,
+					bashCalls,
+					isBashRunning: session.isBashRunning,
+					userChunks,
+				},
+			};
+		} finally {
+			globalThis.__piParityUuidOverride = null;
+			globalThis.setTimeout = realSetTimeout;
+			Date.now = realDateNow;
+			globalThis.Date = RealDate;
+		}
+	}
+
 	if (tool === "file-mutation-queue") {
 		// dist/core/tools/file-mutation-queue.js — withFileMutationQueue over
 		// scripted fns. Ops run concurrently; each fn marks itself started,
