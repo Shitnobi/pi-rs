@@ -1428,6 +1428,33 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       2573/2573): stats on empty/mixed sessions, token
       aggregation, context usage variants, JSONL export
       byte-exactness, validation.
-- [ ] Remaining agent-session tranches (phase3-agent-session.md):
-      Slices 18–19 (runtime, services+event-bus),
-      extending crates/pi-session.
+- [x] **Tranches 18–19 — session runtime + services+event-bus (phase 3
+      COMPLETE).** runtime.rs (~590 LOC): AgentSessionRuntime —
+      switch_session/new_session/fork (persisted + in-memory,
+      targetLeafId null path), import_from_jsonl (exclusive copy,
+      -N suffix collision loop), teardown_current ordering (abort
+      → session_shutdown emit → beforeSessionInvalidate →
+      dispose), apply/finish_session_replacement (rebind +
+      withSession over createReplacedSessionContext),
+      assertSessionCwdExists + byte-exact MissingSessionCwdError.
+      services.rs (~270 LOC): createAgentSessionServices — flag
+      validation (ordered flag map, boolean coercion, byte-exact
+      "Unknown option(s)" singular/plural), pending provider/
+      native/virtual registration drains with `Extension "<path>"
+      error:` diagnostics, refresh(allowNetwork:false); injected
+      ServicesModelRuntime/ServicesResourceLoader traits (real
+      constructions Phase 4+). event-bus harness already existed
+      (eb-* cases, green). Parity harnesses `agent-session-
+      runtime` (20 cases) + `agent-session-services` (9 cases);
+      suite **2602/2602**. Determinism: uuidv7 via zero-filled
+      crypto.getRandomValues patch (TS) replicated byte-exactly
+      in Rust v7 generator; both harnesses chdir to the case cwd.
+      Full-parity-only fixes (mr-diff compares results only;
+      run-parity also snapshots the case filesystem): services
+      harness now creates the pi-parity-assv fixture dir
+      symmetrically (TS created it, Rust didn't); runtime harness
+      validates all `files` values before any fixture write (TS
+      throws before fs mutation; Rust wrote initial.jsonl first).
+- [ ] Remaining roadmap after phase 3 (see docs/plans/): extensions
+      (extension-runner real port, Phase 4+), tools/* slices,
+      shared typebox-walker refactor.
