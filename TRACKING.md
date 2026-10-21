@@ -1374,7 +1374,28 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       threaded to resolveModel; state-entry events flow
       through the agent event queue — observably identical in
       all cases.
+- [x] **Tranche 15 — bash execution.** crates/pi-session/
+      agent_session/bash.rs: executeBash (per-call AbortController
+      set, shellCommandPrefix/shellPath settings resolution,
+      scripted BashOperations seam, bash_execution_update chunk
+      emission, recordBashResult), recordBashResult (bashExecution
+      message to context + session, pending queue while
+      streaming flushed at checkpoint), abortBash. pi-tools
+      bash_executor.rs/shell.rs gained the operations seam.
+      Parity harness `agent-session-bash` (17 cases; suite
+      2532/2532): scripted BashOperations on both sides; happy
+      path, excludeFromContext, concurrent ids, abortBash,
+      prefix, throws, pending-flush ordering, validation.
+      Harness determinism fix found in differential:
+      tokio::spawn takes the current-thread scheduler's LIFO
+      slot which scrambles concurrent-bash ordering vs TS's
+      setImmediate strict FIFO — the harness now polls
+      awaitAllBash futures manually in FIFO round-robin
+      (Waker::noop context, complete-on-mid-round mirroring
+      microtask-before-next-macrotask) with a custom
+      always-wake YieldStep replacing tokio::yield_now. Library
+      was correct; the divergence was purely harness scheduling.
 - [ ] Remaining agent-session tranches (phase3-agent-session.md):
-      AgentSession slices 15–17 (bash,
-      tree, stats) and 18–19 (runtime, services+event-bus),
+      AgentSession slices 16–17 (tree,
+      stats) and 18–19 (runtime, services+event-bus),
       extending crates/pi-session.
