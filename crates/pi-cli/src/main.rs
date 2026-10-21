@@ -175,6 +175,7 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "output-accumulator" => return run_output_accumulator_harness(&input),
         "messages" => return run_messages_harness(&input),
         "compaction-utils" => return run_compaction_utils_harness(&input),
+        "file-mutation-queue" => return run_file_mutation_queue_harness(&input, std::path::Path::new(cwd)),
         "compaction" => return run_compaction_harness(&input),
         "agent" => return agent_harness::run_agent_harness(&input, std::path::Path::new(cwd)),
         "agent-queue" => {
@@ -3397,4 +3398,178 @@ fn run_tui_screen_harness(input: &Value, alt: bool) -> Result<Value, String> {
         }
     }
     Ok(out)
+}
+
+/// Drive `pi-tools` `file_mutation_queue.rs` (mirrors
+/// dist/core/tools/file-mutation-queue.js). args:
+/// `{ setup?: {realFiles?: [{path, content?}], symlinks?: [{link, target}]},
+///    ops: [{path, script: ["label" | {awaitGate} | {throw}]}],
+///    release: [{gate, afterStarted: [op indices]}] }`
+/// → `{ log: [...], outcomes: [...] }`. Ops run concurrently; each op's fn
+/// marks itself started, then walks its script (label → log, awaitGate →
+/// spin until the release rule fires, throw → fn error). Release rules are
+/// processed in order once all their `afterStarted` ops have begun. Futures
+/// are polled round-robin with a no-op waker (all synchronization is via
+/// yield_now loops and the queue's async mutex), keeping the interleaving
+/// deterministic and matching the TS microtask order.
+fn run_file_mutation_queue_harness(input: &Value, cwd: &std::path::Path) -> Result<Value, String> {
+    use pi_tools::file_mutation_queue::FileMutationQueues;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+    use serde_json::json;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct NoopWake;
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    // setup: real files + symlinks, relative to the harness cwd
+    if let Some(setup) = input["setup"].as_object() {
+        for file in setup.get("realFiles").and_then(Value::as_array).unwrap_or(&Vec::new()) {
+            let rel = file["path"].as_str().ok_or("setup.realFiles[].path must be a string")?;
+            let target = cwd.join(rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let content = file["content"].as_str().unwrap_or("");
+            std::fs::write(&target, content).map_err(|e| e.to_string())?;
+        }
+        for link in setup.get("symlinks").and_then(Value::as_array).unwrap_or(&Vec::new()) {
+            let rel = link["link"].as_str().ok_or("setup.symlinks[].link must be a string")?;
+            let target_rel =
+                link["target"].as_str().ok_or("setup.symlinks[].target must be a string")?;
+            let link_path = cwd.join(rel);
+            let _ = std::fs::remove_file(&link_path);
+            std::os::unix::fs::symlink(target_rel, &link_path).map_err(|e| e.to_string())?;
+        }
+    }
+
+    let ops: Vec<Value> = input["ops"]
+        .as_array()
+        .cloned()
+        .ok_or("missing ops")?;
+
+    struct Shared {
+        log: Mutex<Vec<String>>,
+        started: Mutex<HashSet<usize>>,
+        gates: Mutex<HashMap<String, bool>>,
+        outcomes: Mutex<Vec<String>>,
+    }
+    let shared = Arc::new(Shared {
+        log: Mutex::new(Vec::new()),
+        started: Mutex::new(HashSet::new()),
+        gates: Mutex::new(
+            ops.iter()
+                .filter_map(|op| {
+                    op["script"].as_array().and_then(|steps| {
+                        steps.iter().find_map(|s| s["awaitGate"].as_str().map(str::to_string))
+                    })
+                })
+                .map(|gate| (gate, false))
+                .collect::<HashMap<String, bool>>(),
+        ),
+        outcomes: Mutex::new(vec!["pending".to_string(); ops.len()]),
+    });
+
+    let queues = Arc::new(FileMutationQueues::new());
+
+    // Each op future: claim its index, run with_queue, record outcome.
+    let make_op = |i: usize| {
+        let shared = Arc::clone(&shared);
+        let queues = Arc::clone(&queues);
+        let op = ops[i].clone();
+        let cwd = cwd.to_path_buf();
+        Box::pin(async move {
+            let path = op["path"].as_str().unwrap_or_default().to_string();
+            let script = op["script"].as_array().cloned().unwrap_or_default();
+            let outcome = queues
+                .with_queue(&path, &cwd, async {
+                    shared.started.lock().expect("started").insert(i);
+                    for step in &script {
+                        if let Some(label) = step.as_str() {
+                            shared.log.lock().expect("log").push(label.to_string());
+                        } else if let Some(gate) = step["awaitGate"].as_str() {
+                            loop {
+                                if shared
+                                    .gates
+                                    .lock()
+                                    .expect("gates")
+                                    .get(gate)
+                                    .copied()
+                                    .unwrap_or(false)
+                                {
+                                    break;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        } else if let Some(message) = step["throw"].as_str() {
+                            return Err(message.to_string());
+                        }
+                    }
+                    Ok(())
+                })
+                .await;
+            let text = match outcome {
+                Ok(Ok(())) => "ok".to_string(),
+                Ok(Err(message)) => format!("error:{}", message),
+                Err(key_error) => format!("keyError:{}", key_error),
+            };
+            shared.outcomes.lock().expect("outcomes")[i] = text;
+        }) as Pin<Box<dyn Future<Output = ()>>>
+    };
+
+    // Master future: apply release rules in order.
+    let master = {
+        let shared = Arc::clone(&shared);
+        let rules = input["release"].as_array().cloned().unwrap_or_default();
+        Box::pin(async move {
+            for rule in &rules {
+                let gate = rule["gate"].as_str().unwrap_or_default().to_string();
+                let need: Vec<usize> = rule["afterStarted"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_u64().map(|v| v as usize)).collect())
+                    .unwrap_or_default();
+                loop {
+                    let started = shared.started.lock().expect("started");
+                    if need.iter().all(|i| started.contains(i)) {
+                        break;
+                    }
+                    drop(started);
+                    tokio::task::yield_now().await;
+                }
+                shared.gates.lock().expect("gates").insert(gate, true);
+            }
+        }) as Pin<Box<dyn Future<Output = ()>>>
+    };
+
+    let mut futures: Vec<Pin<Box<dyn Future<Output = ()>>>> =
+        (0..ops.len()).map(make_op).collect();
+    futures.push(master);
+
+    let waker = Arc::new(NoopWake).into();
+    let mut cx = Context::from_waker(&waker);
+    let mut done = vec![false; futures.len()];
+    loop {
+        let mut all_done = true;
+        for (i, future) in futures.iter_mut().enumerate() {
+            if done[i] {
+                continue;
+            }
+            if future.as_mut().poll(&mut cx).is_pending() {
+                all_done = false;
+            } else {
+                done[i] = true;
+            }
+        }
+        if all_done {
+            break;
+        }
+    }
+
+    let outcomes = shared.outcomes.lock().expect("outcomes").clone();
+    let log = shared.log.lock().expect("log").clone();
+    Ok(json!({ "result": { "log": log, "outcomes": outcomes } }))
 }

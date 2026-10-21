@@ -1161,9 +1161,29 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       nested-tool-calls (28); compaction (44) and compaction-utils (18)
       entries now drive the pi-core modules. Tranche 7's runner is
       thereby already ported; only agent-loop integration remains.
-- [ ] Remaining agent-session tranches (phase3-agent-session.md): file
-      mutation queue (tranche 6), then AgentSession slices 8–17 (events,
-      tools, prompt, run, retry, compaction, model, bash, tree, stats)
-      and 18–19 (runtime, services+event-bus). The future AgentSession
-      crate (recreate pi-session or extend pi-agent) depends on
-      pi-core + pi-agent + pi-providers.
+- [x] **Tranche 6 — file mutation queue (src/core/tools/file-mutation-queue.ts)
+      ported to crates/pi-tools/src/file_mutation_queue.rs.** Keyed by
+      realpath of the target file (missing-path errors fall back to the
+      resolved path, like TS's realpath-miss branch). Rust uses a tokio
+      AsyncMutex per queue key in a process-global map instead of the
+      TS realpath-keyed promise chains; the TS registration queue is
+      unnecessary here because the key is computed synchronously before
+      the map lock (documented divergence). Map entries are removed when
+      the last holder releases (Arc ptr_eq check). Wiring the queue
+      into write/edit belongs to the tool-definition layer (tranche 9).
+      Parity harness `file-mutation-queue` (7 cases, suite total 2424)
+      with deterministic gate/release concurrency: ops run as futures
+      with awaitGate steps, release rules fire once their afterStarted
+      ops begin; TS spins gates with `setImmediate` macrotask yields
+      (a Promise.resolve microtask spin starves pending realpath I/O),
+      Rust round-robins NoopWake polling with per-future done flags
+      (re-polling completed async fns panics). Harness setup
+      (realFiles/symlinks) is idempotent on both sides (rm before
+      symlink) so stale scratch state can't produce EEXIST. Full parity
+      2424/2424.
+- [ ] Remaining agent-session tranches (phase3-agent-session.md):
+      AgentSession slices 8–17 (events, tools, prompt, run, retry,
+      compaction, model, bash, tree, stats) and 18–19 (runtime,
+      services+event-bus). The future AgentSession crate (recreate
+      pi-session or extend pi-agent) depends on pi-core + pi-agent +
+      pi-providers.

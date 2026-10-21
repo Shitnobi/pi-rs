@@ -4908,6 +4908,69 @@ async function runModule(tool, args, cwd) {
 		return { result: { events, stateMessages: agent.state.messages, results, snapshots } };
 	}
 
+	if (tool === "file-mutation-queue") {
+		// dist/core/tools/file-mutation-queue.js — withFileMutationQueue over
+		// scripted fns. Ops run concurrently; each fn marks itself started,
+		// then walks its script (label → log, awaitGate → spin on microtasks
+		// until the release rule fires, throw → fn rejection). Release rules
+		// are applied in order once all their afterStarted ops have begun.
+		// Mirrors the Rust harness entry (run_file_mutation_queue_harness).
+		const { withFileMutationQueue } = require(path.join(distDir, "core", "tools", "file-mutation-queue.js"));
+		const fs = require("fs");
+		const setup = args.setup ?? {};
+		for (const file of setup.realFiles ?? []) {
+			const target = path.resolve(cwd, file.path);
+			fs.mkdirSync(path.dirname(target), { recursive: true });
+			fs.writeFileSync(target, file.content ?? "");
+		}
+		for (const link of setup.symlinks ?? []) {
+			{
+				const target = path.resolve(cwd, link.link);
+				fs.rmSync(target, { force: true, recursive: true });
+				fs.symlinkSync(link.target, target);
+			}
+		}
+		if (!Array.isArray(args.ops)) throw new Error("missing ops");
+		const log = [];
+		const gates = {};
+		const startedResolvers = [];
+		const startedPromises = args.ops.map((_, i) => new Promise((r) => (startedResolvers[i] = r)));
+		const outcomes = new Array(args.ops.length).fill("pending");
+		const runOp = async (i) => {
+			const op = args.ops[i];
+			try {
+				await withFileMutationQueue(path.resolve(cwd, op.path), async () => {
+					startedResolvers[i]();
+					for (const step of op.script ?? []) {
+						if (typeof step === "string") {
+							log.push(step);
+						} else if (typeof step.awaitGate === "string") {
+							// setImmediate (not Promise.resolve): the spin must
+							// yield through the macrotask queue so pending
+							// realpath I/O in later registrations can complete;
+							// a microtask spin would starve the event loop and
+							// deadlock the release rule.
+							while (!gates[step.awaitGate]) await new Promise((r) => setImmediate(r));
+						} else if (typeof step.throw === "string") {
+							throw new Error(step.throw);
+						}
+					}
+				});
+				outcomes[i] = "ok";
+			} catch (e) {
+				outcomes[i] = "error:" + (e && e.message !== undefined ? e.message : String(e));
+			}
+		};
+		const master = (async () => {
+			for (const rule of args.release ?? []) {
+				await Promise.all((rule.afterStarted ?? []).map((i) => startedPromises[i]));
+				gates[rule.gate] = true;
+			}
+		})();
+		await Promise.all([...args.ops.map((_, i) => runOp(i)), master]);
+		return { result: { log, outcomes } };
+	}
+
 	return undefined;
 }
 

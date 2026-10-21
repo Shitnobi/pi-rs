@@ -18,6 +18,7 @@ pub mod output_files;
 pub mod shell;
 pub mod read;
 pub mod write;
+pub mod file_mutation_queue;
 
 use serde::Serialize;
 

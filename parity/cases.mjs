@@ -1662,6 +1662,98 @@ export const cases = [
 			settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 10 },
 		},
 	},
+	// ------------------------------------------------ file-mutation-queue
+	// Differential parity for withFileMutationQueue: per-file serialization,
+	// cross-file parallelism, symlink/realpath key sharing, missing-path
+	// fallback, and fn-error propagation with queue release. Ops run
+	// concurrently with scripted fns; gates make the interleaving
+	// deterministic on both sides.
+	{
+		name: "file-mutation-queue/same-file-serializes",
+		tool: "file-mutation-queue",
+		args: {
+			ops: [
+				{ path: "a.txt", script: ["a1", { awaitGate: "g" }, "a2"] },
+				{ path: "a.txt", script: ["b1"] },
+			],
+			release: [{ gate: "g", afterStarted: [0] }],
+		},
+	},
+	{
+		name: "file-mutation-queue/different-files-parallel",
+		tool: "file-mutation-queue",
+		args: {
+			ops: [
+				{ path: "a.txt", script: ["a1", { awaitGate: "g" }, "a2"] },
+				{ path: "b.txt", script: ["b1"] },
+			],
+			release: [{ gate: "g", afterStarted: [0, 1] }],
+		},
+	},
+	{
+		name: "file-mutation-queue/symlink-shares-queue",
+		tool: "file-mutation-queue",
+		args: {
+			setup: {
+				realFiles: [{ path: "f.txt", content: "x" }],
+				symlinks: [{ link: "link.txt", target: "f.txt" }],
+			},
+			ops: [
+				{ path: "f.txt", script: ["a1", { awaitGate: "g" }, "a2"] },
+				{ path: "link.txt", script: ["b1"] },
+			],
+			release: [{ gate: "g", afterStarted: [0] }],
+		},
+	},
+	{
+		name: "file-mutation-queue/missing-path-fallback",
+		tool: "file-mutation-queue",
+		args: {
+			ops: [
+				{ path: "missing/x.txt", script: ["a1", { awaitGate: "g" }, "a2"] },
+				{ path: "missing/x.txt", script: ["b1"] },
+			],
+			release: [{ gate: "g", afterStarted: [0] }],
+		},
+	},
+	{
+		name: "file-mutation-queue/fn-error-releases-queue",
+		tool: "file-mutation-queue",
+		args: {
+			ops: [
+				{ path: "a.txt", script: ["a1", { throw: "boom" }] },
+				{ path: "a.txt", script: ["b1"] },
+			],
+		},
+	},
+	{
+		name: "file-mutation-queue/three-ops-fifo",
+		tool: "file-mutation-queue",
+		args: {
+			ops: [
+				{ path: "a.txt", script: ["a1", { awaitGate: "g" }, "a2"] },
+				{ path: "a.txt", script: ["b1"] },
+				{ path: "a.txt", script: ["c1"] },
+			],
+			release: [{ gate: "g", afterStarted: [0] }],
+		},
+	},
+	{
+		name: "file-mutation-queue/two-gates",
+		tool: "file-mutation-queue",
+		args: {
+			ops: [
+				{ path: "a.txt", script: ["a1", { awaitGate: "g1" }, "a2", { awaitGate: "g2" }, "a3"] },
+				{ path: "b.txt", script: ["b1", { awaitGate: "g2" }, "b2"] },
+			],
+			release: [
+				{ gate: "g1", afterStarted: [0, 1] },
+				{ gate: "g2", afterStarted: [0, 1] },
+			],
+		},
+	},
+
+
 	// ------------------------------------------------------------- tui-utils
 	// Differential parity for the pure width-engine functions of the TUI
 	// package (layer 1 of the TUI parity plan; see docs/TUI_PORT_PLAN.md).

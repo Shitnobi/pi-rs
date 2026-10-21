@@ -10,3 +10,4 @@ pi-photon = { path = "../pi-photon" }
 pi-core = { path = "../pi-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { version = "1", features = ["sync"] }
