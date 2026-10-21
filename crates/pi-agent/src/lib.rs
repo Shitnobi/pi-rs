@@ -36,7 +36,7 @@ pub use provider::{ScriptedProvider, ScriptedTurn, StreamFn, StreamOutput};
 pub use queue::PendingMessageQueue;
 pub use r#loop::{
     AgentEventSink, AgentLoopTurnUpdate, AgentRequestUpdate, CompletedTurn, ConvertToLlm,
-    FnSink, LoopConfig, LoopStreamFn, TransformContext,
+    FnSink, LoopConfig, LoopStreamFn, PrepareRequestHook, TransformContext,
 };
 pub use stream_assistant::stream_assistant_response;
 pub use types::{

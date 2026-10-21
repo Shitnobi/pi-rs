@@ -188,6 +188,11 @@ pub enum AgentEvent {
         is_error: bool,
         duration_ms: Option<f64>,
     },
+    /// A session-emitted event forwarded through the agent event queue
+    /// (tranche 14: the virtual-model projection's `entry_appended`).
+    /// `to_value` returns the wrapped event unchanged; the agent's own
+    /// state reduction ignores it.
+    SessionEvent(Value),
 }
 
 impl AgentEvent {
@@ -267,6 +272,7 @@ impl AgentEvent {
                 }
                 map
             }
+            AgentEvent::SessionEvent(event) => return event.clone(),
         };
         Value::Object(map)
     }

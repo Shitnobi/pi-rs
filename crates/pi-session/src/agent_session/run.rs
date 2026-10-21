@@ -77,7 +77,9 @@ impl AgentSession {
     /// The `_startRun` try body: run the agent, then re-dispatch undelivered
     /// queue entries (`agent.continue()` while messages remain queued).
     pub(super) async fn drive_run(&mut self, messages: Vec<Value>) -> Result<(), String> {
-        let outcome = async {
+        let outcome = {
+            let mut bridge_rx = self.take_bridge_rx();
+            let result = async {
             // TS installs `agent.transformContext` at construction and reads
             // the forced prompt / hidden declarations live at request time;
             // the Rust agent takes the projection as a per-run hook.
@@ -90,18 +92,20 @@ impl AgentSession {
                 self.agent.abort_next_run();
             }
             self.state.turn_end_boundary_continue = false;
-            self.agent.prompt(messages)?.await?;
+            let prompt_run = self.agent.prompt(messages)?;
+            run_with_bridge(self, prompt_run, &mut bridge_rx).await?;
             self.pump_agent_events().await;
-            self.resume_turn_end_continuation().await;
+            self.resume_turn_end_continuation_with_bridge(&mut bridge_rx).await;
             while !self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
                 if self.handle_post_agent_run().await? {
                     if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
                         break;
                     }
                     self.state.turn_end_boundary_continue = false;
-                    self.agent.continue_run()?.await?;
+                    let run = self.agent.continue_run()?;
+                    run_with_bridge(self, run, &mut bridge_rx).await?;
                     self.pump_agent_events().await;
-                    self.resume_turn_end_continuation().await;
+                    self.resume_turn_end_continuation_with_bridge(&mut bridge_rx).await;
                     continue;
                 }
                 let boundary_continue = self.run_before_settle_boundary().await;
@@ -114,28 +118,40 @@ impl AgentSession {
                     break;
                 }
                 self.state.turn_end_boundary_continue = false;
-                self.agent.continue_run()?.await?;
+                let run = self.agent.continue_run()?;
+                run_with_bridge(self, run, &mut bridge_rx).await?;
                 self.pump_agent_events().await;
-                self.resume_turn_end_continuation().await;
+                self.resume_turn_end_continuation_with_bridge(&mut bridge_rx).await;
             }
             Ok(())
-        }
-        .await;
+            }
+            .await;
+            self.restore_bridge_rx(bridge_rx);
+            result
+        };
         self.pump_agent_events().await;
         outcome
     }
 
-    /// TS's in-loop turn_end continuation: a `finishTurn` boundary
-    /// `continue` decision restarts the agent loop within the same run
-    /// (the Rust session dispatches the boundary at event-pump time, so it
-    /// re-enters with a resume run that emits `turn_start` but no
-    /// `agent_start`).
-    async fn resume_turn_end_continuation(&mut self) {
+    /// Take the projection-bridge receiver for the duration of a run (the
+    /// hook's sender is installed once at construction and never closes).
+    fn take_bridge_rx(&mut self) -> Option<tokio::sync::mpsc::UnboundedReceiver<super::model::ProjectionCall>> {
+        self.bridge_rx.lock().expect("bridge receiver").take()
+    }
+
+    fn restore_bridge_rx(&mut self, rx: Option<tokio::sync::mpsc::UnboundedReceiver<super::model::ProjectionCall>>) {
+        *self.bridge_rx.lock().expect("bridge receiver") = rx;
+    }
+
+    /// `run_with_bridge` for the resume runs of turn_end continuations.
+    /// The receiver is passed through (it is not `Clone`), so the session
+    /// keeps servicing forwarded hook calls across the whole drive loop.
+    async fn resume_turn_end_continuation_with_bridge(
+        &mut self,
+        bridge_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<super::model::ProjectionCall>>,
+    ) {
         while self.state.turn_end_boundary_continue {
             self.state.turn_end_boundary_continue = false;
-            // TS aborts the active run's controller from the boundary; the
-            // abort survives into the continued turn (stream errors become
-            // stopReason "aborted").
             if self.state.agent_run_abort_requested.load(Ordering::SeqCst) {
                 self.agent.abort_next_run();
             }
@@ -143,7 +159,7 @@ impl AgentSession {
                 Ok(run) => run,
                 Err(_) => break,
             };
-            if run.await.is_err() {
+            if run_with_bridge(self, run, bridge_rx).await.is_err() {
                 break;
             }
             self.pump_agent_events().await;
@@ -636,6 +652,36 @@ impl AgentSession {
         }
         self.agent.abort();
         self.wait_for_idle().await;
+    }
+}
+
+/// Await `run` while servicing forwarded request-hook calls (the run
+/// future parks inside the hook while each call is served — see the
+/// `model` module docs).
+async fn run_with_bridge(
+    session: &mut AgentSession,
+    mut run: pi_agent::types::BoxFuture<'static, Result<(), String>>,
+    receiver: &mut Option<tokio::sync::mpsc::UnboundedReceiver<super::model::ProjectionCall>>,
+) -> Result<(), String> {
+    loop {
+        let received = async {
+            match receiver.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            outcome = &mut run => return outcome,
+            received = received => {
+                match received {
+                    None => *receiver = None,
+                    Some((request, reply)) => {
+                        let response = session.service_projection(request).await;
+                        let _ = reply.send(response);
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -28,6 +28,7 @@ mod session_prompt_harness;
 mod session_run_harness;
 mod session_retry_harness;
 mod session_compaction_harness;
+mod session_model_harness;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -211,6 +212,9 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         }
         "agent-session-retry" => {
             return session_retry_harness::run_agent_session_retry_harness(&input)
+        }
+        "agent-session-model" => {
+            return session_model_harness::run_agent_session_model_harness(&input)
         }
         "agent-session-compaction" => {
             return session_compaction_harness::run_agent_session_compaction_harness(&input)
@@ -3441,7 +3445,7 @@ fn run_file_mutation_queue_harness(input: &Value, cwd: &std::path::Path) -> Resu
     use serde_json::json;
     use std::future::Future;
     use std::pin::Pin;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Wake};
 
     struct NoopWake;
     impl Wake for NoopWake {

@@ -33,7 +33,7 @@ use crate::host::{AbortHandle, Clock};
 use crate::r#loop::{
     run_agent_loop, run_agent_loop_continue, run_agent_loop_resume, tool_declarations,
     AgentEventSink, LoopConfig, TransformContext,
-    LoopStreamFn, MessagePollHook,
+    LoopStreamFn, MessagePollHook, PrepareRequestHook,
 };
 use crate::types::{AgentEvent, AgentTool, BoxFuture, QueueMode, ToolExecutionMode};
 
@@ -159,6 +159,8 @@ struct AgentInner {
     /// TS `agent.transformContext` — installed per run by the session
     /// (forced-prompt projection).
     context_transform: Mutex<Option<TransformContext>>,
+    /// TS `agent.prepareRequest` (installed once, by the session).
+    prepare_request: Mutex<Option<Arc<PrepareRequestHook>>>,
 }
 
 /// Stateful wrapper around the low-level agent loop (TS `class Agent`).
@@ -234,6 +236,7 @@ impl Agent {
                 next_listener_id: AtomicUsize::new(0),
                 pending_abort: AtomicBool::new(false),
                 context_transform: Mutex::new(None),
+                prepare_request: Mutex::new(None),
             }),
         }
     }
@@ -424,6 +427,26 @@ impl Agent {
     /// forced-prompt projection per run.
     pub fn set_context_transform(&self, transform: Option<TransformContext>) {
         *self.inner.context_transform.lock().expect("context transform") = transform;
+    }
+
+    /// TS `agent.state.model = model`.
+    pub fn set_model(&self, model: Value) {
+        self.inner.state.lock().expect("agent state").model = model;
+    }
+
+    /// TS `agent.state.thinkingLevel = level`.
+    pub fn set_thinking_level(&self, level: &str) {
+        self.inner.state.lock().expect("agent state").thinking_level = level.to_string();
+    }
+
+    /// TS `agent.prepareRequest = hook` (public field assignment).
+    pub fn set_prepare_request(&self, hook: Option<Arc<PrepareRequestHook>>) {
+        *self.inner.prepare_request.lock().expect("prepare request") = hook;
+    }
+
+    /// TS `agent.prepareRequest` (the current hook, if any).
+    pub fn prepare_request_hook(&self) -> Option<Arc<PrepareRequestHook>> {
+        self.inner.prepare_request.lock().expect("prepare request").clone()
     }
 
     /// TS `waitForIdle()` — resolves after `agent_end` listeners settle
@@ -625,6 +648,7 @@ impl Agent {
             get_follow_up_messages: Some(get_follow_up_messages),
             clock: Arc::clone(&self.inner.clock),
             transform_context: self.inner.context_transform.lock().expect("context transform").clone(),
+            prepare_request: self.inner.prepare_request.lock().expect("prepare request").clone(),
             ..LoopConfig::default()
         }
     }
@@ -725,7 +749,8 @@ impl Agent {
             }
             AgentEvent::AgentStart
             | AgentEvent::TurnStart
-            | AgentEvent::ToolExecutionUpdate { .. } => {}
+            | AgentEvent::ToolExecutionUpdate { .. }
+            | AgentEvent::SessionEvent(_) => {}
         }
 
         let signal = self

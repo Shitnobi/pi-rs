@@ -8,6 +8,7 @@
 
 pub mod compaction;
 pub mod events;
+pub mod model;
 pub mod event_handler;
 pub mod prompt;
 pub mod retry;
@@ -46,6 +47,24 @@ pub trait SessionSettingsStore: Send + Sync {
     /// TS `settingsManager.setCompactionEnabled(enabled)` (default no-op;
     /// the harness stores implement it when a case exercises the setter).
     fn set_compaction_enabled(&self, _enabled: bool) {}
+    /// TS `settingsManager.setDefaultModelAndProvider(provider, modelId)`.
+    fn set_default_model_and_provider(&self, _provider: &str, _model_id: &str) {}
+    /// TS `settingsManager.getEnabledModels()` (`None` = undefined).
+    fn get_enabled_models(&self) -> Option<Vec<String>> {
+        None
+    }
+    /// TS `settingsManager.setEnabledModels(patterns)`.
+    fn set_enabled_models(&self, _patterns: Vec<String>) {}
+    /// TS `settingsManager.setDefaultThinkingLevel(level)`.
+    fn set_default_thinking_level(&self, _level: &str) {}
+    /// TS `settingsManager.getModelThinkingLevel(provider, modelId)`.
+    fn get_model_thinking_level(&self, _provider: &str, _model_id: &str) -> Option<String> {
+        None
+    }
+    /// TS `settingsManager.getDefaultThinkingLevel()`.
+    fn get_default_thinking_level(&self) -> Option<String> {
+        None
+    }
 }
 
 /// TS `_modelRuntime` auth surface the prompt pipeline validates against
@@ -208,6 +227,10 @@ pub struct AgentSessionConfig {
     /// TS `sleep(delayMs, signal)` seam (plan §3): the retry backoff
     /// sleeper. `None` = the real tokio-time sleeper.
     pub sleeper: Option<Arc<dyn pi_agent::host::Sleeper>>,
+    /// TS `config.scopedModels` (`--models` flag).
+    pub scoped_models: Vec<model::ScopedModel>,
+    /// TS `_modelRuntime` routing seam (model & thinking slice).
+    pub model_routes: Option<Arc<dyn model::ModelRouteStore>>,
 }
 
 /// A deferred `agent_settled` action (TS `_deferredSettledActions` holds
@@ -315,6 +338,11 @@ struct SessionState {
     /// [`AgentSession::abort_retry_tap`]). `Some` while a retry sleep is
     /// in flight (`isRetrying`).
     retry_abort: Arc<Mutex<Option<pi_agent::host::AbortHandle>>>,
+    /// TS `_scopedModels`.
+    scoped_models: Vec<model::ScopedModel>,
+    /// The projection-bridge sender the request hook forwards over (see
+    /// [`model`] module docs).
+    projection_bridge: tokio::sync::mpsc::UnboundedSender<model::ProjectionCall>,
 }
 
 /// TS `class AgentSession` — the events slice.
@@ -356,6 +384,11 @@ pub struct AgentSession {
     /// TS `_unsubscribeAgent` — the agent→session subscription is wired
     /// with the run pipeline. TODO(tranche 11).
     _unsubscribe_agent: Option<usize>,
+    /// TS `_modelRuntime` routing seam (model & thinking slice).
+    model_routes: Option<Arc<dyn model::ModelRouteStore>>,
+    /// The projection-bridge receiver [`AgentSession::run_with_bridge`]
+    /// services while an agent run is parked in the request hook.
+    bridge_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<model::ProjectionCall>>>,
 }
 
 impl AgentSession {
@@ -365,6 +398,7 @@ impl AgentSession {
     pub fn new(config: AgentSessionConfig) -> AgentSession {
         let tools_state = tools::ToolsState::new(&config);
         let agent_event_queue = Arc::new(Mutex::new(Vec::new()));
+        let (projection_bridge, bridge_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut session = AgentSession {
             agent: config.agent,
             session_manager: config.session_manager,
@@ -414,15 +448,22 @@ impl AgentSession {
                 auto_compaction_abort: Arc::new(Mutex::new(None)),
                 summarization_events: Arc::new(Mutex::new(Vec::new())),
                 retry_abort: Arc::new(Mutex::new(None)),
+                scoped_models: config.scoped_models,
+                projection_bridge,
             },
             idle_resolvers: Mutex::new(Vec::new()),
             next_listener_id: 0,
             _unsubscribe_agent: None,
+            model_routes: config.model_routes.clone(),
+            bridge_rx: std::sync::Mutex::new(Some(bridge_rx)),
         };
         // TS constructor: `_installHiddenDeclarationsProjection` +
         // `_installAgentForcedPromptProjection` are stateful here (see
         // `tools::AgentSession::transform_context`), then `_buildRuntime`
         // runs and the default-tools restore follows.
+        // TS constructor: `_installAgentRequestProjection()` (chained over
+        // any agent-level `prepareRequest`).
+        session.install_agent_request_projection();
         session.build_runtime(config.initial_active_tool_names.clone(), true);
         if session.state.tools.uses_default_tools {
             let modifiers = session.state.tools.default_tool_modifiers.clone();

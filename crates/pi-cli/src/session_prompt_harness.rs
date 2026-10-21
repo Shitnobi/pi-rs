@@ -470,6 +470,8 @@ pub fn run_agent_session_prompt_harness(args: &Value) -> Result<Value, String> {
         prompt_templates: templates,
         system_prompt,
         model_lookup: None,
+        scoped_models: Vec::new(),
+        model_routes: None,
         sleeper: None,
     });
 

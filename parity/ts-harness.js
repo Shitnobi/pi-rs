@@ -6860,6 +6860,350 @@ async function runModule(tool, args, cwd) {
 		}
 	}
 
+	if (tool === "agent-session-model") {
+		// dist/core/agent-session.js — the model & thinking-management slice
+		// (setModel / cycleModel / setThinkingLevel / cycleThinkingLevel) plus
+		// the prepareRequest projection with virtual-model routing
+		// (_installAgentRequestProjection → modelRuntime.resolveModel), over a
+		// real AgentSession with a scripted provider. Mirrors the Rust harness
+		// (crates/pi-cli/src/session_model_harness.rs). setTimeout is patched
+		// for the duration of the script (fast-forward, unrecorded) so the
+		// auto-retry backoff never parks.
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		const { AgentSession } = require(path.join(distDir, "core", "agent-session.js"));
+		const { SessionManager } = require(path.join(distDir, "core", "session-manager.js"));
+		const { SettingsManager } = require(path.join(distDir, "core", "settings-manager.js"));
+		// Validation order mirrors the Rust entry exactly.
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		const config = args.config ?? {};
+		if (typeof config !== "object" || config === null || Array.isArray(config)) {
+			throw new Error("invalid config");
+		}
+		if (typeof config.systemPrompt !== "string") throw new Error("invalid systemPrompt");
+		if (
+			!Array.isArray(config.entries) ||
+			config.entries.length === 0 ||
+			config.entries[0].type !== "session"
+		) {
+			throw new Error("missing entries");
+		}
+		if (config.model !== undefined && config.model !== null) {
+			if (typeof config.model !== "object" || Array.isArray(config.model)) {
+				throw new Error("invalid model");
+			}
+		}
+		const scopedModelsIn = config.scopedModels ?? [];
+		if (!Array.isArray(scopedModelsIn)) throw new Error("invalid scopedModels");
+		const scopedModels = [];
+		for (const scoped of scopedModelsIn) {
+			if (typeof scoped !== "object" || scoped === null || Array.isArray(scoped)) {
+				throw new Error("invalid scopedModels");
+			}
+			if (typeof scoped.model !== "object" || scoped.model === null || Array.isArray(scoped.model)) {
+				throw new Error("invalid scopedModels");
+			}
+			if (scoped.thinkingLevel !== undefined && scoped.thinkingLevel !== null) {
+				if (typeof scoped.thinkingLevel !== "string") throw new Error("invalid scopedModels");
+			}
+			scopedModels.push({
+				model: scoped.model,
+				thinkingLevel: scoped.thinkingLevel ?? undefined,
+			});
+		}
+		const settingsIn = config.settings ?? {};
+		if (typeof settingsIn !== "object" || settingsIn === null || Array.isArray(settingsIn)) {
+			throw new Error("invalid settings");
+		}
+		const stringField = (value) => {
+			if (value === undefined || value === null) return undefined;
+			if (typeof value === "string") return value;
+			throw new Error("invalid settings");
+		};
+		const settingsSeed = {
+			defaultProvider: stringField(settingsIn.defaultProvider),
+			defaultModel: stringField(settingsIn.defaultModel),
+			enabledModels: undefined,
+			defaultThinkingLevel: stringField(settingsIn.defaultThinkingLevel),
+			modelThinkingLevels: undefined,
+		};
+		if (settingsIn.enabledModels !== undefined && settingsIn.enabledModels !== null) {
+			if (!Array.isArray(settingsIn.enabledModels)) throw new Error("invalid settings");
+			settingsSeed.enabledModels = settingsIn.enabledModels.map((pattern) => {
+				if (typeof pattern !== "string") throw new Error("invalid settings");
+				return pattern;
+			});
+		}
+		if (settingsIn.modelThinkingLevels !== undefined && settingsIn.modelThinkingLevels !== null) {
+			if (typeof settingsIn.modelThinkingLevels !== "object" || Array.isArray(settingsIn.modelThinkingLevels)) {
+				throw new Error("invalid settings");
+			}
+			const parsed = {};
+			for (const [key, level] of Object.entries(settingsIn.modelThinkingLevels)) {
+				if (typeof level !== "string") throw new Error("invalid settings");
+				parsed[key] = level;
+			}
+			settingsSeed.modelThinkingLevels = parsed;
+		}
+		if (!Array.isArray(args.models)) throw new Error("missing models");
+		for (const model of args.models) {
+			if (typeof model !== "object" || model === null || Array.isArray(model)) {
+				throw new Error("invalid models");
+			}
+		}
+		let authDenied = [];
+		if (args.authDenied !== undefined && args.authDenied !== null) {
+			if (!Array.isArray(args.authDenied)) throw new Error("invalid authDenied");
+			authDenied = args.authDenied.map((provider) => {
+				if (typeof provider !== "string") throw new Error("invalid authDenied");
+				return provider;
+			});
+		}
+		let resolveScript = [];
+		if (args.resolveScript !== undefined && args.resolveScript !== null) {
+			if (!Array.isArray(args.resolveScript)) throw new Error("invalid resolveScript");
+			for (const entry of args.resolveScript) {
+				if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+					throw new Error("invalid resolveScript");
+				}
+				if (typeof entry.throw === "string") continue;
+				if (
+					typeof entry.model !== "object" ||
+					entry.model === null ||
+					Array.isArray(entry.model) ||
+					typeof entry.thinkingLevel !== "string"
+				) {
+					throw new Error("invalid resolveScript");
+				}
+			}
+			resolveScript = args.resolveScript;
+		}
+		if (!Array.isArray(args.script)) throw new Error("missing script");
+
+		const realDateNow = Date.now;
+		Date.now = () => args.nowMs;
+		const RealDate = Date;
+		class PinnedDate extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(args.nowMs);
+				else super(...ctorArgs);
+			}
+		}
+		globalThis.Date = PinnedDate;
+		const realSetTimeout = globalThis.setTimeout;
+		globalThis.setTimeout = (fn, _ms, ...rest) => {
+			fn(...rest);
+			return { __piParityDummyTimeout: true };
+		};
+		let uuidI = 0;
+		const nextUuid = () => "uid" + String(++uuidI).padStart(5, "0");
+		try {
+			const sessionManager = SessionManager.inMemory("/proj", undefined, config.entries);
+			const projected = sessionManager.buildSessionProjection().messages;
+			const providerCalls = [];
+			let providerIdx = 0;
+			const providerTurns = args.providerTurns ?? [];
+			const fakeStreamFn = (model, context, _options) => {
+				const turn = providerTurns[providerIdx];
+				if (turn === undefined) throw new Error("provider script exhausted");
+				providerIdx++;
+				providerCalls.push({
+					model: JSON.parse(JSON.stringify(model)),
+					messages: JSON.parse(JSON.stringify(context.messages ?? [])),
+				});
+				return {
+					async *[Symbol.asyncIterator]() {
+						for (const event of turn.events ?? []) yield event;
+					},
+					result() {
+						return Promise.resolve(turn.result);
+					},
+				};
+			};
+			const agent = new Agent({
+				streamFn: fakeStreamFn,
+				initialState: { messages: projected },
+			});
+			agent.state.model = config.model ?? undefined;
+			const settingsManager = SettingsManager.inMemory(settingsSeed);
+			const fakeLoader = {
+				getSkills: () => ({ skills: [], diagnostics: [] }),
+				getPrompts: () => ({ prompts: [], diagnostics: [] }),
+				getAgentsFiles: () => ({ agentsFiles: [] }),
+				getSystemPrompt: () => config.systemPrompt,
+				getAppendSystemPrompt: () => [],
+				getExtensions: () => ({
+					extensions: [],
+					runtime: {
+						mcpServers: { setChangeListener: () => {} },
+						pendingProviderRegistrations: [],
+						pendingNativeProviderRegistrations: [],
+						pendingVirtualModelRegistrations: [],
+					},
+					diagnostics: [],
+				}),
+				getThemes: () => ({ themes: [], diagnostics: [] }),
+			};
+			const resolveCalls = [];
+			let resolveIdx = 0;
+			const modelRuntime = {
+				getModel: () => undefined,
+				getPhysicalModel: () => undefined,
+				hasConfiguredAuth: () => true,
+				checkAuth: async (provider) => !authDenied.includes(provider),
+				isUsingOAuth: () => false,
+				getAvailableSnapshot: () => args.models,
+				resolveModel: async (model, llmMessages, request) => {
+					resolveCalls.push({
+						model: JSON.parse(JSON.stringify(model)),
+						messages: JSON.parse(JSON.stringify(llmMessages)),
+						reason: request.reason,
+						thinkingLevel: request.thinkingLevel,
+						failed: request.failed === undefined ? null : JSON.parse(JSON.stringify(request.failed)),
+						state: request.state === undefined ? null : JSON.parse(JSON.stringify(request.state)),
+					});
+					const entry = resolveScript[resolveIdx];
+					resolveIdx++;
+					if (entry === undefined) throw new Error("resolve script exhausted");
+					if (typeof entry.throw === "string") throw new Error(entry.throw);
+					return {
+						model: entry.model,
+						thinkingLevel: entry.thinkingLevel,
+						state: entry.state,
+					};
+				},
+			};
+			const session = new AgentSession({
+				agent,
+				sessionManager,
+				settingsManager,
+				cwd: "/proj",
+				resourceLoader: fakeLoader,
+				modelRuntime,
+				usesDefaultTools: false,
+				baseToolsOverride: {},
+				scopedModels,
+			});
+			const snapEvent = (event) => JSON.parse(JSON.stringify(event));
+			const extensionEvents = [];
+			const extensionErrors = [];
+			const fakeRunner = {
+				hasHandlers: () => false,
+				emit: async (event) => {
+					extensionEvents.push(snapEvent(event));
+				},
+				emitMessageEnd: async (event) => {
+					extensionEvents.push(snapEvent(event));
+					return undefined;
+				},
+				emitError: (error) => {
+					extensionErrors.push(error);
+				},
+				invalidate: () => {},
+				getAllRegisteredTools: () => [],
+				emitBeforeAgentStart: async (_trigger, options) => ({
+					messages: [],
+					systemPromptOptions: JSON.parse(JSON.stringify(options)),
+				}),
+			};
+			session._extensionRunner = fakeRunner;
+
+			const sessionEvents = [];
+			session.subscribe((event) => {
+				sessionEvents.push(snapEvent(event));
+			});
+			globalThis.__piParityUuidOverride = nextUuid;
+
+			const persistOf = (op) => {
+				if (op.persist === undefined || op.persist === false) return false;
+				if (op.persist === true) return true;
+				throw new Error("invalid persist");
+			};
+			const results = [];
+			for (const op of args.script) {
+				try {
+					if (op === null || typeof op !== "object" || Array.isArray(op)) {
+						throw new Error("ops entries must be objects");
+					}
+					if (typeof op.op !== "string") throw new Error("missing op");
+					let v = null;
+					switch (op.op) {
+						case "setModel": {
+							if (typeof op.modelIndex !== "number") throw new Error("missing modelIndex");
+							const model = args.models[op.modelIndex];
+							if (model === undefined) throw new Error("modelIndex out of range");
+							await session.setModel(model, { persist: persistOf(op) });
+							break;
+						}
+						case "cycleModel": {
+							let direction = "forward";
+							if (op.direction !== undefined) {
+								if (op.direction !== "forward" && op.direction !== "backward") {
+									throw new Error("invalid direction");
+								}
+								direction = op.direction;
+							}
+							v =
+								(await session.cycleModel(direction, { persist: persistOf(op) })) ??
+								null;
+							break;
+						}
+						case "setThinkingLevel": {
+							if (typeof op.level !== "string") throw new Error("missing level");
+							session.setThinkingLevel(op.level, { persist: persistOf(op) });
+							break;
+						}
+						case "cycleThinkingLevel": {
+							v = (await session.cycleThinkingLevel({ persist: persistOf(op) })) ?? null;
+							break;
+						}
+						case "prompt": {
+							if (typeof op.text !== "string") throw new Error("missing text");
+							await session.prompt(op.text);
+							break;
+						}
+						case "waitForIdle": {
+							await session.waitForIdle();
+							break;
+						}
+						default:
+							throw new Error("unknown agent-session-model op: " + op.op);
+					}
+					results.push(v === undefined ? null : v);
+				} catch (e) {
+					results.push({
+						thrown: e && e.message !== undefined ? String(e.message) : String(e),
+					});
+				}
+			}
+			const entries = sessionManager.getEntries();
+			return {
+				result: {
+					results,
+					sessionEvents,
+					entries,
+					modelChanges: entries.filter((entry) => entry.type === "model_change"),
+					thinkingLevelChanges: entries.filter((entry) => entry.type === "thinking_level_change"),
+					extensionEvents,
+					extensionErrors,
+					providerCalls,
+					resolveCalls,
+					settingsEnd: {
+						defaultProvider: settingsManager.getDefaultProvider() ?? null,
+						defaultModel: settingsManager.getDefaultModel() ?? null,
+						enabledModels: settingsManager.getEnabledModels() ?? null,
+						defaultThinkingLevel: settingsManager.getDefaultThinkingLevel() ?? null,
+						modelThinkingLevels: settingsManager.getAllModelThinkingLevels() ?? {},
+					},
+				},
+			};
+		} finally {
+			globalThis.__piParityUuidOverride = null;
+			globalThis.setTimeout = realSetTimeout;
+			Date.now = realDateNow;
+			globalThis.Date = RealDate;
+		}
+	}
+
 	if (tool === "file-mutation-queue") {
 		// dist/core/tools/file-mutation-queue.js — withFileMutationQueue over
 		// scripted fns. Ops run concurrently; each fn marks itself started,

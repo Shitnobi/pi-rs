@@ -532,6 +532,11 @@ impl AgentSession {
             AgentEvent::TurnStart => {
                 self.handle_agent_event(&SessionAgentEvent::TurnStart).await;
             }
+            AgentEvent::SessionEvent(event) => {
+                // A session-emitted event forwarded through the queue (the
+                // virtual-model projection's `entry_appended`).
+                self.emit(event);
+            }
             AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
                 self.handle_agent_event(&SessionAgentEvent::ToolExecutionStart {
                     tool_call_id,

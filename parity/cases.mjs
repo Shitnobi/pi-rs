@@ -10653,3 +10653,254 @@ cases.push(
 		providerTurns: [ascOverflowErr(ASC_NOW)],
 	}),
 );
+
+// ======================================================= agent-session-model
+// The model & thinking-management slice of AgentSession (setModel /
+// cycleModel / setThinkingLevel / cycleThinkingLevel) plus the
+// prepareRequest projection with virtual-model routing (resolveModel),
+// over a scripted provider. The models list feeds getAvailableSnapshot
+// and setModel targets; resolveScript feeds the scripted router.
+const asmo = (name, args) => ({
+	name: "agent-session-model/" + name,
+	tool: "agent-session-model",
+	args: {
+		...args,
+		config: { systemPrompt: "You are the parity assistant.", ...(args.config ?? {}) },
+	},
+});
+const ASMO_NOW = 1748000000000;
+const asmoIso = (ms) => new Date(ms).toISOString();
+const asmoHeader = () => [{ type: "session", id: "s-root", version: 3, cwd: "/proj" }];
+const asmoModel = (o = {}) => ({
+	id: o.id ?? "m-a",
+	name: o.name ?? "Model A",
+	api: o.api ?? "anthropic",
+	provider: o.provider ?? "anthropic",
+	baseUrl: "",
+	reasoning: o.reasoning ?? false,
+	input: [],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	contextWindow: o.contextWindow ?? 100000,
+	maxTokens: o.maxTokens ?? 8192,
+	...(o.thinkingLevelMap !== undefined ? { thinkingLevelMap: o.thinkingLevelMap } : {}),
+});
+const asmoUsage = () => ({
+	input: 3,
+	output: 5,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 8,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+});
+const asmoMsg = (o = {}) => ({
+	role: "assistant",
+	content: o.content ?? [{ type: "text", text: "ok" }],
+	api: o.api ?? "anthropic",
+	provider: o.provider ?? "anthropic",
+	model: o.model ?? "m-a",
+	usage: o.usage ?? asmoUsage(),
+	stopReason: o.stopReason ?? "stop",
+	...(o.errorMessage !== undefined ? { errorMessage: o.errorMessage } : {}),
+	timestamp: o.timestamp ?? ASMO_NOW,
+});
+const asmoTurn = (result, events = []) => ({ events, result });
+cases.push(
+	asmo("missing-args", {}),
+	asmo("unknown-op", {
+		nowMs: ASMO_NOW,
+		config: { model: asmoModel(), entries: asmoHeader() },
+		models: [asmoModel()],
+		script: [{ op: "bogus" }],
+	}),
+	// setModel happy path: model_change entry, thinking clamp to the new
+	// model's supported levels, thinking_level_changed session event, and
+	// the model_select / thinking_level_select extension events.
+	asmo("setmodel-happy", {
+		nowMs: ASMO_NOW,
+		config: {
+			model: asmoModel({ id: "m-a", name: "Model A" }),
+			entries: asmoHeader(),
+		},
+		models: [
+			asmoModel({ id: "m-a", name: "Model A" }),
+			asmoModel({
+				id: "m-b",
+				name: "Model B",
+				reasoning: true,
+				thinkingLevelMap: { off: null, minimal: "b-min", low: "b-low", medium: "b-med" },
+			}),
+		],
+		script: [{ op: "setModel", modelIndex: 1 }],
+	}),
+	// setModel throws before any mutation when auth is not configured.
+	asmo("setmodel-no-api-key", {
+		nowMs: ASMO_NOW,
+		config: { model: asmoModel(), entries: asmoHeader() },
+		models: [asmoModel(), asmoModel({ id: "m-b", name: "Model B" })],
+		authDenied: ["anthropic"],
+		script: [{ op: "setModel", modelIndex: 1 }],
+	}),
+	// setModel persist: global default model/provider recorded; the empty
+	// scoped-models list leaves enabledModels untouched.
+	asmo("setmodel-persist", {
+		nowMs: ASMO_NOW,
+		config: {
+			model: asmoModel(),
+			entries: asmoHeader(),
+			settings: { enabledModels: ["anthropic/m-a"] },
+		},
+		models: [asmoModel(), asmoModel({ id: "m-b", name: "Model B" })],
+		script: [{ op: "setModel", modelIndex: 1, persist: true }],
+	}),
+	// setModel persist with a non-empty scope: the persisted model joins
+	// scopedModels and enabledModels gains its reference.
+	asmo("setmodel-persist-scoped", {
+		nowMs: ASMO_NOW,
+		config: {
+			model: asmoModel(),
+			entries: asmoHeader(),
+			scopedModels: [{ model: asmoModel() }],
+			settings: { enabledModels: ["anthropic/m-a"] },
+		},
+		models: [asmoModel(), asmoModel({ id: "m-b", name: "Model B" })],
+		script: [{ op: "setModel", modelIndex: 1, persist: true }],
+	}),
+	// cycleModel forward / wrap / backward over the available snapshot.
+	asmo("cyclemodel-wrap", {
+		nowMs: ASMO_NOW,
+		config: { model: asmoModel(), entries: asmoHeader() },
+		models: [
+			asmoModel({ id: "m-a", name: "Model A" }),
+			asmoModel({ id: "m-b", name: "Model B" }),
+			asmoModel({ id: "m-c", name: "Model C" }),
+		],
+		script: [
+			{ op: "cycleModel" },
+			{ op: "cycleModel", direction: "forward" },
+			{ op: "cycleModel", direction: "forward" },
+			{ op: "cycleModel", direction: "backward" },
+		],
+	}),
+	// A single available model cannot cycle.
+	asmo("cyclemodel-single", {
+		nowMs: ASMO_NOW,
+		config: { model: asmoModel(), entries: asmoHeader() },
+		models: [asmoModel()],
+		script: [{ op: "cycleModel" }],
+	}),
+	// Scoped cycling filters to models present in the available snapshot.
+	asmo("cyclemodel-scoped", {
+		nowMs: ASMO_NOW,
+		config: {
+			model: asmoModel(),
+			entries: asmoHeader(),
+			scopedModels: [
+				{ model: asmoModel() },
+				{ model: asmoModel({ id: "m-b", name: "Model B", reasoning: true }) },
+				{ model: asmoModel({ id: "m-unavailable", name: "Unavailable" }) },
+			],
+		},
+		models: [asmoModel(), asmoModel({ id: "m-b", name: "Model B", reasoning: true })],
+		script: [
+			{ op: "cycleModel" },
+			{ op: "cycleModel", direction: "backward" },
+		],
+	}),
+	// setThinkingLevel clamps unsupported levels to the nearest supported
+	// one (forward scan from the requested level, then backward).
+	asmo("setthinkinglevel-clamp", {
+		nowMs: ASMO_NOW,
+		config: {
+			model: asmoModel({
+				id: "m-think",
+				name: "Think",
+				reasoning: true,
+				thinkingLevelMap: { off: null, minimal: "t-min", low: "t-low", medium: "t-med" },
+			}),
+			entries: asmoHeader(),
+		},
+		models: [asmoModel({ id: "m-think", name: "Think", reasoning: true })],
+		script: [
+			{ op: "setThinkingLevel", level: "off" },
+			{ op: "setThinkingLevel", level: "max" },
+		],
+	}),
+	// A no-op setThinkingLevel persists nothing and records no entry.
+	asmo("setthinkinglevel-no-change", {
+		nowMs: ASMO_NOW,
+		config: { model: asmoModel(), entries: asmoHeader() },
+		models: [asmoModel()],
+		script: [{ op: "setThinkingLevel", level: "off" }],
+	}),
+	// setThinkingLevel persist records the raw requested level.
+	asmo("setthinkinglevel-persist", {
+		nowMs: ASMO_NOW,
+		config: {
+			model: asmoModel({ id: "m-think", name: "Think", reasoning: true }),
+			entries: asmoHeader(),
+		},
+		models: [asmoModel({ id: "m-think", name: "Think", reasoning: true })],
+		script: [{ op: "setThinkingLevel", level: "high", persist: true }],
+	}),
+	// cycleThinkingLevel walks the supported levels and wraps; models
+	// without reasoning support return undefined.
+	asmo("cyclethinkinglevel", {
+		nowMs: ASMO_NOW,
+		config: {
+			model: asmoModel({ id: "m-think", name: "Think", reasoning: true }),
+			entries: asmoHeader(),
+		},
+		models: [
+			asmoModel({ id: "m-think", name: "Think", reasoning: true }),
+			asmoModel({ id: "m-plain", name: "Plain" }),
+		],
+		script: [
+			{ op: "cycleThinkingLevel" },
+			{ op: "cycleThinkingLevel" },
+			{ op: "cycleThinkingLevel" },
+			{ op: "cycleThinkingLevel" },
+			{ op: "cycleThinkingLevel" },
+			{ op: "setModel", modelIndex: 1 },
+			{ op: "cycleThinkingLevel" },
+		],
+	}),
+	// Virtual-model routing: a prompt through a virtual model resolves
+	// with reason "user", appends the router state entry, and streams with
+	// the routed physical model.
+	asmo("virtual-model-route", {
+		nowMs: ASMO_NOW,
+		config: {
+			model: asmoModel({ id: "m-virt", name: "Virt", api: "pi-virtual", provider: "virtual" }),
+			entries: asmoHeader(),
+		},
+		models: [asmoModel({ id: "m-virt", name: "Virt", api: "pi-virtual", provider: "virtual" })],
+		resolveScript: [
+			{
+				model: asmoModel({ id: "m-phys", name: "Phys" }),
+				thinkingLevel: "low",
+				state: { turn: 1 },
+			},
+		],
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [asmoTurn(asmoMsg({ model: "m-phys", content: [{ type: "text", text: "routed" }] }))],
+	}),
+	// A failed routed response sets _failedResponse; the retried request
+	// resolves with reason "retry" and the failed message attached.
+	asmo("virtual-model-retry-reason", {
+		nowMs: ASMO_NOW,
+		config: {
+			model: asmoModel({ id: "m-virt", name: "Virt", api: "pi-virtual", provider: "virtual" }),
+			entries: asmoHeader(),
+		},
+		models: [asmoModel({ id: "m-virt", name: "Virt", api: "pi-virtual", provider: "virtual" })],
+		resolveScript: [
+			{ model: asmoModel({ id: "m-phys", name: "Phys" }), thinkingLevel: "off" },
+			{ model: asmoModel({ id: "m-phys", name: "Phys" }), thinkingLevel: "off" },
+		],
+		script: [{ op: "prompt", text: "hello" }],
+		providerTurns: [
+			asmoTurn(asmoMsg({ model: "m-phys", stopReason: "error", errorMessage: "overloaded" })),
+			asmoTurn(asmoMsg({ model: "m-phys", content: [{ type: "text", text: "recovered" }] })),
+		],
+	}),
+);

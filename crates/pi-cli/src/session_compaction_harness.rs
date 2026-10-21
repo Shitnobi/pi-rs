@@ -398,6 +398,8 @@ pub fn run_agent_session_compaction_harness(args: &Value) -> Result<Value, Strin
             prompt_templates: Vec::new(),
             system_prompt: Some(system_prompt),
             model_lookup: None,
+            scoped_models: Vec::new(),
+            model_routes: None,
             sleeper: Some(Arc::clone(&sleeper)),
         });
         {

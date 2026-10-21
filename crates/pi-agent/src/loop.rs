@@ -139,8 +139,10 @@ pub type FinishTurnHook =
     dyn Fn(&CompletedTurn) -> BoxFuture<'static, Option<String>> + Send + Sync;
 
 /// TS `config.prepareRequest` — receives `(context, model, thinkingLevel)`.
+/// `Err` models a throw (e.g. failed virtual-model routing), which rejects
+/// the run like the TS rejection does.
 pub type PrepareRequestHook = dyn
-    Fn(&AgentContext, &Value, &str) -> BoxFuture<'static, Option<AgentRequestUpdate>>
+    Fn(&AgentContext, &Value, &str) -> BoxFuture<'static, Result<Option<AgentRequestUpdate>, String>>
     + Send
     + Sync;
 
@@ -413,7 +415,7 @@ async fn run_loop(
             if let Some(hook) = &config.prepare_request {
                 let thinking_level =
                     config.reasoning.clone().unwrap_or_else(|| "off".to_string());
-                if let Some(update) = hook(context, &config.model.clone(), &thinking_level).await {
+                if let Some(update) = hook(context, &config.model.clone(), &thinking_level).await? {
                     if let Some(next_context) = update.context {
                         *context = next_context;
                     }

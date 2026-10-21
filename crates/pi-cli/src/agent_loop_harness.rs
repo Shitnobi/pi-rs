@@ -535,7 +535,7 @@ pub fn run_agent_loop_harness(args: &Value, _cwd: &Path) -> Result<Value, String
                             .and_then(Value::as_str)
                             .map(str::to_string),
                     });
-                Box::pin(async move { update })
+                Box::pin(async move { Ok(update) })
             },
         ));
     }
