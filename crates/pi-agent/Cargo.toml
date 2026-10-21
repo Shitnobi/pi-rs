@@ -7,6 +7,9 @@ description = "Agent-loop and agent-session layer for the pi coding agent (port 
 
 [dependencies]
 pi-core = { path = "../pi-core" }
+pi-providers = { path = "../pi-providers" }
+pi-session = { path = "../pi-session" }
+fancy-regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }

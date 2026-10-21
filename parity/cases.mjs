@@ -8307,6 +8307,355 @@ export const cases = [
 
 	return c.filter(Boolean);
 })(),
+
+...(() => {
+	// ========================================================================
+	// declare-tool-changes — pi-agent-core first-request reduction: the real
+	// Agent (scripted streamFn recording the TranscriptContext messages of
+	// the single request, Date.now pinned to nowMs) prompted with the
+	// pending batch after seeding contextMessages/contextTools. The result
+	// is defaultConvertToLlm([...contextMessages, ...pending]) with
+	// declareToolChanges applied to the pending batch. Mirrors
+	// crates/pi-cli/src/agent_harness.rs run_declare_tool_changes_harness.
+	// All timestamps are literal numbers; no dynamic values.
+	// ========================================================================
+	const dtc = (name, args) => ({ tool: "declare-tool-changes", name: "dtc-" + name, args });
+	const decl = (name, description) => ({
+		name,
+		description: description ?? "Tool " + name,
+		parameters: { type: "object", properties: {}, additionalProperties: false },
+	});
+	const ctxTool = (name, description) => ({
+		name,
+		description: description ?? "Tool " + name,
+		parameters: { type: "object", properties: {}, additionalProperties: false },
+	});
+	const sys = (content, timestamp, extra = {}) => ({ role: "system", content, timestamp, ...extra });
+	const usr = (text, timestamp) => ({ role: "user", content: [{ type: "text", text }], timestamp });
+
+	const c = [];
+	// No changes: the transcript already declares exactly the context tools,
+	// so the pending batch passes through untouched.
+	c.push(dtc("no-changes", {
+		contextMessages: [sys("base", 100, { toolsAdded: [decl("a"), decl("b")] })],
+		contextTools: [ctxTool("a"), ctxTool("b")],
+		pendingMessages: [usr("hi", 200)],
+		nowMs: 1000,
+	}));
+	// No changes with nothing declared at all (no system message anywhere).
+	c.push(dtc("no-changes-no-tools", {
+		contextMessages: [usr("first", 50)],
+		contextTools: [],
+		pendingMessages: [usr("hi", 200)],
+		nowMs: 1000,
+	}));
+	// Tools added: a new system message (timestamp = nowMs) is inserted
+	// before the first non-system pending message.
+	c.push(dtc("tools-added", {
+		contextMessages: [sys("base", 100, { toolsAdded: [decl("a")] })],
+		contextTools: [ctxTool("a"), ctxTool("b")],
+		pendingMessages: [usr("hi", 200)],
+		nowMs: 1000,
+	}));
+	// Tools removed.
+	c.push(dtc("tools-removed", {
+		contextMessages: [sys("base", 100, { toolsAdded: [decl("a"), decl("b")] })],
+		contextTools: [ctxTool("a")],
+		pendingMessages: [usr("hi", 200)],
+		nowMs: 1000,
+	}));
+	// A changed definition is a removal plus an addition of the same name.
+	c.push(dtc("tool-redefined", {
+		contextMessages: [sys("base", 100, { toolsAdded: [decl("a", "v1")] })],
+		contextTools: [ctxTool("a", "v2")],
+		pendingMessages: [usr("hi", 200)],
+		nowMs: 1000,
+	}));
+	// Mixed add + remove in one delta message.
+	c.push(dtc("mixed-add-remove", {
+		contextMessages: [sys("base", 100, { toolsAdded: [decl("a"), decl("b")] })],
+		contextTools: [ctxTool("b"), ctxTool("c")],
+		pendingMessages: [usr("hi", 200)],
+		nowMs: 1000,
+	}));
+	// Pending system message with stale tool fields: replaced by the delta
+	// between the committed transcript and the executable set.
+	c.push(dtc("pending-system-stale-replaced", {
+		contextMessages: [sys("base", 100, { toolsAdded: [decl("a")] })],
+		contextTools: [ctxTool("a"), ctxTool("b")],
+		pendingMessages: [sys("note", 300, { toolsAdded: [decl("z"), decl("q")] }), usr("hi", 301)],
+		nowMs: 1000,
+	}));
+	// Pending system message with a stale toolsRemoved only.
+	c.push(dtc("pending-system-stale-removed", {
+		contextMessages: [sys("base", 100, { toolsAdded: [decl("a"), decl("b")] })],
+		contextTools: [ctxTool("a")],
+		pendingMessages: [sys("note", 300, { toolsRemoved: [{ name: "c" }] })],
+		nowMs: 1000,
+	}));
+	// Pending system already clean and no changes: kept as-is (same objects).
+	c.push(dtc("pending-system-clean-kept", {
+		contextMessages: [sys("base", 100, { toolsAdded: [decl("a")] })],
+		contextTools: [ctxTool("a")],
+		pendingMessages: [sys("note", 300), usr("hi", 301)],
+		nowMs: 1000,
+	}));
+	// Pending system clean but changes exist: the delta is written into it.
+	c.push(dtc("pending-system-clean-changed", {
+		contextMessages: [sys("base", 100, { toolsAdded: [decl("a")] })],
+		contextTools: [ctxTool("a"), ctxTool("b")],
+		pendingMessages: [sys("note", 300), usr("hi", 301)],
+		nowMs: 1000,
+	}));
+	// Empty pending batch with changes: the delta message is the only
+	// initial message (insert index falls off the end).
+	c.push(dtc("empty-pending-changes", {
+		contextMessages: [sys("base", 100, { toolsAdded: [decl("a")] })],
+		contextTools: [ctxTool("a"), ctxTool("b")],
+		pendingMessages: [],
+		nowMs: 1000,
+	}));
+	// Only context tools, no transcript tools: the delta message is inserted
+	// before the first non-system pending message.
+	c.push(dtc("context-tools-only", {
+		contextMessages: [usr("first", 50)],
+		contextTools: [ctxTool("a")],
+		pendingMessages: [usr("hi", 200)],
+		nowMs: 1000,
+	}));
+	// Pending messages are all system: the delta message goes last.
+	c.push(dtc("all-system-pending", {
+		contextMessages: [sys("base", 100, { toolsAdded: [decl("a")] })],
+		contextTools: [ctxTool("a"), ctxTool("b")],
+		pendingMessages: [sys("s1", 300), sys("s2", 301)],
+		nowMs: 1000,
+	}));
+	// Protocol-misuse cases: in-band {error} with byte-identical messages.
+	c.push(dtc("err-missing-nowms", {
+		contextMessages: [],
+		contextTools: [],
+		pendingMessages: [],
+	}));
+	c.push(dtc("err-bad-context-tools", {
+		contextMessages: [],
+		contextTools: "nope",
+		pendingMessages: [],
+		nowMs: 1000,
+	}));
+
+	return c.filter(Boolean);
+})(),
+
+...(() => {
+	// ========================================================================
+	// run-tool-call — pi-agent-core agent-loop runToolCall with scripted
+	// tools (update/return/throw execute steps), scripted prepareArguments,
+	// before/after hooks, and a pinned performance.now clock (durationMs =
+	// Math.round of the scripted difference; one case pins a .5 fraction).
+	// Mirrors crates/pi-cli/src/agent_harness.rs run_run_tool_call_harness.
+	// No timestamps or random values.
+	// ========================================================================
+	const rtc = (name, args) => ({ tool: "run-tool-call", name: "rtc-" + name, args });
+	const rtcParams = () => ({
+		type: "object",
+		properties: { path: { type: "string" } },
+		required: ["path"],
+		additionalProperties: false,
+	});
+	const rtcTool = (name, extra = {}) => ({
+		name,
+		description: "Tool " + name,
+		parameters: rtcParams(),
+		label: name,
+		...extra,
+	});
+	const rtcCall = (name, callArgs) => ({ id: "call-1", name, arguments: callArgs });
+	const rtcAssistant = () => ({
+		role: "assistant",
+		content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "x" } }],
+		timestamp: 5,
+	});
+	const rtcUser = (text, timestamp) => ({ role: "user", content: [{ type: "text", text }], timestamp });
+	const rtcContext = () => [rtcUser("ctx", 1)];
+
+	const c = [];
+	// Happy path: two update steps then a full result (content, details,
+	// structuredContent); durationMs from the scripted clock.
+	c.push(rtc("happy-path-updates", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", {
+			execute: { script: [
+				{ perfNow: 1010, update: { content: [{ type: "text", text: "partial" }], details: { stage: 1 } } },
+				{ perfNow: 1100, return: {
+					content: [{ type: "text", text: "done" }],
+					details: { ok: true },
+					structuredContent: { path: "x" },
+				} },
+			] },
+		})],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		contextTools: [{ name: "read", description: "Tool read", parameters: rtcParams(), label: "read" }],
+		perfSeq: [1000],
+	}));
+	// Tool not found: immediate error outcome, no durationMs, no updates.
+	c.push(rtc("tool-not-found", {
+		toolCall: rtcCall("write", { path: "x" }),
+		tools: [rtcTool("read", { execute: { script: [{ perfNow: 1000, return: { content: [], details: {} } }] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		perfSeq: [1000],
+	}));
+	// Validation error: arguments miss the required "path" property.
+	c.push(rtc("validation-error", {
+		toolCall: rtcCall("read", {}),
+		tools: [rtcTool("read", { execute: { script: [{ perfNow: 1000, return: { content: [], details: {} } }] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		perfSeq: [1000],
+	}));
+	// beforeToolCall blocks without a reason: the default message is used.
+	c.push(rtc("before-block-no-reason", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", { execute: { script: [{ perfNow: 1000, return: { content: [], details: {} } }] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		beforeToolCall: { block: true },
+		perfSeq: [1000],
+	}));
+	// beforeToolCall blocks with a reason.
+	c.push(rtc("before-block-reason", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", { execute: { script: [{ perfNow: 1000, return: { content: [], details: {} } }] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		beforeToolCall: { block: true, reason: "Not allowed" },
+		perfSeq: [1000],
+	}));
+	// beforeToolCall blocks with terminate: the error result carries it.
+	c.push(rtc("before-block-terminate", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", { execute: { script: [{ perfNow: 1000, return: { content: [], details: {} } }] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		beforeToolCall: { block: true, reason: "Stop here", terminate: true },
+		perfSeq: [1000],
+	}));
+	// execute throws: the message becomes an error result, durationMs kept.
+	c.push(rtc("execute-throw", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", { execute: { script: [
+			{ perfNow: 1015, update: { content: [{ type: "text", text: "partial" }], details: null } },
+			{ perfNow: 1025, throw: "boom" },
+		] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		perfSeq: [1000],
+	}));
+	// execute returns isError: true — passed through as the outcome flag.
+	c.push(rtc("execute-is-error", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", { execute: { script: [{ perfNow: 1050, return: {
+			content: [{ type: "text", text: "soft failure" }],
+			details: {},
+			isError: true,
+		} }] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		perfSeq: [1000],
+	}));
+	// afterToolCall overrides content: structuredContent is dropped (it was
+	// not replaced along with the content).
+	c.push(rtc("after-content-override-drops-structured", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", { execute: { script: [{ perfNow: 1050, return: {
+			content: [{ type: "text", text: "original" }],
+			details: { d: 1 },
+			structuredContent: { s: 1 },
+		} }] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		afterToolCall: { content: [{ type: "text", text: "replaced" }] },
+		perfSeq: [1000],
+	}));
+	// afterToolCall returns structuredContent (and overrides details/usage):
+	// content is kept, structuredContent is replaced.
+	c.push(rtc("after-keeps-structured-content", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", { execute: { script: [{ perfNow: 1050, return: {
+			content: [{ type: "text", text: "original" }],
+			details: { d: 1 },
+			structuredContent: { s: 1 },
+		} }] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		afterToolCall: { details: { d: 2 }, structuredContent: { s: 2 }, usage: { totalTokens: 7 } },
+		perfSeq: [1000],
+	}));
+	// afterToolCall overrides isError (and terminate) on a success.
+	c.push(rtc("after-is-error-override", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", { execute: { script: [{ perfNow: 1050, return: {
+			content: [{ type: "text", text: "done" }],
+			details: {},
+		} }] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		afterToolCall: { isError: true, terminate: true },
+		perfSeq: [1000],
+	}));
+	// afterToolCall throws: the result becomes an error tool result.
+	c.push(rtc("after-throw", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", { execute: { script: [{ perfNow: 1050, return: {
+			content: [{ type: "text", text: "done" }],
+			details: { d: 1 },
+		} }] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		afterToolCall: { throw: "after hook failed" },
+		perfSeq: [1000],
+	}));
+	// prepareArguments script rewrite: the outcome toolCall carries the
+	// rewritten arguments (validation and execution see them too).
+	c.push(rtc("prepare-arguments-script", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", {
+			prepareArguments: { mode: "script", script: [{ in: { path: "x" }, out: { path: "rewritten" } }] },
+			execute: { script: [{ perfNow: 1050, return: { content: [{ type: "text", text: "ok" }], details: {} } }] },
+		})],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		perfSeq: [1000],
+	}));
+	// prepareArguments identity: same reference — toolCall object unchanged.
+	c.push(rtc("prepare-arguments-identity", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", {
+			prepareArguments: { mode: "identity" },
+			execute: { script: [{ perfNow: 1050, return: { content: [{ type: "text", text: "ok" }], details: {} } }] },
+		})],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		perfSeq: [1000],
+	}));
+	// durationMs Math.round with a .5 fraction (50.5 → 51).
+	c.push(rtc("duration-half-fraction", {
+		toolCall: rtcCall("read", { path: "x" }),
+		tools: [rtcTool("read", { execute: { script: [
+			{ perfNow: 1010.25, update: { content: [{ type: "text", text: "partial" }], details: null } },
+			{ perfNow: 1050.5, return: { content: [{ type: "text", text: "done" }], details: {} } },
+		] } })],
+		assistantMessage: rtcAssistant(),
+		contextMessages: rtcContext(),
+		perfSeq: [1000],
+	}));
+	// Protocol-misuse cases: in-band {error} with byte-identical messages.
+	c.push(rtc("err-missing-tool-call", { tools: [], assistantMessage: rtcAssistant() }));
+	c.push(rtc("err-missing-tools", { toolCall: rtcCall("read", { path: "x" }), assistantMessage: rtcAssistant() }));
+
+	return c.filter(Boolean);
+})(),
 ];
 
 // config-value sub-case builder (hoisted; used by the cases above).

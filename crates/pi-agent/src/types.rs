@@ -430,20 +430,22 @@ pub trait AgentTool: Send + Sync {
         ReplayPolicy::Never
     }
     /// Optional compatibility shim for raw tool-call arguments before schema
-    /// validation. Must return an object matching `parameters`.
-    fn prepare_arguments(&self, args: &Value) -> Value {
-        args.clone()
+    /// validation. `None` models both an absent shim and the TS
+    /// same-reference return (the identity shortcut); `Some` replaces the
+    /// arguments (the rebuilt `{...toolCall, arguments}` object).
+    fn prepare_arguments(&self, _args: &Value) -> Option<Value> {
+        None
     }
     /// Execute the tool call. Failures are reported via a result with
-    /// `is_error: true` (or an `Err`-free error result), not by only
-    /// describing the failure in `content`.
+    /// `is_error: true`; `Err` models a thrown error (the pipeline converts
+    /// it to an error result with the error message).
     fn execute<'a>(
         &'a self,
         tool_call_id: &'a str,
         args: &'a Value,
         signal: Option<&'a AbortHandle>,
         on_update: Option<&'a AgentToolUpdateCallback<'a>>,
-    ) -> BoxFuture<'a, AgentToolResult>;
+    ) -> BoxFuture<'a, Result<AgentToolResult, String>>;
 }
 
 #[cfg(test)]

@@ -18,10 +18,13 @@
 //! inside the loop; sleeps go through the [`host::Sleeper`] seam.
 
 pub mod agent_surface;
+pub mod conversion;
 pub mod host;
 pub mod provider;
 pub mod queue;
+pub mod tool_call;
 pub mod types;
+pub mod validation;
 
 pub use agent_surface::AgentQueues;
 pub use host::{AbortHandle, Aborted, Clock, FixedClock, Sleeper, TokioSleeper};

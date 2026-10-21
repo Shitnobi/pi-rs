@@ -180,6 +180,12 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "agent-queue" => {
             return agent_harness::run_agent_queue_harness(&input, std::path::Path::new(cwd))
         }
+        "declare-tool-changes" => {
+            return agent_harness::run_declare_tool_changes_harness(&input, std::path::Path::new(cwd))
+        }
+        "run-tool-call" => {
+            return agent_harness::run_run_tool_call_harness(&input, std::path::Path::new(cwd))
+        }
         "tui-utils" => return run_tui_utils_harness(&input),
         "tui-fuzzy" => return run_tui_fuzzy_harness(&input),
         "tui-word-navigation" => return run_tui_word_navigation_harness(&input),

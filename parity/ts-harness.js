@@ -50,6 +50,12 @@
  * - "agent-queue": packages/agent Agent queue surface (steer/followUp
  *   queues, modes, peek/clear) driven against a real Agent with a
  *   never-called dummy streamFn
+ * - "declare-tool-changes": packages/agent first-request reduction — a real
+ *   Agent (scripted streamFn recording the TranscriptContext messages,
+ *   Date.now pinned to nowMs) run once over the pending batch
+ * - "run-tool-call": packages/agent agent-loop runToolCall with scripted
+ *   tools (update/return/throw steps), scripted prepareArguments,
+ *   before/after hooks, and a pinned performance.now clock
  */
 const path = require("path");
 const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
@@ -4071,6 +4077,231 @@ async function runModule(tool, args, cwd) {
 			results.push(v === undefined ? null : v);
 		}
 		return { result: { results } };
+	}
+
+	if (tool === "declare-tool-changes") {
+		// packages/agent/dist/agent.js — the reduced fixed pipeline of what
+		// the provider sees on the first request: a REAL Agent is seeded with
+		// contextMessages + contextTools and prompted with the pending batch.
+		// The scripted streamFn records the TranscriptContext messages of the
+		// single request (no tool calls, one turn) and finishes immediately
+		// with a minimal assistant message. Date.now is pinned to nowMs for
+		// the run (the inserted system message timestamp). Mirrors the Rust
+		// harness (declare_tool_changes + default_convert_to_llm over
+		// [...contextMessages, ...pending]). Messages carry literal numeric
+		// timestamps — no normalization.
+		const { Agent } = require(path.join(distDir, "..", "..", "agent", "dist", "agent.js"));
+		// Validation order mirrors the Rust entry exactly.
+		if (!Array.isArray(args.contextMessages)) throw new Error("missing contextMessages");
+		if (!Array.isArray(args.contextTools)) throw new Error("missing contextTools");
+		if (!Array.isArray(args.pendingMessages)) throw new Error("missing pendingMessages");
+		if (typeof args.nowMs !== "number") throw new Error("missing nowMs");
+		const nowMs = args.nowMs;
+
+		// Minimal final assistant message: empty content (no tool calls) and
+		// stopReason "stop" so the loop ends after exactly one request.
+		const finalMessage = {
+			role: "assistant",
+			content: [],
+			api: "unknown",
+			provider: "unknown",
+			model: "unknown",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 0,
+		};
+		// Hand-rolled AssistantMessageEventStream stand-in: the dist loop
+		// for-awaits the events and calls response.result() on the terminal
+		// event. A single "done" event carrying the final message satisfies
+		// both (no streamed partials, no timing side effects).
+		const fakeResponse = {
+			async *[Symbol.asyncIterator]() {
+				yield { type: "done", message: finalMessage };
+			},
+			result() {
+				return Promise.resolve(finalMessage);
+			},
+		};
+		let llmMessages;
+		const streamFn = (_model, context) => {
+			if (llmMessages === undefined) llmMessages = context.messages;
+			return fakeResponse;
+		};
+		// AgentTool-shaped context tools (label + dummy execute); the loop
+		// only reads name/description/parameters/constrainedSampling through
+		// toToolDeclaration.
+		const contextTools = args.contextTools.map((t) => ({
+			name: typeof t.name === "string" ? t.name : "",
+			description: t.description,
+			parameters: t.parameters === undefined ? null : t.parameters,
+			label: typeof t.label === "string" ? t.label : typeof t.name === "string" ? t.name : "",
+			...(t.constrainedSampling !== undefined ? { constrainedSampling: t.constrainedSampling } : {}),
+			execute: async () => ({ content: [], details: {} }),
+		}));
+		const realDateNow = Date.now;
+		Date.now = () => nowMs;
+		try {
+			const agent = new Agent({
+				streamFn,
+				initialState: { messages: args.contextMessages },
+			});
+			agent.state.tools = contextTools;
+			await agent.prompt(args.pendingMessages);
+		} finally {
+			Date.now = realDateNow;
+		}
+		return { result: { llmMessages: llmMessages ?? [] } };
+	}
+
+	if (tool === "run-tool-call") {
+		// packages/agent/dist/agent-loop.js — the exported runToolCall with
+		// scripted tools, hooks, and a pinned performance.now clock. Mirrors
+		// the Rust harness (ScriptedTool + SharedPerfClock): every execute
+		// step may set perfNow (advancing the clock before its update),
+		// emit a parsed partial result via onUpdate, and the final step
+		// returns the parsed AgentToolResult or throws. No timestamps are
+		// produced (runToolCall adds no messages); durationMs comes from the
+		// scripted clock (Math.round of the difference).
+		const { runToolCall } = require(path.join(distDir, "..", "..", "agent", "dist", "agent-loop.js"));
+		// Validation order mirrors the Rust entry exactly: toolCall, tools,
+		// assistantMessage; contextMessages/perfSeq degrade to defaults.
+		if (args.toolCall === undefined) throw new Error("missing toolCall");
+		if (!Array.isArray(args.tools)) throw new Error("missing tools");
+		if (args.assistantMessage === undefined) throw new Error("missing assistantMessage");
+		const contextMessages = Array.isArray(args.contextMessages) ? args.contextMessages : [];
+		const perfSeq = (Array.isArray(args.perfSeq) ? args.perfSeq : []).filter((v) => typeof v === "number");
+
+		// JSON deep equality (object key order insensitive), mirroring the
+		// serde_json Value equality of the Rust ScriptedTool pair match.
+		const canonJson = (v) => {
+			if (v === null || typeof v !== "object") return v;
+			if (Array.isArray(v)) return v.map(canonJson);
+			const o = {};
+			for (const k of Object.keys(v).sort()) o[k] = canonJson(v[k]);
+			return o;
+		};
+		const jsonEq = (a, b) => JSON.stringify(canonJson(a)) === JSON.stringify(canonJson(b));
+
+		// JSON spec → AgentToolResult, mirroring the Rust parse_tool_result:
+		// content defaults to [], details is always present (null when
+		// absent), structuredContent/usage drop null, isError/terminate keep
+		// booleans only.
+		const parseToolResult = (value) => {
+			const v = value === undefined || value === null ? {} : value;
+			const out = {
+				content: Array.isArray(v.content) ? v.content : [],
+				details: v.details === undefined || v.details === null ? null : v.details,
+			};
+			if (v.structuredContent !== undefined && v.structuredContent !== null) out.structuredContent = v.structuredContent;
+			if (v.usage !== undefined && v.usage !== null) out.usage = v.usage;
+			if (typeof v.isError === "boolean") out.isError = v.isError;
+			if (typeof v.terminate === "boolean") out.terminate = v.terminate;
+			return out;
+		};
+
+		// Pinned monotonic clock: starts at perfSeq[0] (0 when empty); each
+		// scripted step's perfNow advances it. Patched before the call (the
+		// dist reads the global at call time) and restored after.
+		let perfValue = perfSeq.length > 0 ? perfSeq[0] : 0;
+		const realPerfNow = performance.now.bind(performance);
+		performance.now = () => perfValue;
+
+		// Scripted tool from a JSON spec (name/description/label/parameters/
+		// executionMode/prepareArguments/execute), mirroring the Rust
+		// ScriptedTool: identity and unmatched-script prepareArguments return
+		// the same reference; execute walks update/return/throw steps in
+		// order, setting perfNow before each step's update.
+		const makeTool = (spec) => {
+			const name = typeof spec.name === "string" ? spec.name : "";
+			const tool = {
+				name,
+				description: typeof spec.description === "string" ? spec.description : "",
+				label: typeof spec.label === "string" ? spec.label : name,
+				parameters: spec.parameters === undefined ? null : spec.parameters,
+				execute: async (_toolCallId, _args, _signal, onUpdate) => {
+					const script = spec.execute && Array.isArray(spec.execute.script) ? spec.execute.script : [];
+					for (let i = 0; i < script.length; i++) {
+						const step = script[i];
+						const last = i === script.length - 1;
+						if (typeof step.perfNow === "number") perfValue = step.perfNow;
+						if (step.update !== undefined) onUpdate(parseToolResult(step.update));
+						if (last) {
+							if (typeof step.throw === "string") throw new Error(step.throw);
+							if (step.return !== undefined) return parseToolResult(step.return);
+						}
+					}
+					return parseToolResult(undefined);
+				},
+			};
+			if (spec.executionMode !== undefined) tool.executionMode = spec.executionMode;
+			if (spec.prepareArguments !== undefined) {
+				tool.prepareArguments = (callArgs) => {
+					const prep = spec.prepareArguments;
+					if (prep && prep.mode === "script" && Array.isArray(prep.script)) {
+						for (const pair of prep.script) {
+							if (pair && jsonEq(pair.in, callArgs)) return pair.out;
+						}
+					}
+					return callArgs;
+				};
+			}
+			return tool;
+		};
+
+		// Hook shims mirroring the Rust parse_before/parse_after: a "throw"
+		// string rejects; block/reason/terminate/content/details/
+		// structuredContent/usage/isError keep only their well-typed values
+		// (null is treated as absent, exactly like the Rust filters).
+		const makeBefore = (rawSpec) => {
+			const spec = rawSpec === undefined || rawSpec === null ? {} : rawSpec;
+			return async () => {
+				if (typeof spec.throw === "string") throw new Error(spec.throw);
+				const out = {};
+				if (typeof spec.block === "boolean") out.block = spec.block;
+				if (typeof spec.reason === "string") out.reason = spec.reason;
+				if (typeof spec.terminate === "boolean") out.terminate = spec.terminate;
+				return out;
+			};
+		};
+		const makeAfter = (rawSpec) => {
+			const spec = rawSpec === undefined || rawSpec === null ? {} : rawSpec;
+			return async () => {
+				if (typeof spec.throw === "string") throw new Error(spec.throw);
+				const out = {};
+				if (spec.content !== undefined && spec.content !== null) out.content = Array.isArray(spec.content) ? spec.content : [];
+				if (spec.details !== undefined && spec.details !== null) out.details = spec.details;
+				if (spec.structuredContent !== undefined && spec.structuredContent !== null) out.structuredContent = spec.structuredContent;
+				if (spec.usage !== undefined && spec.usage !== null) out.usage = spec.usage;
+				if (typeof spec.isError === "boolean") out.isError = spec.isError;
+				if (typeof spec.terminate === "boolean") out.terminate = spec.terminate;
+				return out;
+			};
+		};
+
+		const updates = [];
+		let outcome;
+		try {
+			outcome = await runToolCall(args.toolCall, {
+				tools: args.tools.map(makeTool),
+				assistantMessage: args.assistantMessage,
+				context: { messages: contextMessages, tools: args.contextTools ?? [] },
+				...(args.beforeToolCall !== undefined ? { beforeToolCall: makeBefore(args.beforeToolCall) } : {}),
+				...(args.afterToolCall !== undefined ? { afterToolCall: makeAfter(args.afterToolCall) } : {}),
+				onUpdate: (partialResult) => {
+					updates.push(partialResult);
+				},
+			});
+		} finally {
+			performance.now = realPerfNow;
+		}
+		return { result: { outcome, updates } };
 	}
 
 	return undefined;
