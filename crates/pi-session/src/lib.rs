@@ -16,4 +16,5 @@
 //! so no library code reads ambient state.
 
 pub mod agent_session;
+pub mod mcp_config;
 pub mod retry_error;

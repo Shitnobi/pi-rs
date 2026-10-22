@@ -1682,6 +1682,105 @@ async function runModule(tool, args, cwd) {
 				throw new Error("unknown mcp-tools fn: " + args.fn);
 		}
 	}
+	if (tool === "mcp-config") {
+		// extensions/mcp/config.js: loadMcpConfig + update/add/remove over a
+		// per-case temp fixture. Results are <base>-normalized and the final
+		// files are read back relative to the base (the Rust side drives an
+		// in-memory file map rooted at the literal "<base>").
+		const { pathToFileURL } = require("url");
+		const fs = require("fs");
+		const os = require("os");
+		const mod = await import(pathToFileURL(path.join(distDir, "extensions", "mcp", "config.js")).href);
+		const files = parityValidateFiles(args.files);
+		if (!Array.isArray(args.steps)) throw new Error("missing steps");
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parity-mcf-"));
+		parityMaterialize(files, base);
+		const optStr = (obj, key, msg) => {
+			if (obj[key] === undefined || obj[key] === null) return undefined;
+			if (typeof obj[key] !== "string") throw new Error(msg);
+			return obj[key];
+		};
+		const optBool = (obj, key, msg) => {
+			if (obj[key] === undefined || obj[key] === null) return undefined;
+			if (typeof obj[key] !== "boolean") throw new Error(msg);
+			return obj[key];
+		};
+		const results = [];
+		try {
+			for (const step of args.steps) {
+				if (step === null || typeof step !== "object" || Array.isArray(step)) {
+					throw new Error("steps entries must be objects");
+				}
+				if (typeof step.op !== "string") throw new Error("missing op");
+				if (step.op === "load") {
+					const agentDir = optStr(step, "agentDir", "agentDir must be a string") ?? "agent";
+					const cwd = optStr(step, "cwd", "cwd must be a string") ?? "cwd";
+					const projectTrusted = optBool(step, "projectTrusted", "projectTrusted must be a boolean") ?? false;
+					const loaded = mod.loadMcpConfig({
+						agentDir: parityJoinRel(base, agentDir),
+						cwd: parityJoinRel(base, cwd),
+						projectTrusted,
+					});
+					results.push(parityNormalizeBase(loaded, base));
+				} else if (step.op === "update") {
+					const filePath = optStr(step, "path", "path must be a string");
+					if (filePath === undefined) throw new Error("missing path");
+					const name = optStr(step, "name", "name must be a string");
+					if (name === undefined) throw new Error("missing name");
+					const patchIn = step.patch ?? {};
+					if (patchIn === null || typeof patchIn !== "object" || Array.isArray(patchIn)) {
+						throw new Error("patch must be an object");
+					}
+					const patch = {};
+					const enabled = optBool(patchIn, "enabled", "patch.enabled must be a boolean");
+					if (enabled !== undefined) patch.enabled = enabled;
+					const exposure = optStr(patchIn, "exposure", "patch.exposure must be a string");
+					if (exposure !== undefined) patch.exposure = exposure;
+					const override = optBool(step, "override", "override must be a boolean") ?? false;
+					try {
+						mod.updateMcpServerConfig(parityJoinRel(base, filePath), name, patch, { override });
+						results.push(null);
+					} catch (e) {
+						results.push(parityNormalizeBase({ error: e && e.message !== undefined ? e.message : String(e) }, base));
+					}
+				} else if (step.op === "add") {
+					const filePath = optStr(step, "path", "path must be a string");
+					if (filePath === undefined) throw new Error("missing path");
+					const name = optStr(step, "name", "name must be a string");
+					if (name === undefined) throw new Error("missing name");
+					if (step.config === undefined) throw new Error("missing config");
+					try {
+						results.push(mod.addMcpServerConfig(parityJoinRel(base, filePath), name, step.config));
+					} catch (e) {
+						results.push(parityNormalizeBase({ error: e && e.message !== undefined ? e.message : String(e) }, base));
+					}
+				} else if (step.op === "remove") {
+					const filePath = optStr(step, "path", "path must be a string");
+					if (filePath === undefined) throw new Error("missing path");
+					const name = optStr(step, "name", "name must be a string");
+					if (name === undefined) throw new Error("missing name");
+					try {
+						results.push(mod.removeMcpServerConfig(parityJoinRel(base, filePath), name));
+					} catch (e) {
+						results.push(parityNormalizeBase({ error: e && e.message !== undefined ? e.message : String(e) }, base));
+					}
+				} else {
+					throw new Error("unknown mcp-config op: " + step.op);
+				}
+			}
+			const outFiles = {};
+			(function walk(dir, prefix) {
+				for (const entry of fs.readdirSync(dir).sort()) {
+					const p = path.join(dir, entry);
+					if (fs.statSync(p).isDirectory()) walk(p, prefix + entry + "/");
+					else outFiles[prefix + entry] = fs.readFileSync(p, "utf8");
+				}
+			})(base, "");
+			return { results, files: outFiles };
+		} finally {
+			fs.rmSync(base, { recursive: true, force: true });
+		}
+	}
 	if (tool === "tool-search") {
 		const tsm = require(path.join(distDir, "extensions", "tool-search", "tool.js"));
 		switch (args.fn) {

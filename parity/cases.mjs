@@ -12923,6 +12923,178 @@ cases.push(
 		{ op: "api", key: "a", steps: [{ step: "eventsEmit", channel: "chan", data: { n: 3 } }] },
 	]),
 
+	// mcp-config (extensions/mcp/config.ts port): loadMcpConfig merge
+	// semantics, override entries, collected validation errors, and the
+	// update/add/remove edit-and-write helpers (default-deleting patches,
+	// indent sniffing, pretty-write byte-exactness). Each case materializes
+	// `files` under a per-side temp base; the final file map is compared.
+	...(() => {
+		const mcf = (name, files, steps) => ({ tool: "mcp-config", name: "mcf/" + name, args: { files, steps } });
+		const c = [];
+		const L = (name, files, options) => c.push(mcf(name, files, [{ op: "load", ...options }]));
+		const G = "agent/mcp.json";
+		const P = "cwd/.pi/mcp.json";
+		const both = (g, p) => ({ [G]: g, [P]: p });
+
+		// --- load: discovery and merging ---
+		L("global-only", { [G]: '{"mcpServers":{"fs":{"command":"npx","args":["-y","pkg"]},"docs":{"url":"https://e/mcp","headers":{"Authorization":"Bearer t"}}}}' }, { agentDir: "agent", cwd: "cwd", projectTrusted: false });
+		L("global-missing", {}, { agentDir: "agent", cwd: "cwd", projectTrusted: false });
+		L("defaults", { [G]: '{"mcpServers":{}}' }, {});
+		L("project-only-trusted", { [P]: '{"mcpServers":{"x":{"url":"https://e/mcp"}}}' }, { projectTrusted: true });
+		L("project-untrusted", { [P]: '{"mcpServers":{"x":{"url":"https://e/mcp"}}}' }, { projectTrusted: false });
+		L("project-replaces-global", both('{"mcpServers":{"fs":{"command":"npx"}}}', '{"mcpServers":{"fs":{"command":"local","args":["--x"]}}}'), { projectTrusted: true });
+		L("disabled-included", { [G]: '{"mcpServers":{"fs":{"command":"npx","enabled":false}}}' }, {});
+		L("extra-top-level-keys", { [G]: '{"autoEnableCodemode":true,"other":[1,2.5],"mcpServers":{"x":{"command":"bin"}},"tail":null}' }, {});
+		L("insertion-order", { [G]: '{"mcpServers":{"b":{"command":"b"},"a":{"command":"a"},"c":{"command":"c"}}}' }, { projectTrusted: true });
+
+		// --- load: project override entries ---
+		L("override-enabled", both('{"mcpServers":{"fs":{"command":"npx"}}}', '{"mcpServers":{"fs":{"enabled":false}}}'), { projectTrusted: true });
+		L("override-exposure", both('{"mcpServers":{"fs":{"command":"npx"}}}', '{"mcpServers":{"fs":{"exposure":"deferred"}}}'), { projectTrusted: true });
+		L("override-toolemposure", both('{"mcpServers":{"fs":{"command":"npx"}}}', '{"mcpServers":{"fs":{"toolExposure":{"read":"direct","write*":"hidden"}}}}'), { projectTrusted: true });
+		L("override-all-keys", both('{"mcpServers":{"fs":{"command":"npx"}}}', '{"mcpServers":{"fs":{"enabled":true,"exposure":"hidden","toolExposure":{"t":"deferred"}}}}'), { projectTrusted: true });
+		L("override-keeps-credentials", both('{"mcpServers":{"docs":{"url":"https://e/mcp","headers":{"Authorization":"Bearer t"},"auth":{"provider":"p"},"oauth":{"scope":"s"}}}}', '{"mcpServers":{"docs":{"enabled":false,"exposure":"direct"}}}'), { projectTrusted: true });
+		L("override-updates-in-place", both('{"mcpServers":{"a":{"command":"a"},"fs":{"command":"npx"},"z":{"command":"z"}}}', '{"mcpServers":{"fs":{"enabled":false}}}'), { projectTrusted: true });
+		L("override-alias-resolution", both('{"mcpServers":{"fs":{"command":"npx","exposure":"codemode-deferred","toolExposure":{"t":"codemode-deferred"}}}}', '{"mcpServers":{"fs":{"exposure":"direct"}}}'), { projectTrusted: true });
+		L("override-no-base", { [P]: '{"mcpServers":{"x":{"enabled":false}}}' }, { projectTrusted: true });
+		L("override-extra-key", both('{"mcpServers":{"fs":{"command":"npx"}}}', '{"mcpServers":{"fs":{"enabled":false,"description":"no"}}}'), { projectTrusted: true });
+		L("override-empty-object", both('{"mcpServers":{"fs":{"command":"npx"}}}', '{"mcpServers":{"fs":{}}}'), { projectTrusted: true });
+		L("override-invalid-exposure", both('{"mcpServers":{"fs":{"command":"npx"}}}', '{"mcpServers":{"fs":{"exposure":"bogus"}}}'), { projectTrusted: true });
+		L("override-raw-entry-not-object", both('{"mcpServers":{"fs":{"command":"npx"}}}', '{"mcpServers":{"fs":"str"}}'), { projectTrusted: true });
+		L("override-type-only-is-definition", both('{"mcpServers":{"fs":{"command":"npx"}}}', '{"mcpServers":{"fs":{"type":"stdio"}}}'), { projectTrusted: true });
+		L("override-command-null-is-definition", both('{"mcpServers":{"fs":{"command":"npx"}}}', '{"mcpServers":{"fs":{"command":null,"enabled":false}}}'), { projectTrusted: true });
+
+		// --- load: auth and namespace rules ---
+		L("auth-in-project", { [P]: '{"mcpServers":{"x":{"url":"https://e/mcp","auth":{"provider":"p"}}}}' }, { projectTrusted: true });
+		L("auth-null-in-project", { [P]: '{"mcpServers":{"x":{"url":"https://e/mcp","auth":null}}}' }, { projectTrusted: true });
+		L("auth-zero-in-project", { [P]: '{"mcpServers":{"x":{"url":"https://e/mcp","auth":0}}}' }, { projectTrusted: true });
+		L("auth-stdio-project-ok", { [P]: '{"mcpServers":{"x":{"command":"bin","auth":{"provider":"p"}}}}' }, { projectTrusted: true });
+		L("auth-url-null-stdio-project", { [P]: '{"mcpServers":{"x":{"url":null,"command":"bin","auth":{"provider":"p"}}}}' }, { projectTrusted: true });
+		L("namespace-clash-project", both('{"mcpServers":{"my-server":{"command":"npx"}}}', '{"mcpServers":{"my_server":{"command":"other"}}}'), { projectTrusted: true });
+		L("namespace-clash-same-file", { [G]: '{"mcpServers":{"a-b":{"command":"npx"},"a_b":{"command":"other"}}}' }, {});
+		L("namespace-no-clash", { [G]: '{"mcpServers":{"ab":{"command":"npx"},"a-b":{"command":"other"}}}' }, {});
+
+		// --- load: parse and shape errors ---
+		L("bad-json", { [G]: '{"a":}' }, {});
+		L("bad-json-empty-file", { [G]: "" }, {});
+		L("bad-json-bom", { [G]: "﻿{}" }, {});
+		L("not-object", { [G]: "[1,2]" }, {});
+		L("not-object-string", { [G]: '"x"' }, {});
+		L("mcpservers-array", { [G]: '{"mcpServers":[]}' }, {});
+		L("mcpservers-null", { [G]: '{"mcpServers":null}' }, {});
+		L("mcpservers-absent", { [G]: '{"other":1}' }, {});
+		L("duplicate-keys", { [G]: '{"mcpServers":{"a":{"command":"one"},"a":{"url":"https://x/mcp"}}}' }, {});
+		L("auto-enable-invalid", { [G]: '{"autoEnableCodemode":"yes","mcpServers":{}}' }, {});
+		L("auto-enable-global-false", { [G]: '{"autoEnableCodemode":false,"mcpServers":{}}' }, {});
+		L("auto-enable-project-overrides", both('{"autoEnableCodemode":false,"mcpServers":{}}', '{"autoEnableCodemode":true,"mcpServers":{}}'), { projectTrusted: true });
+		L("invalid-server-exposure", { [G]: '{"mcpServers":{"x":{"command":"bin","exposure":"nope"}}}' }, {});
+		L("invalid-server-enabled", { [G]: '{"mcpServers":{"x":{"command":"bin","enabled":"yes"}}}' }, {});
+		L("invalid-server-must-be-object", { [G]: '{"mcpServers":{"x":"str"}}' }, {});
+		L("invalid-server-needs-command-or-url", { [G]: '{"mcpServers":{"x":{}}}' }, {});
+		L("invalid-server-url", { [G]: '{"mcpServers":{"x":{"url":"ftp://e/mcp"}}}' }, {});
+		L("invalid-server-args", { [G]: '{"mcpServers":{"x":{"command":"bin","args":[1]}}}' }, {});
+		L("invalid-server-headers", { [G]: '{"mcpServers":{"x":{"url":"https://e/mcp","headers":{"a":1}}}}' }, {});
+		L("invalid-server-timeout", { [G]: '{"mcpServers":{"x":{"command":"bin","timeout":0}}}' }, {});
+		L("invalid-server-sse", { [G]: '{"mcpServers":{"x":{"type":"sse","url":"https://e/mcp"}}}' }, {});
+		L("invalid-server-name", { [G]: '{"mcpServers":{"bad name":{"command":"bin"}}}' }, {});
+		L("errors-from-both-files", both('{"mcpServers":{"a":{"command":"bin","enabled":"x"}}}', '{"mcpServers":{"a":{"command":"npx"},"b":{"enabled":false}}}'), { projectTrusted: true });
+
+		// --- update ---
+		c.push(mcf("update-deletes-defaults", { [G]: '{\n  "mcpServers": {\n    "x": {\n      "command": "bin",\n      "enabled": false,\n      "exposure": "deferred"\n    }\n  }\n}\n' }, [
+			{ op: "update", path: G, name: "x", patch: { enabled: true, exposure: "codemode" } },
+		]));
+		c.push(mcf("update-sets-values", { [G]: '{\n  "mcpServers": {\n    "x": {\n      "command": "bin",\n      "enabled": true\n    }\n  }\n}\n' }, [
+			{ op: "update", path: G, name: "x", patch: { enabled: false, exposure: "hidden" } },
+		]));
+		c.push(mcf("update-override-keeps-defaults", { [P]: '{\n  "mcpServers": {\n    "x": {\n      "enabled": false\n    }\n  }\n}\n' }, [
+			{ op: "update", path: P, name: "x", patch: { enabled: true, exposure: "codemode" } },
+		]));
+		c.push(mcf("update-missing-throws", { [G]: '{"mcpServers":{"x":{"command":"bin"}}}' }, [
+			{ op: "update", path: G, name: "y", patch: { enabled: true } },
+		]));
+		c.push(mcf("update-non-record-entry-throws", { [G]: '{"mcpServers":{"x":"str"}}' }, [
+			{ op: "update", path: G, name: "x", patch: { enabled: true } },
+		]));
+		c.push(mcf("update-missing-with-override", { [G]: '{"mcpServers":{"x":{"command":"bin"}}}' }, [
+			{ op: "update", path: G, name: "y", patch: { enabled: false }, override: true },
+		]));
+		c.push(mcf("update-override-no-mcpservers-key", { [G]: '{"other":1}' }, [
+			{ op: "update", path: G, name: "y", patch: { enabled: false }, override: true },
+		]));
+		c.push(mcf("update-indent-four-spaces", { [G]: '{\n    "mcpServers": {\n        "x": {\n            "command": "bin"\n        }\n    }\n}\n' }, [
+			{ op: "update", path: G, name: "x", patch: { enabled: false } },
+		]));
+		c.push(mcf("update-indent-tab", { [G]: '{\n\t"mcpServers": {\n\t\t"x": {"command": "bin"}\n\t}\n}\n' }, [
+			{ op: "update", path: G, name: "x", patch: { enabled: false } },
+		]));
+		c.push(mcf("update-indent-long-truncated", { [G]: '{\n               "mcpServers": {\n                    "x": {"command": "bin"}\n               }\n}\n' }, [
+			{ op: "update", path: G, name: "x", patch: { enabled: false } },
+		]));
+		c.push(mcf("update-indent-first-indented-line-wins", { [G]: '{"a":1,\n    "mcpServers": {"x": {"command": "bin"}}\n}\n' }, [
+			{ op: "update", path: G, name: "x", patch: { enabled: false } },
+		]));
+		c.push(mcf("update-bad-json-throws-raw", { [G]: "{" }, [
+			{ op: "update", path: G, name: "x", patch: { enabled: true } },
+		]));
+		c.push(mcf("update-empty-file-throws", { [G]: "" }, [
+			{ op: "update", path: G, name: "x", patch: { enabled: true } },
+		]));
+		c.push(mcf("update-mcpservers-not-object-throws", { [G]: '{"mcpServers":5}' }, [
+			{ op: "update", path: G, name: "x", patch: { enabled: true } },
+		]));
+		c.push(mcf("update-missing-file-creates", {}, [
+			{ op: "update", path: "new/dir/mcp.json", name: "x", patch: { enabled: false }, override: true },
+		]));
+		c.push(mcf("update-no-patch-is-noop-write", { [G]: '{"mcpServers":{"x":{"command":"bin"}}}\n' }, [
+			{ op: "update", path: G, name: "x", patch: {} },
+		]));
+
+		// --- add / remove ---
+		c.push(mcf("add-creates-file", {}, [
+			{ op: "add", path: "new/dir/mcp.json", name: "x", config: { command: "bin", args: ["--a"] } },
+		]));
+		c.push(mcf("add-replaces-keeps-position", { [G]: '{"mcpServers":{"x":{"command":"old"},"y":{"command":"y"}}}' }, [
+			{ op: "add", path: G, name: "x", config: { url: "https://e/mcp" } },
+			{ op: "add", path: G, name: "z", config: { command: "z" } },
+		]));
+		c.push(mcf("add-keeps-other-content", { [G]: '{\n  "before": [1, 2.5, "s"],\n  "mcpServers": {},\n  "after": {"deep": [true, null]}\n}\n' }, [
+			{ op: "add", path: G, name: "x", config: { command: "bin" } },
+		]));
+		c.push(mcf("add-bad-json-throws-raw", { [G]: "not json" }, [
+			{ op: "add", path: G, name: "x", config: { command: "bin" } },
+		]));
+		c.push(mcf("remove-existing", { [G]: '{"mcpServers":{"x":{"command":"x"},"y":{"command":"y"}}}' }, [
+			{ op: "remove", path: G, name: "x" },
+		]));
+		c.push(mcf("remove-missing-name-no-write", { [G]: '{"mcpServers":{"x":{"command":"x"}}}\n' }, [
+			{ op: "remove", path: G, name: "y" },
+		]));
+		c.push(mcf("remove-missing-file", {}, [
+			{ op: "remove", path: "nope/mcp.json", name: "x" },
+		]));
+		c.push(mcf("remove-empty-mcpservers", { [G]: '{"mcpServers":{"x":{"command":"x"}}}' }, [
+			{ op: "remove", path: G, name: "x" },
+		]));
+
+		// --- round trip: writes are readable by the loader ---
+		c.push(mcf("round-trip", { [G]: '{"mcpServers":{"fs":{"command":"npx","enabled":false}}}' }, [
+			{ op: "load", agentDir: "agent", cwd: "cwd", projectTrusted: false },
+			{ op: "update", path: G, name: "fs", patch: { enabled: true } },
+			{ op: "load", agentDir: "agent", cwd: "cwd", projectTrusted: false },
+			{ op: "add", path: P, name: "fs", config: { enabled: false } },
+			{ op: "load", agentDir: "agent", cwd: "cwd", projectTrusted: true },
+			{ op: "remove", path: P, name: "fs" },
+			{ op: "load", agentDir: "agent", cwd: "cwd", projectTrusted: true },
+		]));
+
+		// --- harness argument errors ---
+		c.push({ tool: "mcp-config", name: "mcf/err-missing-steps", args: { files: {} } });
+		c.push({ tool: "mcp-config", name: "mcf/err-bad-files", args: { files: [1], steps: [] } });
+		c.push({ tool: "mcp-config", name: "mcf/err-bad-patch", args: { files: {}, steps: [{ op: "update", path: "a", name: "x", patch: 5 }] } });
+		c.push({ tool: "mcp-config", name: "mcf/err-unknown-op", args: { files: {}, steps: [{ op: "bogus" }] } });
+
+		return c;
+	})(),
+
 	// -- harness error paths --------------------------------------------------------
 	{ tool: "extension-runner", name: "exr/missing-ops", args: {} },
 );

@@ -171,7 +171,9 @@ fn js_stringify_pretty(value: &Value) -> String {
 // Node-compatible JSON.parse (load path only)
 // ============================================================================
 
-/// `JSON.parse` with Node 24 (V8) error messages. Coverage of the observed
+/// `JSON.parse` with Node 24 (V8) error messages. Public so other modules
+/// with collected `${path}: ${message}` errors (e.g. pi-session's
+/// mcp_config) can reuse the exact message strings. Coverage of the observed
 /// message shapes (probed under Node 24):
 /// - "Unexpected end of JSON input" (truncated values, `[`/`,` at value
 ///   position, keyword literals cut short, whitespace-only input)
@@ -192,7 +194,7 @@ fn js_stringify_pretty(value: &Value) -> String {
 /// input), lone-surrogate escapes (Rust strings cannot hold them; U+FFFD is
 /// substituted), and position units beyond ASCII (V8 counts UTF-16 units,
 /// mirrored here).
-fn parse_json_like(input: &str) -> Result<Value, String> {
+pub fn parse_json_like(input: &str) -> Result<Value, String> {
 	struct Parser<'a> {
 		chars: Vec<char>,
 		/// UTF-16 position of `chars[i]`.

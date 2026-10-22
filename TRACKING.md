@@ -1490,7 +1490,31 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       incl. filesystem snapshots). Harness fix found during
       smoke: projectTrust omits the `result` key when undefined
       (JS undefined-omitted JSON).
-- [ ] Remaining roadmap (see docs/plans/): rest of extension-runner
-      real port (jiti/path discovery, command/tool execution,
-      ExtensionContext construction — replacing remaining fakes),
-      tools/* slices, shared typebox-walker refactor.
+- [x] **Phase 4 tranche 2 — mcp-config (extensions/mcp/config.ts).**
+      mcp_config.rs (~700 LOC, TS line→Rust item map in module
+      docs): readConfigFile/loadMcpConfig (global mcp.json +
+      trusted `<cwd>/.pi/mcp.json`; project entries replace
+      same-name globals, override-only entries patch just
+      enabled/exposure/toolExposure keeping credentials;
+      autoEnableCodemode default true, project overrides),
+      update/add/removeMcpServerConfig with default-deleting
+      patch semantics and JS `JSON.stringify(v, null, gap)`
+      pretty-writes (gap truncated to 10, indent sniffing).
+      All fs behind `McpConfigFs` trait (in-memory map in
+      harness + unit tests, `RealMcpConfigFs` std::fs adapter).
+      JSON parsing reuses `pi_core::settings_manager::
+      parse_json_like` (now pub) for byte-exact Node-24 JSON
+      parse errors. Preserve-order spread merges. Parity
+      harness `mcp-config`, 83 cases (mcf/) covering every
+      override/validation/patch/indent branch. Suite
+      **2726/2726** (full parity incl. filesystem snapshots).
+      One TS-harness-only fix (thrown-error `<base>`
+      normalization); no Rust divergences from dist ground
+      truth.
+- [ ] Remaining roadmap (see docs/plans/phase3-mcp-extensions.md
+      steps 5-10): mcp_resources (pi-core), pi-extensions crate
+      (mcp log/transport/fake + runtime connection state
+      machine), extension-runner remaining slices (discovery,
+      command/tool execution, real ExtensionContext), mcp
+      extension wiring + mcp-section, tools/* slices,
+      typebox-walker refactor.
