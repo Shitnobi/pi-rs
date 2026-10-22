@@ -5530,6 +5530,583 @@ export const cases = [
 		},
 	},
 
+	// ------------------------------------------------ mcp-resources (module)
+	// extensions/mcp/resources.ts: list_mcp_resources,
+	// list_mcp_resource_templates, read_mcp_resource over scripted fake
+	// servers (see the ts-harness "mcp-resources" entry for the scripting
+	// protocol: pages consumed per call, all*/readResource outcome specs,
+	// shared call log).
+	{
+		name: "mcr/definitions",
+		tool: "mcp-resources",
+		args: { fn: "definitions", exposure: "direct" },
+	},
+	{
+		name: "mcr/definitions-exposures",
+		tool: "mcp-resources",
+		args: { fn: "definitions", exposure: "codemode" },
+	},
+	{
+		name: "mcr/definitions-deferred",
+		tool: "mcp-resources",
+		args: { fn: "definitions", exposure: "deferred" },
+	},
+	{
+		name: "mcr/definitions-hidden",
+		tool: "mcp-resources",
+		args: { fn: "definitions", exposure: "hidden" },
+	},
+	{
+		name: "mcr/list-page",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "alpha" },
+			servers: [
+				{
+					name: "alpha",
+					timeoutMs: 1500,
+					resourcesPages: [
+						{
+							resources: [
+								{ uri: "file:///a.txt", name: "a", title: "A", mimeType: "text/plain", size: 10, _meta: { progress: 1 } },
+								{ uri: "file:///b.json", name: "b", description: "config", size: 2048.5 },
+							],
+							nextCursor: "c2",
+						},
+						{ resources: [{ uri: "file:///c.txt", name: "c" }] },
+					],
+				},
+			],
+		},
+	},
+	{
+		name: "mcr/list-page-no-next-cursor",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "alpha" },
+			servers: [
+				{ name: "alpha", resourcesPages: [{ resources: [{ uri: "u", name: "n" }] }] },
+			],
+		},
+	},
+	{
+		name: "mcr/list-page-null-next-cursor",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "alpha" },
+			servers: [
+				{ name: "alpha", resourcesPages: [{ resources: [], nextCursor: null }] },
+			],
+		},
+	},
+	{
+		name: "mcr/list-page-cursor-continuation",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "alpha", cursor: "c2" },
+			servers: [
+				{
+					name: "alpha",
+					resourcesPages: [
+						{ resources: [{ uri: "u1", name: "n1" }], nextCursor: "c2" },
+						{ resources: [{ uri: "u2", name: "n2" }], nextCursor: "c3" },
+					],
+				},
+			],
+		},
+	},
+	{
+		name: "mcr/list-page-empty",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "alpha" },
+			servers: [{ name: "alpha", resourcesPages: [{ resources: [] }] }],
+		},
+	},
+	{
+		name: "mcr/list-page-error",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "alpha" },
+			servers: [{ name: "alpha", resourcesPages: [{ error: "page fetch failed" }] }],
+		},
+	},
+	{
+		name: "mcr/list-page-reject-value",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "alpha" },
+			servers: [{ name: "alpha", resourcesPages: [{ reject: 42 }] }],
+		},
+	},
+	{
+		name: "mcr/list-page-unscripted",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "alpha" },
+			servers: [{ name: "alpha", allResources: { items: [] } }],
+		},
+	},
+	{
+		name: "mcr/list-all-multi",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: {},
+			servers: [
+				{
+					name: "zeta",
+					timeoutMs: 2000,
+					allResources: { items: [{ uri: "z://1", name: "z1" }, { uri: "z://2", name: "z2" }] },
+				},
+				{ name: "alpha", allResources: { items: [{ uri: "a://1", name: "a1", _meta: { x: 1 }, icons: [{ src: "i" }] }] } },
+				{ name: "mid", allResources: { items: [] } },
+			],
+		},
+	},
+	{
+		name: "mcr/list-all-sort-order",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: {},
+			servers: [
+				{ name: "zebra", allResources: { items: [{ uri: "z://1", name: "z" }] } },
+				{ name: "apple", allResources: { items: [{ uri: "a://1", name: "a" }] } },
+				{ name: "banana2", allResources: { items: [{ uri: "b2://1", name: "b2" }] } },
+				{ name: "banana10", allResources: { items: [{ uri: "b10://1", name: "b10" }] } },
+				{ name: "mcp-docs", allResources: { items: [{ uri: "d://1", name: "d1" }] } },
+				{ name: "mcpdocs", allResources: { items: [{ uri: "d://2", name: "d2" }] } },
+				{ name: "docs", allResources: { items: [{ uri: "d://3", name: "d3" }] } },
+				{ name: "docs", allResources: { items: [{ uri: "d://4", name: "d4" }] } },
+			],
+		},
+	},
+	{
+		name: "mcr/list-all-empty-servers",
+		tool: "mcp-resources",
+		args: { fn: "execute", tool: "list_mcp_resources", params: {}, servers: [] },
+	},
+	{
+		name: "mcr/list-all-mcp-app-filter",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: {},
+			servers: [
+				{
+					name: "apps",
+					allResources: {
+						items: [
+							{ uri: "ui://host/panel", name: "panel" },
+							{ uri: "file:///keep.txt", name: "keep" },
+							{ uri: "mem://x", name: "html", mimeType: "text/html; profile=mcp-app" },
+							{ uri: "mem://y", name: "html2", mimeType: "text/html;\tPROFILE = \"mcp-app\"" },
+							{ uri: "mem://z", name: "html3", mimeType: 'text/html;profile="mcp-app' },
+							{ uri: "mem://w", name: "web", mimeType: "text/html; profile=web-app" },
+							{ uri: "mem://v", name: "near", mimeType: "text/html;profileX=mcp-app" },
+							{ uri: "mem://u", name: "nosemi", mimeType: "profile=mcp-app" },
+							{ uri: "file:///icon.png", name: "icon", icons: [{ src: "x" }] },
+						],
+					},
+				},
+			],
+		},
+	},
+	{
+		name: "mcr/list-all-per-server-error",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: {},
+			servers: [
+				{ name: "a", allResources: { items: [{ uri: "a://1", name: "a1" }] } },
+				{ name: "b", allResources: { error: "connection lost" } },
+				{ name: "c", allResources: { items: [{ uri: "c://1", name: "c1" }] } },
+			],
+		},
+	},
+	{
+		name: "mcr/list-all-reject-non-error",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: {},
+			servers: [
+				{ name: "a", allResources: { reject: 42 } },
+				{ name: "b", allResources: { reject: { x: 1 } } },
+				{ name: "c", allResources: { reject: true } },
+				{ name: "d", allResources: { reject: "plain string" } },
+			],
+		},
+	},
+	{
+		name: "mcr/list-all-mixed",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: {},
+			servers: [
+				{ name: "broken", timeoutMs: 3000, allResources: { reject: 7 } },
+				{ name: "works", allResources: { items: [{ uri: "w://1", name: "w1", _meta: null }] } },
+				{ name: "empty", allResources: { items: [] } },
+			],
+		},
+	},
+	{
+		name: "mcr/list-all-blank-server-param",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "   " },
+			servers: [{ name: "alpha", allResources: { items: [{ uri: "a://1", name: "a1" }] } }],
+		},
+	},
+	{
+		name: "mcr/list-server-not-found",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "nope" },
+			servers: [
+				{ name: "zeta", allResources: { items: [] } },
+				{ name: "alpha", allResources: { items: [] } },
+			],
+		},
+	},
+	{
+		name: "mcr/list-server-not-found-no-servers",
+		tool: "mcp-resources",
+		args: { fn: "execute", tool: "list_mcp_resources", params: { server: "nope" }, servers: [] },
+	},
+	{
+		name: "mcr/list-server-whitespace",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "  alpha\t" },
+			servers: [{ name: "alpha", resourcesPages: [{ resources: [{ uri: "u", name: "n" }] }] }],
+		},
+	},
+	{
+		name: "mcr/list-cursor-without-server",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { cursor: "x" },
+			servers: [{ name: "alpha", allResources: { items: [] } }],
+		},
+	},
+	{
+		name: "mcr/list-blank-cursor-without-server",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { cursor: "   " },
+			servers: [{ name: "alpha", allResources: { items: [{ uri: "a://1", name: "a1" }] } }],
+		},
+	},
+	{
+		name: "mcr/list-non-string-server",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: 42 },
+			servers: [],
+		},
+	},
+	{
+		name: "mcr/list-non-string-cursor",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resources",
+			params: { server: "alpha", cursor: 42 },
+			servers: [{ name: "alpha", resourcesPages: [] }],
+		},
+	},
+	{
+		name: "mcr/templates-page",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resource_templates",
+			params: { server: "alpha" },
+			servers: [
+				{
+					name: "alpha",
+					templatesPages: [
+						{
+							resourceTemplates: [
+								{ uriTemplate: "mem://{key}", name: "mem", description: "by key", mimeType: "text/plain" },
+								{ uriTemplate: "ui://host/{panel}", name: "panel", _meta: { a: 1 } },
+							],
+							nextCursor: "t2",
+						},
+					],
+				},
+			],
+		},
+	},
+	{
+		name: "mcr/templates-all",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resource_templates",
+			params: {},
+			servers: [
+				{
+					name: "zeta",
+					allResourceTemplates: { items: [{ uriTemplate: "z://{id}", name: "z", mimeType: "text/html; profile=mcp-app" }] },
+				},
+				{
+					name: "alpha",
+					allResourceTemplates: { items: [{ uriTemplate: "a://{x}/{y}", name: "a", title: "A" }] },
+				},
+			],
+		},
+	},
+	{
+		name: "mcr/templates-all-errors",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resource_templates",
+			params: {},
+			servers: [
+				{ name: "a", allResourceTemplates: { items: [{ uriTemplate: "a://{x}", name: "a" }] } },
+				{ name: "b", allResourceTemplates: { error: "templates unavailable" } },
+				{ name: "c", allResourceTemplates: { reject: "raw" } },
+			],
+		},
+	},
+	{
+		name: "mcr/templates-page-error",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resource_templates",
+			params: { server: "alpha" },
+			servers: [{ name: "alpha", templatesPages: [{ reject: "no templates here" }] }],
+		},
+	},
+	{
+		name: "mcr/templates-page-unscripted",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "list_mcp_resource_templates",
+			params: { server: "alpha" },
+			servers: [{ name: "alpha", allResourceTemplates: { items: [] } }],
+		},
+	},
+	{
+		name: "mcr/read-single-text",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: "file:///a.txt" },
+			servers: [
+				{
+					name: "alpha",
+					readResource: {
+						contents: [{ uri: "file:///a.txt", mimeType: "text/plain", text: "hello world" }],
+					},
+				},
+			],
+		},
+	},
+	{
+		name: "mcr/read-multi",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: "file:///dir" },
+			servers: [
+				{
+					name: "alpha",
+					readResource: {
+						contents: [
+							{ uri: "file:///dir/x.txt", mimeType: "text/plain", text: "xx" },
+							{ mimeType: "text/plain", text: "no uri" },
+							{ uri: null, text: "null uri" },
+						],
+					},
+				},
+			],
+		},
+	},
+	{
+		name: "mcr/read-image",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: "file:///img.png" },
+			servers: [
+				{
+					name: "alpha",
+					readResource: {
+						contents: [{ uri: "file:///img.png", mimeType: "image/png", blob: "aGVsbG8=" }],
+					},
+				},
+			],
+		},
+	},
+	{
+		name: "mcr/read-empty",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: "mem://empty" },
+			servers: [{ name: "alpha", readResource: { contents: [] } }],
+		},
+	},
+	{
+		name: "mcr/read-null-contents",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: "mem://x" },
+			servers: [{ name: "alpha", readResource: { contents: null } }],
+		},
+	},
+	{
+		name: "mcr/read-non-object-contents",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: "mem://x" },
+			servers: [
+				{
+					name: "alpha",
+					readResource: { contents: [42, "str", { uri: "mem://real", text: "real" }] },
+				},
+			],
+		},
+	},
+	{
+		name: "mcr/read-meta-strip",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: "file:///a.txt" },
+			servers: [
+				{
+					name: "alpha",
+					readResource: {
+						contents: [{ uri: "file:///a.txt", mimeType: "text/plain", text: "data", _meta: { p: 1 } }],
+					},
+				},
+			],
+		},
+	},
+	{
+		name: "mcr/read-error",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: "mem://x" },
+			servers: [{ name: "alpha", readResource: { error: "read failed" } }],
+		},
+	},
+	{
+		name: "mcr/read-reject-value",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: "mem://x" },
+			servers: [{ name: "alpha", readResource: { reject: 42 } }],
+		},
+	},
+	{
+		name: "mcr/read-missing-server",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { uri: "mem://x" },
+			servers: [{ name: "alpha", readResource: { contents: [] } }],
+		},
+	},
+	{
+		name: "mcr/read-missing-uri",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: "   " },
+			servers: [{ name: "alpha", readResource: { contents: [] } }],
+		},
+	},
+	{
+		name: "mcr/read-non-string-uri",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: 42 },
+			servers: [{ name: "alpha", readResource: { contents: [] } }],
+		},
+	},
+	{
+		name: "mcr/read-server-not-found",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "nope", uri: "mem://x" },
+			servers: [{ name: "alpha", readResource: { contents: [] } }],
+		},
+	},
+	{
+		name: "mcr/read-unscripted-defaults-empty",
+		tool: "mcp-resources",
+		args: {
+			fn: "execute",
+			tool: "read_mcp_resource",
+			params: { server: "alpha", uri: "mem://x" },
+			servers: [{ name: "alpha" }],
+		},
+	},
+
 	// -------------------------------------------------- tool-search (module)
 	// extensions/tool-search/tool.ts: tokenizer, documents, BM25 ranker.
 	{

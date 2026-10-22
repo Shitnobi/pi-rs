@@ -691,7 +691,27 @@ pub fn to_llm_content(result: &CallToolResult) -> Vec<LlmContent> {
 
 /// Model-facing content of one block of `server`'s result
 /// (`blockToContent`, L206).
-fn block_to_content(server: &str, block: &ContentBlock, options: &ConvertMcpResultOptions) -> Vec<LlmContent> {
+/// The right-hand operand of JS `key in value` in V8 error messages:
+/// `String(value)` for the non-object shapes (`"blob" in 42`).
+fn js_in_operand(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Object(_) => "[object Object]".to_string(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::Null => String::new(),
+                other => js_in_operand(other),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    }
+}
+
+fn block_to_content(server: &str, block: &ContentBlock, options: &ConvertMcpResultOptions) -> Result<Vec<LlmContent>, String> {
     if block.block_type() == "resource_link" {
         let mut details: Vec<String> = Vec::new();
         if let Some(mime_type) = block.mime_type() {
@@ -709,7 +729,7 @@ fn block_to_content(server: &str, block: &ContentBlock, options: &ConvertMcpResu
             Some(d) if !d.is_empty() => format!(": {}", d),
             _ => String::new(),
         };
-        return vec![LlmContent::Text {
+        return Ok(vec![LlmContent::Text {
             text: format!(
                 "[Resource {} \"{}\"{}{}{}]",
                 block.uri().unwrap_or("undefined"),
@@ -719,30 +739,43 @@ fn block_to_content(server: &str, block: &ContentBlock, options: &ConvertMcpResu
                 read
             ),
             text_signature: None,
-        }];
+        }]);
     }
     if block.block_type() == "resource" {
-        let resource = block.resource();
-        let has_blob = resource.map(|r| r.contains_key("blob")).unwrap_or(false);
-        let is_image = block_is_image_resource(resource);
+        // `"blob" in block.resource` throws (V8) for anything but an object —
+        // including an absent `resource` field (`in undefined`).
+        let resource = match block.fields.get("resource") {
+            None => {
+                return Err("Cannot use 'in' operator to search for 'blob' in undefined".to_string())
+            }
+            Some(Value::Object(map)) => map,
+            Some(other) => {
+                return Err(format!(
+                    "Cannot use 'in' operator to search for 'blob' in {}",
+                    js_in_operand(other)
+                ))
+            }
+        };
+        let has_blob = resource.contains_key("blob");
+        let is_image = block_is_image_resource(Some(resource));
         if has_blob && !is_image {
-            let get = |key: &str| resource.and_then(|r| r.get(key));
+            let get = |key: &str| resource.get(key);
             let uri = get("uri").and_then(Value::as_str).unwrap_or("undefined");
             let mime_type = get("mimeType").and_then(Value::as_str);
             let blob = get("blob").and_then(Value::as_str).unwrap_or_default();
             let data = base64_decode(blob);
             if is_text_mime_type(mime_type) {
-                return vec![LlmContent::Text {
+                return Ok(vec![LlmContent::Text {
                     text: String::from_utf8_lossy(&data).into_owned(),
                     text_signature: None,
-                }];
+        }]);
             }
             let kind = format!(
                 "{}, {}",
                 mime_type.unwrap_or("unknown type"),
                 format_size_number(data.len() as f64)
             );
-            return match (options.save_output)(OutputData::Bytes(data), &extension_of(uri)) {
+            return Ok(match (options.save_output)(OutputData::Bytes(data), &extension_of(uri)) {
                 Ok(path) => vec![LlmContent::Text {
                     text: format!("[Binary resource {} ({}) saved to {}]", uri, kind, path),
                     text_signature: None,
@@ -751,16 +784,24 @@ fn block_to_content(server: &str, block: &ContentBlock, options: &ConvertMcpResu
                     text: format!("[Binary resource {} ({}) could not be saved: {}]", uri, kind, reason),
                     text_signature: None,
                 }],
-            };
+            });
         }
     }
-    vec![block_to_llm_content(block)]
+    Ok(vec![block_to_llm_content(block)])
 }
 
 /// Model-facing content of `server`'s content blocks, before the output limit
 /// (`toModelContent`, L224).
-pub fn to_model_content(server: &str, blocks: &[ContentBlock], options: &ConvertMcpResultOptions) -> Vec<LlmContent> {
-    blocks.iter().flat_map(|block| block_to_content(server, block, options)).collect()
+pub fn to_model_content(
+    server: &str,
+    blocks: &[ContentBlock],
+    options: &ConvertMcpResultOptions,
+) -> Result<Vec<LlmContent>, String> {
+    let mut content = Vec::new();
+    for block in blocks {
+        content.extend(block_to_content(server, block, options)?);
+    }
+    Ok(content)
 }
 
 /// `McpToolDetails` (L57).
@@ -825,7 +866,7 @@ pub fn convert_mcp_result(
     // Without content blocks, toLlmContent falls back to the structured
     // content as JSON.
     let mut converted = if !blocks.is_empty() {
-        to_model_content(server, &blocks, options)
+        to_model_content(server, &blocks, options)?
     } else {
         to_llm_content(result)
     };
@@ -1282,7 +1323,7 @@ mod tests {
         };
         let saver = saver_ok();
         let options = ConvertMcpResultOptions { save_output: &saver, readable_resources: true };
-        let content = to_model_content("srv", &[block], &options);
+        let content = to_model_content("srv", &[block], &options).unwrap();
         assert_eq!(
             content,
             vec![text("[Resource ui://x/y.png \"T\" (image/png, 2.0KB): d. Read it with read_mcp_resource (server \"srv\")]")]
@@ -1301,7 +1342,7 @@ mod tests {
         // `resource_link` and never falls through to `toLlmContent`; an
         // empty description is falsy and drops out, and without
         // `readableResources` there is no read hint.
-        assert_eq!(content, vec![text("[Resource u \"n\"]")]);
+        assert_eq!(content.unwrap(), vec![text("[Resource u \"n\"]")]);
     }
 
     #[test]
@@ -1318,7 +1359,7 @@ mod tests {
         };
         let saver = saver_err();
         let options = ConvertMcpResultOptions { save_output: &saver, readable_resources: false };
-        let content = to_model_content("srv", &[block], &options);
+        let content = to_model_content("srv", &[block], &options).unwrap();
         assert_eq!(
             content,
             vec![text("[Binary resource file://x/data.bin (application/octet-stream, 2B) could not be saved: disk full]")]
@@ -1335,7 +1376,7 @@ mod tests {
         };
         let saver = saver_ok();
         let options = ConvertMcpResultOptions { save_output: &saver, readable_resources: false };
-        let content = to_model_content("srv", &[block], &options);
+        let content = to_model_content("srv", &[block], &options).unwrap();
         assert_eq!(
             content,
             vec![text("[Binary resource file://x/data.bin (application/octet-stream, 2B) saved to /tmp/pi-mcp/x.bin]")]
@@ -1356,7 +1397,7 @@ mod tests {
         };
         let saver = saver_ok();
         let options = ConvertMcpResultOptions { save_output: &saver, readable_resources: false };
-        assert_eq!(to_model_content("srv", &[block], &options), vec![text("héllo")]);
+        assert_eq!(to_model_content("srv", &[block], &options).unwrap(), vec![text("héllo")]);
         // Embedded image resources become images.
         let block = ContentBlock {
             fields: json!({
@@ -1368,7 +1409,7 @@ mod tests {
             .clone(),
         };
         assert_eq!(
-            to_model_content("srv", &[block], &options),
+            to_model_content("srv", &[block], &options).unwrap(),
             vec![LlmContent::Image { data: "QUJD".to_string(), mime_type: "image/png".to_string() }]
         );
     }

@@ -1511,10 +1511,28 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       One TS-harness-only fix (thrown-error `<base>`
       normalization); no Rust divergences from dist ground
       truth.
+- [x] **Phase 4 tranche 3 — mcp-resources (extensions/mcp/
+      resources.ts).** mcp_resources.rs (~600 LOC): McpResourceServer
+      trait (page/all/read seams, Err = JS-visible error
+      message), list orchestration (page vs all-pages,
+      localeCompare sort, allSettled per-server error collection
+      incl. non-Error rejections `[object Object]`, MCP-App
+      filtering via hand-ported `/;\s*profile="?mcp-app"?/i`
+      with JS \s semantics, `listed` server-tagging with
+      _meta/icons strip), read with multi-content `uri:` labels
+      (incl. undefined:/null:), 3 tool definitions with exact
+      schemas and injected save_output. Added js_trim +
+      js_locale_compare (UTF-16 code-unit compare) to js_string.
+      Genuine divergence fixed in mcp_tools: `blockToContent`
+      uses `"blob" in block.resource` — V8 throws for
+      non-object resource fields; block_to_content/
+      to_model_content now return Result with byte-exact
+      messages. Parity harness `mcp-resources`, 46 cases (mcr/).
+      Suite **2772/2772** (full parity incl. filesystem
+      snapshots).
 - [ ] Remaining roadmap (see docs/plans/phase3-mcp-extensions.md
-      steps 5-10): mcp_resources (pi-core), pi-extensions crate
-      (mcp log/transport/fake + runtime connection state
-      machine), extension-runner remaining slices (discovery,
-      command/tool execution, real ExtensionContext), mcp
-      extension wiring + mcp-section, tools/* slices,
-      typebox-walker refactor.
+      steps 7-10): pi-extensions crate (mcp log/transport/fake
+      + runtime connection state machine), extension-runner
+      remaining slices (discovery, command/tool execution, real
+      ExtensionContext), mcp extension wiring + mcp-section,
+      tools/* slices, typebox-walker refactor.

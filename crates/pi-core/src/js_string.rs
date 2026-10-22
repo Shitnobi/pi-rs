@@ -35,6 +35,16 @@ pub fn is_js_whitespace_or_terminator(c: char) -> bool {
     )
 }
 
+/// JS `String.prototype.trim()`: strips leading and trailing chars that are
+/// ECMAScript WhiteSpace or LineTerminator.
+pub fn js_trim(s: &str) -> &str {
+    let start = match s.char_indices().find(|(_, c)| !is_js_whitespace_or_terminator(*c)) {
+        Some((i, _)) => i,
+        None => return "",
+    };
+    js_trim_end(&s[start..])
+}
+
 /// JS `Number.prototype.toFixed(1)` for the non-negative finite values we use
 /// (byte counts / KiB, exact binary fractions). ECMAScript picks the integer
 /// `n` such that `n / 10 - x` is closest to zero, ties to the larger `n`.
@@ -63,9 +73,49 @@ pub fn js_length(s: &str) -> usize {
     s.chars().map(|c| c.len_utf16()).sum()
 }
 
+/// JS `str1.localeCompare(str2)` under the default Node ICU locale (en-US),
+/// for the plain-ASCII names this port sorts (server names). Probed against
+/// the real Node runtime, and matching the conclusion already recorded in
+/// `crates/pi-providers/src/pi_ai/js.rs`: for ASCII alphanumeric-plus-
+/// punctuation strings ICU's en-US collation reduces to a UTF-16 code-unit
+/// comparison. Known divergence (documented, not exercised by the parity
+/// catalog): mixed-case ties (`"alpha"` vs `"Beta"`) and accented letters
+/// collate differently under ICU.
+pub fn js_locale_compare(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut ai = a.encode_utf16();
+    let mut bi = b.encode_utf16();
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => {
+                if x != y {
+                    return x.cmp(&y);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trim_matches_js() {
+        assert_eq!(js_trim("  x  "), "x");
+        assert_eq!(js_trim("\u{FEFF}x\u{00A0}"), "x");
+        assert_eq!(js_trim("   "), "");
+    }
+
+    #[test]
+    fn locale_compare_matches_js() {
+        // Node-verified: same order as `[...xs].sort((a, b) => a.localeCompare(b))`.
+        let mut names = vec!["zebra", "apple", "banana2", "banana10", "mcp-docs", "mcpdocs"];
+        names.sort_by(|a, b| js_locale_compare(a, b));
+        assert_eq!(names, vec!["apple", "banana10", "banana2", "mcp-docs", "mcpdocs", "zebra"]);
+    }
 
     #[test]
     fn trim_end_matches_js() {

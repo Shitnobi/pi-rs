@@ -14,6 +14,7 @@ pub mod jsdiff;
 pub mod js_math;
 pub mod mcp_servers;
 pub mod mcp_tools;
+pub mod mcp_resources;
 pub mod tool_search;
 pub mod normalize;
 pub mod paths;

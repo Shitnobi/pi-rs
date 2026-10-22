@@ -36,6 +36,7 @@ mod session_services_harness;
 mod session_stats_harness;
 mod extension_runner_harness;
 mod mcp_config_harness;
+mod mcp_resources_harness;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = run(&args);
@@ -262,6 +263,7 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "math" => return run_math_harness(&input),
         "mcp-servers" => return run_mcp_servers_harness(&input),
         "mcp-tools" => return run_mcp_tools_harness(&input),
+        "mcp-resources" => return mcp_resources_harness::run(&input),
         "tool-search" => return run_tool_search_harness(&input),
         "config-value" | "http-dispatcher" | "auth-guidance" | "models-store"
         | "runtime-credentials" | "virtual-models" => {
@@ -1063,7 +1065,7 @@ fn run_mcp_tools_harness(input: &Value) -> Result<Value, String> {
                 save_output: &fake_saver,
                 readable_resources: input["readableResources"].as_bool().unwrap_or(false),
             };
-            let content = mt::to_model_content(server, &blocks, &options);
+            let content = mt::to_model_content(server, &blocks, &options)?;
             let content = content
                 .iter()
                 .map(|c| serde_json::to_value(c))

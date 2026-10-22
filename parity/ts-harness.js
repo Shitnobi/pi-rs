@@ -18,6 +18,8 @@
  * - "mcp-servers": core/mcp-servers.js pure functions
  * - "mcp-tools": extensions/mcp/tools.js pure conversion functions (the
  *   output saver is a deterministic fake on both sides)
+ * - "mcp-resources": extensions/mcp/resources.js resource tools over
+ *   scripted fake servers (per-server failures, cursor pagination, call log)
  * - "tool-search": extensions/tool-search/tool.ts tokenizer/document/ranker
  * - "config-value": core/resolve-config-value.js config resolution
  * - "http-dispatcher": core/http-dispatcher.js idle-timeout parse/format
@@ -1680,6 +1682,100 @@ async function runModule(tool, args, cwd) {
 			}
 			default:
 				throw new Error("unknown mcp-tools fn: " + args.fn);
+		}
+	}
+	if (tool === "mcp-resources") {
+		const mr = require(path.join(distDir, "extensions", "mcp", "resources.js"));
+		// Scripted fake server, mirrored by the Rust harness
+		// (mcp_resources_harness.rs). Records every method call into the shared
+		// `log`; page entries are consumed one per call, an exhausted queue
+		// fails deterministically on both sides.
+		const mcrFakeServer = (spec, log) => {
+			const name = spec.name;
+			const timeoutMs = spec.timeoutMs ?? 10000;
+			const record = (method, extra) => {
+				const entry = { server: name, method, ...(extra || {}) };
+				entry.timeoutMs = timeoutMs;
+				log.push(entry);
+			};
+			const take = (method, queue) => {
+				const entry = queue.shift();
+				if (entry === undefined) throw new Error(`${method} not scripted for server "${name}"`);
+				if (entry.error !== undefined) throw new Error(entry.error);
+				if (entry.reject !== undefined) throw entry.reject;
+				return entry;
+			};
+			const applyOutcome = (outcome) => {
+				if (outcome === undefined || outcome === null) return [];
+				if (outcome.error !== undefined) throw new Error(outcome.error);
+				if (outcome.reject !== undefined) throw outcome.reject;
+				return outcome.items || [];
+			};
+			const pages = (spec.resourcesPages || []).slice();
+			const tpages = (spec.templatesPages || []).slice();
+			return {
+				name,
+				timeoutMs,
+				async resourcesPage(cursor) {
+					record("resourcesPage", cursor !== undefined ? { cursor } : undefined);
+					const entry = take("resourcesPage", pages);
+					return { resources: entry.resources || [], nextCursor: entry.nextCursor };
+				},
+				async resourceTemplatesPage(cursor) {
+					record("resourceTemplatesPage", cursor !== undefined ? { cursor } : undefined);
+					const entry = take("resourceTemplatesPage", tpages);
+					return { resourceTemplates: entry.resourceTemplates || [], nextCursor: entry.nextCursor };
+				},
+				async allResources() {
+					record("allResources");
+					return applyOutcome(spec.allResources);
+				},
+				async allResourceTemplates() {
+					record("allResourceTemplates");
+					return applyOutcome(spec.allResourceTemplates);
+				},
+				async readResource(uri) {
+					record("readResource", { uri });
+					const spec_r = spec.readResource;
+					if (spec_r && spec_r.error !== undefined) throw new Error(spec_r.error);
+					if (spec_r && spec_r.reject !== undefined) throw spec_r.reject;
+					return { contents: spec_r && spec_r.contents !== undefined ? spec_r.contents : [] };
+				},
+			};
+		};
+		switch (args.fn) {
+			case "definitions": {
+				const defs = mr.createMcpResourceToolDefinitions({ exposure: args.exposure, servers: () => [] });
+				return {
+					definitions: defs.map((d) => ({
+						name: d.name,
+						label: d.label,
+						description: d.description,
+						parameters: d.parameters,
+						outputSchema: d.outputSchema,
+						exposure: d.exposure,
+						annotations: d.annotations,
+					})),
+				};
+			}
+			case "execute": {
+				const log = [];
+				const servers = (args.servers || []).map((spec) => mcrFakeServer(spec, log));
+				const defs = mr.createMcpResourceToolDefinitions({
+					exposure: args.exposure || "direct",
+					servers: () => servers,
+				});
+				const def = defs.find((d) => d.name === args.tool);
+				if (!def) throw new Error("unknown tool: " + args.tool);
+				try {
+					const result = await def.execute("parity-call", args.params, undefined);
+					return { result, calls: log };
+				} catch (e) {
+					return { error: e && e.message !== undefined ? e.message : String(e), calls: log };
+				}
+			}
+			default:
+				throw new Error("unknown mcp-resources fn: " + args.fn);
 		}
 	}
 	if (tool === "mcp-config") {
