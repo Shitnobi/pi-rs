@@ -14,10 +14,14 @@
 // Pipeline mirrors the Rust test exactly: decode -> PNG roundtrip; resize
 // (2000x2000 cap, aspect-preserving, Math.round, Lanczos3); PNG + JPEG
 // (q80/85/70/55/40) encodes of the resized image.
-const fs = require("fs");
-const path = require("path");
+import { createRequire } from "node:module";
+import fs from "node:fs";
+import path from "node:path";
 
-const photon = require("/tmp/pi-repo/node_modules/@silvia-odwyer/photon-node/photon_rs.js");
+const PI_REPO = process.env.PI_REPO || "/home/shinobi/AI/pi-repo";
+const require = createRequire(import.meta.url);
+
+const photon = require(PI_REPO + "/node_modules/@silvia-odwyer/photon-node/photon_rs.js");
 const { PhotonImage, SamplingFilter } = photon;
 
 const DIR = "/tmp/imgtest";

@@ -16,6 +16,7 @@ pi-agent = { path = "../pi-agent" }
 pi-session = { path = "../pi-session" }
 pi-tools = { path = "../pi-tools" }
 pi-tui = { path = "../pi-tui" }
+pi-extensions = { path = "../pi-extensions" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }

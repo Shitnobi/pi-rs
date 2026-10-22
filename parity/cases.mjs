@@ -68,8 +68,14 @@ import { interactionCases } from "./wavec/interaction-cases.mjs";
 import { terminalImageCases } from "./waved/terminal-image-cases.mjs";
 import { markdownLexCases } from "./waved/markdown-lex-cases.mjs";
 // Ground-truth TS defaults, reused by the settings-schema valid-defaults
-// case (stays in sync with the TS tree automatically).
-import { SETTINGS_DEFAULTS } from "file:///tmp/pi-repo/packages/coding-agent/dist/core/settings-defaults.js";
+// case (stays in sync with the TS tree automatically). PI_REPO defaults to
+// the persistent reference checkout (the /tmp default predates the bwrap
+// sandbox, which gives every bash call a fresh /tmp).
+import { pathToFileURL } from "node:url";
+const PI_REPO = process.env.PI_REPO || "/home/shinobi/AI/pi-repo";
+const { SETTINGS_DEFAULTS } = await import(
+	pathToFileURL(PI_REPO + "/packages/coding-agent/dist/core/settings-defaults.js").href
+);
 import { latexCases } from "./waved/latex-cases.mjs";
 import { markdownRenderCases } from "./waved/markdown-render-cases.mjs";
 import { regressionCases } from "./regressions/index.mjs";
@@ -13668,6 +13674,133 @@ cases.push(
 		c.push({ tool: "mcp-config", name: "mcf/err-bad-files", args: { files: [1], steps: [] } });
 		c.push({ tool: "mcp-config", name: "mcf/err-bad-patch", args: { files: {}, steps: [{ op: "update", path: "a", name: "x", patch: 5 }] } });
 		c.push({ tool: "mcp-config", name: "mcf/err-unknown-op", args: { files: {}, steps: [{ op: "bogus" }] } });
+
+		return c;
+	})(),
+
+	// mcp-log (extensions/mcp/log.ts port): formatMcpLogMessage byte
+	// format (level/logger defaults, string vs JSON data, continuation
+	// indent, ISO timestamps) and McpServerLog append/rotation semantics
+	// (single-append lines, cached-size rotation with the external-rotation
+	// guard, ignored write errors). `{ unit, count }` file seeds cross the
+	// 5MB rotation threshold without megabyte payloads.
+	...(() => {
+		const mll = (name, files, steps) => ({ tool: "mcp-log", name: "mll/" + name, args: { files, steps } });
+		const F = (name, steps) => mll(name, {}, steps);
+		const fmt = (server, params, nowMs) => ({ op: "format", server, ...(params === undefined ? {} : { params }), nowMs });
+		const wr = (path, server, params, nowMs, extra) => ({
+			op: "write", path, server, ...(params === undefined ? {} : { params }), nowMs, ...(extra || {}),
+		});
+		const MB = 1024 * 1024;
+		const c = [];
+
+		// --- formatMcpLogMessage ---
+		c.push(F("fmt-string-data", [
+			fmt("fs", { level: "debug", logger: "mylog", data: "hello world" }, 0),
+			fmt("context7", { level: "warning", data: "careful" }, 1767225623123),
+		]));
+		c.push(F("fmt-object-data", [
+			fmt("fs", { data: { a: 1, b: "x", c: [1, 2], d: null } }, 0),
+			fmt("fs", { data: { nested: { deep: true } } }, 0),
+			fmt("fs", { data: {} }, 0),
+			fmt("fs", { data: [] }, 0),
+		]));
+		c.push(F("fmt-defaults", [
+			fmt("fs", {}, 0),
+			fmt("fs", undefined, 0),
+			fmt("fs", null, 0),
+			fmt("fs", { data: null }, 0),
+			fmt("fs", { level: null, logger: null, data: "x" }, 0),
+		]));
+		c.push(F("fmt-non-record-params", [
+			fmt("fs", "plain text", 0),
+			fmt("fs", 42, 0),
+			fmt("fs", 1.5, 0),
+			fmt("fs", true, 0),
+			fmt("fs", [1, "a", { b: 2 }], 0),
+		]));
+		c.push(F("fmt-level-logger-edges", [
+			fmt("fs", { level: 5, data: "x" }, 0),
+			fmt("fs", { level: "", data: "x" }, 0),
+			fmt("fs", { level: null, data: "x" }, 0),
+			fmt("fs", { logger: "", data: "x" }, 0),
+			fmt("fs", { logger: 7, data: "x" }, 0),
+			fmt("fs", { logger: "server.logger", level: "error", data: "boom" }, 0),
+		]));
+		c.push(F("fmt-multiline", [
+			fmt("fs", { data: "a\nb" }, 0),
+			fmt("fs", { data: "a\r\nb" }, 0),
+			fmt("fs", { data: "a\rb\nc" }, 0),
+			fmt("fs", { data: "\n" }, 0),
+			fmt("fs", { data: "line1\nline2\nline3" }, 0),
+		]));
+		c.push(F("fmt-iso-timestamps", [
+			fmt("fs", { data: "x" }, -1),
+			fmt("fs", { data: "x" }, 86400123),
+			fmt("fs", { data: "x" }, 253402300799999),
+		]));
+		c.push(F("fmt-number-formatting", [
+			fmt("fs", { data: 1e21 }, 0),
+			fmt("fs", { data: 0.000001 }, 0),
+			fmt("fs", { data: -0.5 }, 0),
+			fmt("fs", { data: 100 }, 0),
+		]));
+
+		// --- McpServerLog appends ---
+		c.push(F("write-creates-file", [wr("agent/mcp.log", "fs", { data: "first" }, 1000)]));
+		c.push(F("write-multiple-lines", [
+			wr("agent/mcp.log", "fs", { data: "one" }, 1000),
+			wr("agent/mcp.log", "fs", { level: "warning", data: "two" }, 2000),
+			wr("agent/mcp.log", "other", { logger: "l", data: "three" }, 3000),
+		]));
+		c.push(F("write-two-processes", [
+			wr("agent/mcp.log", "fs", { data: "cached" }, 1000),
+			wr("agent/mcp.log", "fs", { data: "fresh" }, 2000, { fresh: true }),
+			wr("agent/mcp.log", "fs", { data: "cached-again" }, 3000),
+		]));
+		c.push(F("write-multiline-indent", [
+			wr("agent/mcp.log", "fs", { data: "a\nb" }, 0),
+			wr("agent/mcp.log", "fs", { data: "c" }, 0),
+		]));
+		// The log path's parent is a seeded file: mkdirSync fails and the
+		// write is silently ignored.
+		c.push(mll("write-error-ignored", { afile: "seed" }, [
+			wr("afile/mcp.log", "fs", { data: "x" }, 0),
+			wr("afile/mcp.log", "fs", { data: "y" }, 0),
+		]));
+
+		// --- rotation ---
+		c.push(mll("rotate-over-threshold", { "logs/mcp.log": { unit: "x", count: 5 * MB + 1 } }, [
+			wr("logs/mcp.log", "fs", { data: "first" }, 0),
+			wr("logs/mcp.log", "fs", { data: "second" }, 0),
+		]));
+		c.push(mll("rotate-at-exact-threshold", { "logs/mcp.log": { unit: "x", count: 5 * MB } }, [
+			wr("logs/mcp.log", "fs", { data: "first" }, 0),
+			wr("logs/mcp.log", "fs", { data: "second" }, 1000),
+			wr("logs/mcp.log", "fs", { data: "third" }, 2000),
+		]));
+		c.push(mll("rotate-external-guard", { "logs/mcp.log": { unit: "x", count: 5 * MB - 10 } }, [
+			wr("logs/mcp.log", "fs", { data: "0123456789abcdef" }, 0),
+			{ op: "renameFile", from: "logs/mcp.log", to: "logs/mcp.log.1" },
+			wr("logs/mcp.log", "fs", { data: "after-external" }, 1000),
+		]));
+		c.push(mll("rotate-two-files-after", { "logs/mcp.log": { unit: "x", count: 5 * MB + 100 } }, [
+			wr("logs/mcp.log", "fs", { data: "rotates" }, 0),
+			wr("logs/mcp.log", "fs", { data: "stays" }, 1000),
+			wr("logs/mcp.log", "fs", { data: "more" }, 2000),
+		]));
+
+		// --- harness argument errors ---
+		c.push(F("err-missing-steps", undefined));
+		c.push(mll("err-bad-files", [1], []));
+		c.push(mll("err-bad-files-value", { a: { unit: "x", count: -1 } }, []));
+		c.push(mll("err-bad-step", {}, [5]));
+		c.push(mll("err-missing-op", {}, [{ server: "fs" }]));
+		c.push(mll("err-unknown-op", {}, [{ op: "bogus" }]));
+		c.push(mll("err-bad-server", {}, [{ op: "format", server: 5, nowMs: 0 }]));
+		c.push(mll("err-missing-server", {}, [{ op: "format", nowMs: 0 }]));
+		c.push(mll("err-bad-nowms", {}, [{ op: "format", server: "fs", nowMs: 1.5 }]));
+		c.push(mll("err-bad-fresh", {}, [{ op: "write", path: "a", server: "fs", fresh: "x" }]));
 
 		return c;
 	})(),

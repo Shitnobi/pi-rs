@@ -628,7 +628,7 @@ impl<H: NestedToolCallHost> NestedToolCallRunner<H> {
 /// JS `JSON.stringify` for a parsed JSON value: compact, insertion key
 /// order, V8 number formatting (integral floats print without a decimal
 /// point; exponents outside `[1e-6, 1e21)`).
-fn js_json_stringify(value: &Value) -> String {
+pub fn js_json_stringify(value: &Value) -> String {
 	match value {
 		Value::Null => "null".to_string(),
 		Value::Bool(b) => b.to_string(),

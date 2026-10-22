@@ -1530,6 +1530,28 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       messages. Parity harness `mcp-resources`, 46 cases (mcr/).
       Suite **2772/2772** (full parity incl. filesystem
       snapshots).
+- [x] **Phase 4 tranche 4 — mcp-log (extensions/mcp/log.ts) +
+      pi-extensions crate.** New `crates/pi-extensions` crate
+      (mcp/log.rs, ~420 LOC): `formatMcpLogMessage` byte format
+      (level/logger defaults incl. falsy-string edge cases, string
+      vs JSON data via `js_json_stringify` — now pub from
+      pi-core::nested_tool_calls —, multiline continuation
+      indent, V8 number formatting, ISO `toISOString` timestamps)
+      and `McpServerLog` append/rotation semantics (single-append
+      lines, cached-size rotation at 5MB with the
+      external-rotation stat guard, silently-ignored write
+      errors). All fs behind an injectable seam. Parity harness
+      `mcp-log` (TS side pins `Date` via a global constructor
+      swap), 27 cases (mll/) covering format edges, appends,
+      multi-process caching, rotation thresholds/guards, and
+      harness argument errors. Suite **2799/2799** (full parity
+      incl. filesystem snapshots). Also: mcp/transport.rs
+      (jsonrpc checks + McpTransport seam + FakeTransport,
+      ~520 LOC) landed ahead of its tranche; parity cases in the
+      next tranche. Parity infra now defaults PI_REPO to
+      ~/AI/pi-repo (persistent reference checkout) instead of
+      /tmp/pi-repo (wiped per bwrap bash call); photon ground
+      truth generator made ESM-correct.
 - [ ] Remaining roadmap (see docs/plans/phase3-mcp-extensions.md
       steps 7-10): pi-extensions crate (mcp log/transport/fake
       + runtime connection state machine), extension-runner

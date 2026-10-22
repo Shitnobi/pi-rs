@@ -467,6 +467,7 @@ version = "0.1.0"
 dependencies = [
  "pi-agent",
  "pi-core",
+ "pi-extensions",
  "pi-providers",
  "pi-session",
  "pi-tools",
@@ -483,6 +484,15 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-normalization",
+]
+
+[[package]]
+name = "pi-extensions"
+version = "0.1.0"
+dependencies = [
+ "pi-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

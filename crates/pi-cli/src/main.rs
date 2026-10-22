@@ -36,6 +36,7 @@ mod session_services_harness;
 mod session_stats_harness;
 mod extension_runner_harness;
 mod mcp_config_harness;
+mod mcp_log_harness;
 mod mcp_resources_harness;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -209,6 +210,7 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         }
         "extension-runner" => return extension_runner_harness::run(&input),
         "mcp-config" => return mcp_config_harness::run_mcp_config_harness(&input),
+        "mcp-log" => return mcp_log_harness::run_mcp_log_harness(&input),
         "agent-session-events" => return session_harness::run_agent_session_events_harness(&input),
         "agent-session-tools" => {
             return session_tools_harness::run_agent_session_tools_harness(&input)

@@ -70,7 +70,8 @@
  *   pinned Date.now + performance.now clocks
  */
 const path = require("path");
-const DIST = process.env.PI_DIST || "/tmp/pi-repo/packages/coding-agent/dist/index.js";
+const PI_REPO = process.env.PI_REPO || "/home/shinobi/AI/pi-repo";
+const DIST = process.env.PI_DIST || PI_REPO + "/packages/coding-agent/dist/index.js";
 const distDir = path.dirname(DIST);
 // The `crypto` ESM namespace snapshots named exports at creation (probed:
 // patching require("crypto").randomUUID AFTER any ESM `import ... from
@@ -100,7 +101,7 @@ async function runModule(tool, args, cwd) {
 		// The TUI package has no dist build; import the TS source directly
 		// (Node 24 type-stripping) so we always test the original source.
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src/utils.ts";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src/utils.ts";
 		const u = await import(pathToFileURL(TUI_SRC).href);
 		switch (args.fn) {
 			case "visibleWidth":
@@ -152,7 +153,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-fuzzy") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const f = await import(pathToFileURL(TUI_SRC + "/fuzzy.ts").href);
 		try {
 			switch (args.fn) {
@@ -172,7 +173,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-word-navigation") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const wn = await import(pathToFileURL(TUI_SRC + "/word-navigation.ts").href);
 		const { getWordSegmenter } = await import(pathToFileURL(TUI_SRC + "/utils.ts").href);
 		const atomic = Array.isArray(args.atomic) ? args.atomic : null;
@@ -197,7 +198,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-kill-ring") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const { KillRing } = await import(pathToFileURL(TUI_SRC + "/kill-ring.ts").href);
 		const ring = new KillRing();
 		const results = [];
@@ -223,7 +224,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-program-status") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const p = await import(pathToFileURL(TUI_SRC + "/program-status.ts").href);
 		try {
 			switch (args.fn) {
@@ -240,7 +241,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-colors") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const c = await import(pathToFileURL(TUI_SRC + "/colors.ts").href);
 		/** Parse a color argument: string (parsed), number (indexed), or object. */
 		const color = (value) => {
@@ -295,7 +296,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-keys") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const k = await import(pathToFileURL(TUI_SRC + "/keys.ts").href);
 		const results = [];
 		for (const c of args.cases || []) {
@@ -320,7 +321,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-stdin-buffer") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const { StdinBuffer } = await import(pathToFileURL(TUI_SRC + "/stdin-buffer.ts").href);
 		const k = await import(pathToFileURL(TUI_SRC + "/keys.ts").href);
 		// Deterministic timers: patch setTimeout/clearTimeout (the module only
@@ -394,7 +395,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-markdown-lex") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const md = await import(pathToFileURL(TUI_SRC + "/components/markdown.ts").href);
 		switch (args.fn) {
 			case "lex":
@@ -407,7 +408,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-latex") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const lx = await import(pathToFileURL(TUI_SRC + "/latex.ts").href);
 		switch (args.fn) {
 			case "render":
@@ -419,7 +420,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-markdown-render") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const md = await import(pathToFileURL(TUI_SRC + "/components/markdown.ts").href);
 		switch (args.fn) {
 			case "render": {
@@ -465,7 +466,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-terminal-image") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const ti = await import(pathToFileURL(TUI_SRC + "/terminal-image.ts").href);
 		// Stateful sub-cases: setup capabilities / cell dimensions first.
 		if (args.setup) {
@@ -540,7 +541,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-terminal-colors") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const t = await import(pathToFileURL(TUI_SRC + "/terminal-colors.ts").href);
 		switch (args.fn) {
 			case "parseOscColorResponse": {
@@ -555,7 +556,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-components") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const tui = await import(pathToFileURL(TUI_SRC + "/tui.ts").href);
 		const load = (name) => import(pathToFileURL(TUI_SRC + "/components/" + name + ".ts").href);
 		const [textMod, ttMod, spacerMod, boxMod, hsMod, vsMod, loaderMod, clMod, mrMod, svMod, inputMod, slMod, stlMod] =
@@ -824,7 +825,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-editor") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const { Editor } = await import(pathToFileURL(TUI_SRC + "/components/editor.ts").href);
 		// Identity theme (preset "default"): borderColor and every selectList
 		// member are (t) => t — the Rust side mirrors this exactly (like the
@@ -917,7 +918,7 @@ async function runModule(tool, args, cwd) {
 	}
 	if (tool === "tui-main" || tool === "tui-alt") {
 		const { pathToFileURL } = require("url");
-		const TUI_SRC = process.env.PI_TUI_SRC || "/tmp/pi-repo/packages/tui/src";
+		const TUI_SRC = process.env.PI_TUI_SRC || PI_REPO + "/packages/tui/src";
 		const tui = await import(pathToFileURL(TUI_SRC + "/tui.ts").href);
 		const mainMod = await import(pathToFileURL(TUI_SRC + "/tui-main-screen.ts").href);
 		const altMod = await import(pathToFileURL(TUI_SRC + "/tui-alt-screen.ts").href);
@@ -1877,6 +1878,119 @@ async function runModule(tool, args, cwd) {
 			fs.rmSync(base, { recursive: true, force: true });
 		}
 	}
+	if (tool === "mcp-log") {
+		// extensions/mcp/log.js: formatMcpLogMessage + McpServerLog over a
+		// per-case temp fixture. write() calls `new Date()` internally, so
+		// the global Date constructor is swapped for a pinned subclass
+		// while the steps run (each step's `nowMs` fixes it). Loggers are
+		// cached per path — the cached size drives rotation; `fresh: true`
+		// writes through a brand-new instance (a second process). Files
+		// values may be { unit, count } (unit repeated count times) so
+		// rotation cases can cross the 5MB threshold compactly. The final
+		// files are read back relative to the base.
+		const { pathToFileURL } = require("url");
+		const fs = require("fs");
+		const os = require("os");
+		const mod = await import(pathToFileURL(path.join(distDir, "extensions", "mcp", "log.js")).href);
+		if (args.files === undefined || args.files === null) {
+			// handled by validation below
+		} else if (typeof args.files !== "object" || Array.isArray(args.files)) {
+			throw new Error("files must be an object");
+		} else {
+			for (const v of Object.values(args.files)) {
+				const ok = typeof v === "string" ||
+					(v !== null && typeof v === "object" && !Array.isArray(v) &&
+						Object.keys(v).length === 2 && typeof v.unit === "string" &&
+						Number.isInteger(v.count) && v.count >= 0);
+				if (!ok) throw new Error("files values must be a string or {unit, count}");
+			}
+		}
+		const files = {};
+		if (args.files !== undefined && args.files !== null) {
+			for (const [rel, v] of Object.entries(args.files)) {
+				files[rel] = typeof v === "string" ? v : v.unit.repeat(v.count);
+			}
+		}
+		if (!Array.isArray(args.steps)) throw new Error("missing steps");
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parity-mll-"));
+		parityMaterialize(files, base);
+		const optStr = (obj, key, msg) => {
+			if (obj[key] === undefined || obj[key] === null) return undefined;
+			if (typeof obj[key] !== "string") throw new Error(msg);
+			return obj[key];
+		};
+		const intNow = (step) => {
+			if (step.nowMs === undefined) return 0;
+			if (typeof step.nowMs !== "number" || !Number.isInteger(step.nowMs)) throw new Error("nowMs must be an integer");
+			return step.nowMs;
+		};
+		const loggers = new Map();
+		let nowMs = 0;
+		const RealDate = Date;
+		const PinnedDate = class extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(nowMs);
+				else super(...ctorArgs);
+			}
+			static now() {
+				return nowMs;
+			}
+		};
+		globalThis.Date = PinnedDate;
+		const results = [];
+		try {
+			for (const step of args.steps) {
+				if (step === null || typeof step !== "object" || Array.isArray(step)) {
+					throw new Error("steps entries must be objects");
+				}
+				if (typeof step.op !== "string") throw new Error("missing op");
+				if (step.op === "format") {
+					const server = optStr(step, "server", "server must be a string");
+					if (server === undefined) throw new Error("missing server");
+					results.push({ line: mod.formatMcpLogMessage(server, step.params, new RealDate(intNow(step))) });
+				} else if (step.op === "write") {
+					const logPath = optStr(step, "path", "path must be a string");
+					if (logPath === undefined) throw new Error("missing path");
+					const server = optStr(step, "server", "server must be a string");
+					if (server === undefined) throw new Error("missing server");
+					if (step.fresh !== undefined && typeof step.fresh !== "boolean") throw new Error("fresh must be a boolean");
+					nowMs = intNow(step);
+					if (step.fresh) {
+						new mod.McpServerLog(parityJoinRel(base, logPath)).write(server, step.params);
+					} else {
+						let logger = loggers.get(logPath);
+						if (!logger) {
+							logger = new mod.McpServerLog(parityJoinRel(base, logPath));
+							loggers.set(logPath, logger);
+						}
+						logger.write(server, step.params);
+					}
+					results.push(null);
+				} else if (step.op === "renameFile") {
+					const from = optStr(step, "from", "from must be a string");
+					if (from === undefined) throw new Error("missing from");
+					const to = optStr(step, "to", "to must be a string");
+					if (to === undefined) throw new Error("missing to");
+					fs.renameSync(parityJoinRel(base, from), parityJoinRel(base, to));
+					results.push(null);
+				} else {
+					throw new Error("unknown mcp-log op: " + step.op);
+				}
+			}
+			const outFiles = {};
+			(function walk(dir, prefix) {
+				for (const entry of fs.readdirSync(dir).sort()) {
+					const p = path.join(dir, entry);
+					if (fs.statSync(p).isDirectory()) walk(p, prefix + entry + "/");
+					else outFiles[prefix + entry] = fs.readFileSync(p, "utf8");
+				}
+			})(base, "");
+			return { results, files: outFiles };
+		} finally {
+			globalThis.Date = RealDate;
+			fs.rmSync(base, { recursive: true, force: true });
+		}
+	}
 	if (tool === "tool-search") {
 		const tsm = require(path.join(distDir, "extensions", "tool-search", "tool.js"));
 		switch (args.fn) {
@@ -2012,7 +2126,7 @@ async function runModule(tool, args, cwd) {
 		// The REAL InMemoryCredentialStore from the pi-ai package (not a fake).
 		const { pathToFileURL } = require("url");
 		const CREDENTIAL_STORE_SRC =
-			process.env.PI_AI_CREDENTIAL_STORE || "/tmp/pi-repo/packages/ai/dist/auth/credential-store.js";
+			process.env.PI_AI_CREDENTIAL_STORE || PI_REPO + "/packages/ai/dist/auth/credential-store.js";
 		const aiAuth = await import(pathToFileURL(CREDENTIAL_STORE_SRC).href);
 		const store = new aiAuth.InMemoryCredentialStore();
 		for (const backing of args.backing || []) {
