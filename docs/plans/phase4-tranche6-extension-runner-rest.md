@@ -528,10 +528,23 @@ code, killed}`:
       `RunnerShared.command_actions` + `bind_command_context(Option<..>)`
       (`None` = the TS default handlers).
        `bind_command_context`
-- [ ] 5. `RunnerShared` extension: ui (fake-UI script), uiPromptDepth/
+- [x] 5. `RunnerShared` extension **DONE**: `ui_context`
+      (`Option<Arc<dyn UiContext>>`; `None` = noOp), `ui_prompt_depth`,
+      `active_ui_prompt`, `ui_prompt_queue` (the `queueMicrotask` seam,
+      drained via `drain_ui_prompt_events`), `command_actions`; the old
+      `ui: bool` field retired (`hasUI` = a context is bound; `ctx_read`
+      routes through it).
        activeUIPrompt, command actions, context defaults pre/post-bind,
        microtask push seams (`ui_prompt_emit`)
-- [ ] 6. `set_ui_context` full + `wrap_ui_prompt_context` +
+- [x] 6. `set_ui_context` full + `wrap_ui_prompt_context` **DONE**:
+      `set_ui_context(Option<Arc<dyn UiContext>>, mode)`; `UiContext` =
+      one Value-typed `invoke(method, args)` seam (the fake-UI script
+      backs it) + runner-level `ui_select`/`ui_confirm`/`ui_input`/
+      `ui_editor`/`ui_custom`; `with_ui_prompt` = outermost-only
+      start/end events, depth clamp (finish double-guard), end event
+      carries the active prompt, throw still emits end; **noOp context is
+      unwrapped** (no events — TS parity). Test covers no-op/nested/throw/
+      custom.
        `with_ui_prompt` (kind/title/start/end + finish double-guard) +
        `get_ui_context` proxy
 - [ ] 7. `ctx_read` full getter map (getter-vs-method assert semantics;

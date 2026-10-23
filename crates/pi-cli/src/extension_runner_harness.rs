@@ -288,6 +288,47 @@ impl RuntimeActions for FakeActions {
 	}
 }
 
+/// `setUIContext` target: records every `ui.<method>` call and replays the
+/// case's `uiScript` (`{method?, returns?, throws?}` per call). With no
+/// script it behaves like the no-op context (undefined/false).
+struct ScriptedUi {
+	log: Log,
+	script: Arc<Mutex<Vec<Value>>>,
+	index: Arc<Mutex<usize>>,
+}
+
+impl UiContext for ScriptedUi {
+	fn invoke(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+		self.log
+			.lock()
+			.unwrap()
+			.push(format!("ui.{}:{}", method, jstr(&json!(args))));
+		let index = {
+			let mut index = self.index.lock().unwrap();
+			let current = *index;
+			*index += 1;
+			current
+		};
+		let entry = self.script.lock().unwrap().get(index).cloned();
+		match entry {
+			Some(entry) => {
+				if let Some(message) = entry.get("throws").and_then(Value::as_str) {
+					return Err(message.to_string());
+				}
+				Ok(entry.get("returns").cloned().unwrap_or(Value::Null))
+			}
+			None => Ok(match method {
+				"confirm" => json!(false),
+				"getEditorText" => json!(""),
+				"getAllThemes" => json!([]),
+				"setTheme" => json!({"success": false, "error": "UI not available"}),
+				"getToolsExpanded" => json!(false),
+				_ => Value::Null,
+			}),
+		}
+	}
+}
+
 struct FakeContext {
 	idle: bool,
 	trusted: bool,
@@ -616,7 +657,18 @@ async fn run_async(ops: &[Value]) -> Result<Value, String> {
 				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
 				let ui = op.get("ui").and_then(Value::as_bool).unwrap_or(false);
 				let mode = op.get("mode").and_then(Value::as_str).unwrap_or("print");
-				runner.set_ui_context(ui, mode);
+				let context = if ui {
+					let script = op.get("uiScript").cloned().unwrap_or(json!([]));
+					let script = script.as_array().cloned().unwrap_or_default();
+					Some(Arc::new(ScriptedUi {
+						log: Arc::clone(&case.log),
+						script: Arc::new(Mutex::new(script)),
+						index: Arc::new(Mutex::new(0)),
+					}) as Arc<dyn UiContext>)
+				} else {
+					None
+				};
+				runner.set_ui_context(context, mode);
 			}
 			"hasUI" => {
 				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;

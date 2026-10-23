@@ -235,6 +235,15 @@ pub trait ContextActions: Send + Sync {
 	}
 }
 
+/// The `ExtensionUIContext` seam. The real TUI is out of scope: every
+/// method routes through one Value-typed [`UiContext::invoke`], which the
+/// host backs with its fake-UI script. `Err` models a throw; `Value::Null`
+/// models `undefined`.
+pub trait UiContext: Send + Sync {
+	/// `ui.<method>(...args)` — `args` is the positional argument list.
+	fn invoke(&self, method: &str, args: &[Value]) -> Result<Value, String>;
+}
+
 /// The `ExtensionCommandContextActions` bound by `bindCommandContext`
 /// (interactive command execution is a later tranche; the seam keeps the
 /// future-based signatures).
@@ -1397,13 +1406,20 @@ pub struct RunnerShared {
 	runtime: ExtensionRuntime,
 	cwd: String,
 	mode: Mutex<String>,
-	ui: Mutex<bool>,
 	error_listeners: Mutex<Vec<(u64, ErrorListener)>>,
 	next_listener_id: AtomicU64,
 	reported_mcp_servers: Mutex<HashSet<String>>,
 	stale_message: Mutex<Option<String>>,
 	context_actions: Mutex<Option<Arc<dyn ContextActions>>>,
 	command_actions: Mutex<Option<Arc<dyn CommandContextActions>>>,
+	/// `setUIContext` target; `None` = the no-op context.
+	ui_context: Mutex<Option<Arc<dyn UiContext>>>,
+	/// `uiPromptDepth` (outermost prompt wins) and the active prompt.
+	ui_prompt_depth: Mutex<i64>,
+	active_ui_prompt: Mutex<Option<(String, Option<String>)>>,
+	/// `ui_prompt_start`/`ui_prompt_end` events deferred through
+	/// `queueMicrotask`; the host drains and emits them.
+	ui_prompt_queue: Mutex<Vec<Value>>,
 	/// `mcp_servers_change` events queued by the registry listener; drained
 	/// by [`ExtensionRunner::drain_mcp_events`].
 	mcp_event_queue: Mutex<Vec<Value>>,
@@ -1435,13 +1451,16 @@ impl ExtensionRunner {
 				runtime,
 				cwd: cwd.to_string(),
 				mode: Mutex::new("print".to_string()),
-				ui: Mutex::new(false),
 				error_listeners: Mutex::new(Vec::new()),
 				next_listener_id: AtomicU64::new(0),
 				reported_mcp_servers: Mutex::new(HashSet::new()),
 				stale_message: Mutex::new(None),
 				context_actions: Mutex::new(None),
 				command_actions: Mutex::new(None),
+				ui_context: Mutex::new(None),
+				ui_prompt_depth: Mutex::new(0),
+				active_ui_prompt: Mutex::new(None),
+				ui_prompt_queue: Mutex::new(Vec::new()),
 				mcp_event_queue: Mutex::new(Vec::new()),
 				shortcut_diagnostics: Mutex::new(Vec::new()),
 				model_registry,
@@ -1475,6 +1494,176 @@ impl ExtensionRunner {
 	}
 
 	/// `bindCore(actions, contextActions, providerActions?)`.
+	/// `setUIContext(uiContext?, mode = "print")` — `None` restores the
+	/// no-op context.
+	pub fn set_ui_context(&self, ui: Option<Arc<dyn UiContext>>, mode: &str) {
+		*self.shared.ui_context.lock().unwrap() = ui;
+		*self.shared.mode.lock().unwrap() = mode.to_string();
+	}
+
+	/// `getUIContext()` — the (wrapped) context handle; `None` = no-op.
+	pub fn get_ui_context(&self) -> Option<Arc<dyn UiContext>> {
+		self.shared.ui_context.lock().unwrap().clone()
+	}
+
+	/// `hasUI()` — `uiContext !== noOpUIContext`.
+	pub fn has_ui(&self) -> bool {
+		self.shared.ui_context.lock().unwrap().is_some()
+	}
+
+	/// Drain the deferred `ui_prompt_*` events (TS `queueMicrotask(... emit)`).
+	pub fn drain_ui_prompt_events(&self) -> Vec<Value> {
+		std::mem::take(&mut *self.shared.ui_prompt_queue.lock().unwrap())
+	}
+
+	fn emit_ui_prompt_event(&self, event: Value) {
+		self.shared.ui_prompt_queue.lock().unwrap().push(event);
+	}
+
+	/// `withUIPrompt(kind, title, run)` — the outermost prompt emits
+	/// `ui_prompt_start`; the depth counter discards nested prompts and the
+	/// end event carries the ACTIVE prompt (whose kind/title can differ when
+	/// a nested prompt opened first... they cannot: nesting does not
+	/// overwrite). `finish` clamps the depth at zero (double-guard).
+	async fn with_ui_prompt<T>(
+		&self,
+		kind: &str,
+		title: Option<&str>,
+		run: impl std::future::Future<Output = Result<T, String>>,
+	) -> Result<T, String> {
+		let outer = {
+			let mut depth = self.shared.ui_prompt_depth.lock().unwrap();
+			let outer = *depth == 0;
+			*depth += 1;
+			outer
+		};
+		if outer {
+			*self.shared.active_ui_prompt.lock().unwrap() =
+				Some((kind.to_string(), title.map(str::to_string)));
+			let mut event = json!({"type": "ui_prompt_start", "reason": "ui_prompt", "kind": kind});
+			if let Some(title) = title {
+				event["title"] = json!(title);
+			}
+			self.emit_ui_prompt_event(event);
+		}
+		let result = run.await;
+		{
+			let mut depth = self.shared.ui_prompt_depth.lock().unwrap();
+			*depth -= 1;
+			if *depth <= 0 {
+				*depth = 0;
+				let prompt = self
+					.shared
+					.active_ui_prompt
+					.lock()
+					.unwrap()
+					.clone()
+					.unwrap_or_else(|| (kind.to_string(), title.map(str::to_string)));
+				*self.shared.active_ui_prompt.lock().unwrap() = None;
+				let mut event = json!({"type": "ui_prompt_end", "reason": "ui_prompt", "kind": prompt.0});
+				if let Some(title) = prompt.1 {
+					event["title"] = json!(title);
+				}
+				self.emit_ui_prompt_event(event);
+			}
+		}
+		result
+	}
+
+	async fn ui_invoke(&self, method: &str, args: &[Value]) -> Result<Value, String> {
+		let ui = self.shared.ui_context.lock().unwrap().clone();
+		match ui {
+			Some(ui) => ui.invoke(method, args),
+			None => {
+				// noOpUIContext: async prompts resolve undefined/false, sync
+				// setters no-op, getEditorText = "", themes = [], setTheme =
+				// {success:false,error:"UI not available"}.
+				Ok(match method {
+					"confirm" => json!(false),
+					"getEditorText" => json!(""),
+					"getAllThemes" => json!([]),
+					"setTheme" => json!({"success": false, "error": "UI not available"}),
+					"getToolsExpanded" => json!(false),
+					_ => Value::Null,
+				})
+			}
+		}
+	}
+
+	/// `withUIPrompt`-wrapped `ui.<kind>(...args)` (`select`/`confirm`/
+	/// `input`/`editor`/`custom`); `Null` = undefined.
+	pub async fn ui_prompt(
+		&self,
+		kind: &str,
+		title: Option<&str>,
+		args: Vec<Value>,
+	) -> Result<Value, String> {
+		// `setUIContext(undefined)` leaves the noOp context UNWRAPPED: prompts
+		// resolve without ui_prompt_* events.
+		if self.get_ui_context().is_none() {
+			return self.ui_invoke(kind, &args).await;
+		}
+		self.with_ui_prompt(kind, title, async { self.ui_invoke(kind, &args).await })
+			.await
+	}
+
+	/// `ctx.ui.select(title, options, opts?)`.
+	pub async fn ui_select(
+		&self,
+		title: &str,
+		options: &[String],
+		opts: Value,
+	) -> Result<Value, String> {
+		self.ui_prompt("select", Some(title), vec![json!(title), json!(options), opts])
+			.await
+	}
+
+	/// `ctx.ui.confirm(title, message, opts?)`.
+	pub async fn ui_confirm(
+		&self,
+		title: &str,
+		message: &str,
+		opts: Value,
+	) -> Result<Value, String> {
+		self.ui_prompt("confirm", Some(title), vec![json!(title), json!(message), opts])
+			.await
+	}
+
+	/// `ctx.ui.input(title, placeholder?, opts?)`.
+	pub async fn ui_input(
+		&self,
+		title: &str,
+		placeholder: Option<&str>,
+		opts: Value,
+	) -> Result<Value, String> {
+		self.ui_prompt(
+			"input",
+			Some(title),
+			vec![json!(title), placeholder.map(|p| json!(p)).unwrap_or(Value::Null), opts],
+		)
+		.await
+	}
+
+	/// `ctx.ui.editor(title, prefill?)`.
+	pub async fn ui_editor(
+		&self,
+		title: &str,
+		prefill: Option<&str>,
+	) -> Result<Value, String> {
+		self.ui_prompt(
+			"editor",
+			Some(title),
+			vec![json!(title), prefill.map(|p| json!(p)).unwrap_or(Value::Null)],
+		)
+		.await
+	}
+
+	/// `ctx.ui.custom(factory, options?)` — the factory is not modelable;
+	/// `args` carries the harness-shaped call.
+	pub async fn ui_custom(&self, args: Vec<Value>) -> Result<Value, String> {
+		self.ui_prompt("custom", None, args).await
+	}
+
 	/// `bindCommandContext(actions?)` — `None` resets every handler to the
 	/// TS defaults (`{ cancelled: false }` / no-op).
 	pub fn bind_command_context(&self, actions: Option<Arc<dyn CommandContextActions>>) {
@@ -1584,7 +1773,7 @@ impl ExtensionRunner {
 		match field {
 			"cwd" => Ok(json!(self.shared.cwd)),
 			"mode" => Ok(json!(*self.shared.mode.lock().unwrap())),
-			"hasUI" => Ok(json!(*self.shared.ui.lock().unwrap())),
+			"hasUI" => Ok(json!(self.has_ui())),
 			// TS class-field defaults are `() => true`; `bindCore` replaces
 			// them with the bound context actions.
 			"isIdle" => Ok(json!(self
@@ -2075,16 +2264,6 @@ impl ExtensionRunner {
 		self.shared.runtime.get_active_tools()
 	}
 
-	/// `hasUI()`.
-	pub fn has_ui(&self) -> bool {
-		*self.shared.ui.lock().unwrap()
-	}
-
-	/// `setUIContext(uiContext?, mode = "print")`.
-	pub fn set_ui_context(&self, ui: bool, mode: &str) {
-		*self.shared.ui.lock().unwrap() = ui;
-		*self.shared.mode.lock().unwrap() = mode.to_string();
-	}
 
 	/// `shutdown()`.
 	pub fn shutdown(&self) {
@@ -2405,6 +2584,71 @@ mod tests {
 		let api = captured.lock().unwrap().clone().unwrap();
 		runtime.invalidate(None);
 		assert_eq!(api.send_message(json!({}), json!({})).unwrap_err(), DEFAULT_STALE_MESSAGE);
+	}
+
+	struct TestUi {
+		answer: Result<Value, String>,
+		calls: Arc<Mutex<Vec<String>>>,
+	}
+
+	impl UiContext for TestUi {
+		fn invoke(&self, method: &str, _args: &[Value]) -> Result<Value, String> {
+			self.calls.lock().unwrap().push(method.to_string());
+			self.answer.clone()
+		}
+	}
+
+	#[tokio::test]
+	async fn ui_prompts_emit_start_end_and_depth() {
+		let runtime = ExtensionRuntime::new();
+		let runner = ExtensionRunner::new(vec![], runtime, "/proj", None);
+		// no-op context: prompts resolve undefined/false, no events.
+		assert_eq!(runner.ui_select("t", &["a".to_string()], json!({})).await.unwrap(), Value::Null);
+		assert_eq!(runner.ui_confirm("t", "m", json!({})).await.unwrap(), json!(false));
+		assert!(runner.drain_ui_prompt_events().is_empty());
+
+		let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+		runner.set_ui_context(
+			Some(Arc::new(TestUi { answer: Ok(json!("picked")), calls: Arc::clone(&calls) })),
+			"tui",
+		);
+		assert!(runner.has_ui());
+		let value = runner.ui_select("Pick", &["a".to_string(), "b".to_string()], json!({})).await.unwrap();
+		assert_eq!(value, json!("picked"));
+		let events = runner.drain_ui_prompt_events();
+		assert_eq!(
+			events,
+			vec![
+				json!({"type": "ui_prompt_start", "reason": "ui_prompt", "kind": "select", "title": "Pick"}),
+				json!({"type": "ui_prompt_end", "reason": "ui_prompt", "kind": "select", "title": "Pick"}),
+			]
+		);
+		// nested prompt: depth suppresses the inner events (finish clamps).
+		let nested = runner.with_ui_prompt("select", Some("Outer"), async {
+			runner.with_ui_prompt("select", Some("Inner"), async { Ok::<(), String>(()) }).await
+		});
+		nested.await.unwrap();
+		let events = runner.drain_ui_prompt_events();
+		assert_eq!(events.len(), 2);
+		assert_eq!(events[0]["title"], json!("Outer"));
+		assert_eq!(events[1]["title"], json!("Outer"));
+		// a throwing prompt still emits the end event.
+		runner.set_ui_context(
+			Some(Arc::new(TestUi { answer: Err("ui boom".to_string()), calls })),
+			"tui",
+		);
+		assert_eq!(runner.ui_input("t", None, json!({})).await.unwrap_err(), "ui boom");
+		let events = runner.drain_ui_prompt_events();
+		assert_eq!(events.len(), 2);
+		assert_eq!(events[0]["kind"], json!("input"));
+		// custom: no title key.
+		runner.set_ui_context(
+			Some(Arc::new(TestUi { answer: Ok(json!(1)), calls: Arc::new(Mutex::new(Vec::new())) })),
+			"print",
+		);
+		runner.ui_custom(vec![json!({"overlay": true})]).await.unwrap();
+		let events = runner.drain_ui_prompt_events();
+		assert!(events[0].get("title").is_none());
 	}
 
 	#[tokio::test]
