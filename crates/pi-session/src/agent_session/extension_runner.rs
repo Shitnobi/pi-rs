@@ -104,6 +104,47 @@ fn js_truthy(value: &Value) -> bool {
 	}
 }
 
+/// `isUserBashEventResult(value)` — exactly one of `operations`/`result`;
+/// `operations.exec` is a function in TS, modeled here by key presence;
+/// `result` needs a string `output`, a **present** `exitCode`
+/// (number/undefined), boolean `cancelled`/`truncated`, and an optional
+/// string `fullOutputPath`.
+pub fn is_user_bash_event_result(value: &Value) -> bool {
+	let Some(object) = value.as_object() else {
+		return false;
+	};
+	let has_operations = object.contains_key("operations");
+	let has_result = object.contains_key("result");
+	if has_operations == has_result {
+		return false;
+	}
+	if has_operations {
+		let Some(operations) = object.get("operations").and_then(Value::as_object) else {
+			return false;
+		};
+		return operations.contains_key("exec");
+	}
+	let Some(result) = object.get("result").and_then(Value::as_object) else {
+		return false;
+	};
+	if !matches!(result.get("output"), Some(Value::String(_))) {
+		return false;
+	}
+	if !result.contains_key("exitCode") {
+		return false;
+	}
+	if !matches!(result.get("exitCode"), Some(Value::Number(_)) | Some(Value::Null)) {
+		return false;
+	}
+	if !matches!(result.get("cancelled"), Some(Value::Bool(_))) {
+		return false;
+	}
+	if !matches!(result.get("truncated"), Some(Value::Bool(_))) {
+		return false;
+	}
+	matches!(result.get("fullOutputPath"), None | Some(Value::String(_)))
+}
+
 /// JS `typeof` for the flag-default error message.
 fn js_typeof(value: &Value) -> &'static str {
 	match value {
@@ -1871,6 +1912,41 @@ impl ExtensionRunner {
 		self.ctx_call_args(method, &[])
 	}
 
+	/// `emitUserBash(event)` — the first non-undefined handler result must
+	/// validate as exactly one of `{operations}` or `{result}`; a handler
+	/// throw or an invalid result is reported and **rethrown**.
+	pub async fn emit_user_bash(&self, event: Value) -> Result<Option<Value>, String> {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		for (extension_path, handlers) in self.snapshot_handlers("user_bash") {
+			for (_, handler) in handlers {
+				match handler(event.clone(), ctx.clone()).await {
+					Ok(HandlerOutcome { result: Some(result), .. }) => {
+						if !is_user_bash_event_result(&result) {
+							let message = "Invalid user_bash handler result: return undefined for local execution or exactly one valid { operations } or { result } object";
+							self.emit_error(&json!({
+								"extensionPath": extension_path,
+								"event": "user_bash",
+								"error": message,
+							}));
+							return Err(message.to_string());
+						}
+						return Ok(Some(result));
+					}
+					Ok(HandlerOutcome { result: None, .. }) => {}
+					Err(error) => {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": "user_bash",
+							"error": error,
+						}));
+						return Err(error);
+					}
+				}
+			}
+		}
+		Ok(None)
+	}
+
 	/// `createToolContext(toolCallId, signal)` — the guarded `tools` getter
 	/// plus `executeTool()` (nested-call fallback when the context actions
 	/// do not bind it).
@@ -2819,6 +2895,70 @@ mod tests {
 		let api = captured.lock().unwrap().clone().unwrap();
 		runtime.invalidate(None);
 		assert_eq!(api.send_message(json!({}), json!({})).unwrap_err(), DEFAULT_STALE_MESSAGE);
+	}
+
+	#[test]
+	fn user_bash_result_validator() {
+		let valid_result = json!({
+			"result": {"output": "o", "exitCode": 0, "cancelled": false, "truncated": false}
+		});
+		assert!(is_user_bash_event_result(&valid_result));
+		// exitCode present-but-undefined (Null in the jstr model) is allowed.
+		assert!(is_user_bash_event_result(&json!({
+			"result": {"output": "o", "exitCode": null, "cancelled": true, "truncated": false}
+		})));
+		assert!(is_user_bash_event_result(&json!({
+			"result": {"output": "o", "exitCode": 0, "cancelled": false, "truncated": false, "fullOutputPath": "/f"}
+		})));
+		assert!(is_user_bash_event_result(&json!({"operations": {"exec": "fn"}})));
+		// invalid: both / neither
+		assert!(!is_user_bash_event_result(&json!({})));
+		assert!(!is_user_bash_event_result(&json!({"operations": {"exec": "fn"}, "result": {}})));
+		assert!(!is_user_bash_event_result(&json!(5)));
+		assert!(!is_user_bash_event_result(&Value::Null));
+		// invalid operations/result shapes
+		assert!(!is_user_bash_event_result(&json!({"operations": {}})));
+		assert!(!is_user_bash_event_result(&json!({"operations": 5})));
+		assert!(!is_user_bash_event_result(&json!({"result": {"output": 5, "exitCode": 0, "cancelled": false, "truncated": false}})));
+		assert!(!is_user_bash_event_result(&json!({"result": {"exitCode": 0, "cancelled": false, "truncated": false}})));
+		assert!(!is_user_bash_event_result(&json!({"result": {"output": "o", "cancelled": false, "truncated": false}})));
+		assert!(!is_user_bash_event_result(&json!({"result": {"output": "o", "exitCode": "0", "cancelled": false, "truncated": false}})));
+		assert!(!is_user_bash_event_result(&json!({"result": {"output": "o", "exitCode": 0, "cancelled": false}})));
+		assert!(!is_user_bash_event_result(&json!({"result": {"output": "o", "exitCode": 0, "cancelled": false, "truncated": false, "fullOutputPath": 5}})));
+	}
+
+	#[tokio::test]
+	async fn emit_user_bash_first_result_wins_and_rethrows() {
+		// handler 1 returns undefined, handler 2 a valid result → returned.
+		let undefined_handler: ExtensionHandler = Arc::new(|event, _ctx| {
+			Box::pin(async move { Ok(HandlerOutcome { event, result: None }) })
+		});
+		let valid_handler: ExtensionHandler = Arc::new(|event, _ctx| {
+			Box::pin(async move {
+				Ok(HandlerOutcome {
+					event,
+					result: Some(json!({"operations": {"exec": "fn"}})),
+				})
+			})
+		});
+		let runner = runner_with_handlers("user_bash", vec![undefined_handler, valid_handler]).await;
+		let result = runner.emit_user_bash(json!({"command": "ls"})).await.unwrap();
+		assert_eq!(result, Some(json!({"operations": {"exec": "fn"}})));
+
+		// invalid result: reported + rethrown.
+		let invalid_handler: ExtensionHandler = Arc::new(|event, _ctx| {
+			Box::pin(async move { Ok(HandlerOutcome { event, result: Some(json!({"nope": 1})) }) })
+		});
+		let runner = runner_with_handlers("user_bash", vec![invalid_handler]).await;
+		let errors: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+		let errors_listener = Arc::clone(&errors);
+		runner.on_error(Arc::new(move |error| {
+			errors_listener.lock().unwrap().push(error.clone());
+		}));
+		let error = runner.emit_user_bash(json!({})).await.unwrap_err();
+		assert!(error.starts_with("Invalid user_bash handler result:"));
+		assert_eq!(errors.lock().unwrap().len(), 1);
+		assert!(!matches!(runner.emit_user_bash(json!({})).await, Ok(Some(_))));
 	}
 
 	#[tokio::test]

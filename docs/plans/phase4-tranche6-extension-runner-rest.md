@@ -567,7 +567,14 @@ code, killed}`:
       the default `{cancelled:false}`/no-op handlers; every entry guarded
       by the shared stale check. Test: fallback object, defaults, stale.
        call fallback; executeTool options merge)
-- [ ] 9. `is_user_bash_event_result` + `emit_user_bash` (validate → throw
+- [x] 9. `is_user_bash_event_result` + `emit_user_bash` **DONE**: exactly
+      one of operations/result (operations.exec = key-presence stand-in);
+      result needs string output, **present** exitCode (number/undefined
+      — Null in the jstr model), boolean cancelled/truncated, optional
+      string fullOutputPath. First non-undefined result wins; invalid →
+      emitError + the exact Invalid-user_bash message RETHROWN; handler
+      throws likewise reported + rethrown. Validator matrix + emitter
+      tests.
        Invalid-user_bash… → rethrow)
 - [ ] 10. `emit_boundary` (buildContext host hook trait + Invalid boundary
         entries) + `emit_cache_warming_decision` + `emit_tool_result`
