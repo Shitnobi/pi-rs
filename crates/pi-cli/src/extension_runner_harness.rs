@@ -305,8 +305,29 @@ impl ContextActions for FakeContext {
 	fn get_model(&self) -> Option<Value> {
 		self.model.clone()
 	}
+	fn get_scoped_models(&self) -> Vec<Value> {
+		Vec::new()
+	}
+	fn get_signal(&self) -> Option<Value> {
+		None
+	}
+	fn abort(&self) {
+		self.log.lock().unwrap().push("contextActions.abort".to_string());
+	}
+	fn has_pending_messages(&self) -> bool {
+		false
+	}
 	fn shutdown(&self) {
 		self.log.lock().unwrap().push("contextActions.shutdown".to_string());
+	}
+	fn get_context_usage(&self) -> Option<Value> {
+		None
+	}
+	fn compact(&self, _options: Value) -> Result<(), String> {
+		Ok(())
+	}
+	fn get_system_prompt(&self) -> String {
+		String::new()
 	}
 }
 

@@ -199,12 +199,53 @@ pub trait RuntimeActions: Send + Sync {
 	fn set_thinking_level(&self, level: Value) -> Result<(), String>;
 }
 
-/// The `ExtensionContextActions` slice bound by `bindCore`.
+/// The full `ExtensionContextActions` bound by `bindCore` (`required except
+/// the three optional ones, which default to the TS class-field fallbacks).
 pub trait ContextActions: Send + Sync {
+	fn get_model(&self) -> Option<Value>;
+	fn get_scoped_models(&self) -> Vec<Value>;
 	fn is_idle(&self) -> bool;
 	fn is_project_trusted(&self) -> bool;
-	fn get_model(&self) -> Option<Value>;
+	/// `AbortSignal | undefined` — opaque to the port.
+	fn get_signal(&self) -> Option<Value>;
+	fn abort(&self);
+	fn has_pending_messages(&self) -> bool;
 	fn shutdown(&self);
+	fn get_context_usage(&self) -> Option<Value>;
+	fn compact(&self, options: Value) -> Result<(), String>;
+	fn get_system_prompt(&self) -> String;
+	/// Optional: absent → `normalizeBuildSystemPromptOptions({cwd})`.
+	fn get_system_prompt_options(&self) -> Option<Value> {
+		None
+	}
+	/// Optional: absent → nested tool calls are unavailable.
+	fn execute_tool(
+		&self,
+		caller_id: &str,
+		name: &str,
+		args: Value,
+		options: Value,
+	) -> Option<Result<Value, String>> {
+		let _ = (caller_id, name, args, options);
+		None
+	}
+	/// Optional: absent → the callable-tool list is empty.
+	fn get_callable_tools(&self) -> Option<Vec<Value>> {
+		None
+	}
+}
+
+/// The `ExtensionCommandContextActions` bound by `bindCommandContext`
+/// (interactive command execution is a later tranche; the seam keeps the
+/// future-based signatures).
+pub trait CommandContextActions: Send + Sync {
+	fn wait_for_idle(&self) -> BoxFuture<'static, ()>;
+	/// `Promise<{ cancelled: boolean }>`.
+	fn new_session(&self, options: Value) -> BoxFuture<'static, Value>;
+	fn fork(&self, entry_id: String, options: Value) -> BoxFuture<'static, Value>;
+	fn navigate_tree(&self, target_id: String, options: Value) -> BoxFuture<'static, Value>;
+	fn switch_session(&self, session_path: String, options: Value) -> BoxFuture<'static, Value>;
+	fn reload(&self) -> BoxFuture<'static, ()>;
 }
 
 /// Provider registration hook aliases: `Err` models a throw (TS propagates
@@ -1362,6 +1403,7 @@ pub struct RunnerShared {
 	reported_mcp_servers: Mutex<HashSet<String>>,
 	stale_message: Mutex<Option<String>>,
 	context_actions: Mutex<Option<Arc<dyn ContextActions>>>,
+	command_actions: Mutex<Option<Arc<dyn CommandContextActions>>>,
 	/// `mcp_servers_change` events queued by the registry listener; drained
 	/// by [`ExtensionRunner::drain_mcp_events`].
 	mcp_event_queue: Mutex<Vec<Value>>,
@@ -1399,6 +1441,7 @@ impl ExtensionRunner {
 				reported_mcp_servers: Mutex::new(HashSet::new()),
 				stale_message: Mutex::new(None),
 				context_actions: Mutex::new(None),
+				command_actions: Mutex::new(None),
 				mcp_event_queue: Mutex::new(Vec::new()),
 				shortcut_diagnostics: Mutex::new(Vec::new()),
 				model_registry,
@@ -1432,6 +1475,12 @@ impl ExtensionRunner {
 	}
 
 	/// `bindCore(actions, contextActions, providerActions?)`.
+	/// `bindCommandContext(actions?)` — `None` resets every handler to the
+	/// TS defaults (`{ cancelled: false }` / no-op).
+	pub fn bind_command_context(&self, actions: Option<Arc<dyn CommandContextActions>>) {
+		*self.shared.command_actions.lock().unwrap() = actions;
+	}
+
 	pub fn bind_core(
 		&self,
 		actions: Arc<dyn RuntimeActions>,

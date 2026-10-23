@@ -520,7 +520,13 @@ code, killed}`:
       Test: pre-bind API call throws the loader stub, exec runs during
       loading, stale runtime fails assertActive.
        delegation)
-- [ ] 4. Full `ContextActions` + `CommandContextActions` traits +
+- [x] 4. Full `ContextActions` + `CommandContextActions` traits +
+      `bind_command_context` **DONE**: ContextActions = 13 methods (the 3
+      optional ones — getSystemPromptOptions/executeTool/getCallableTools —
+      are Rust default impls returning None, matching the TS optionality);
+      CommandContextActions = 6 future-based methods;
+      `RunnerShared.command_actions` + `bind_command_context(Option<..>)`
+      (`None` = the TS default handlers).
        `bind_command_context`
 - [ ] 5. `RunnerShared` extension: ui (fake-UI script), uiPromptDepth/
        activeUIPrompt, command actions, context defaults pre/post-bind,
