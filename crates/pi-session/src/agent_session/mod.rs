@@ -17,6 +17,7 @@ pub mod prompt;
 pub mod retry;
 pub mod run;
 pub mod stats;
+pub mod exec;
 pub mod system_prompt;
 pub mod tree;
 pub mod tools;
