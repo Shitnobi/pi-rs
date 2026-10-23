@@ -576,12 +576,33 @@ code, killed}`:
       throws likewise reported + rethrown. Validator matrix + emitter
       tests.
        Invalid-user_bash… → rethrow)
-- [ ] 10. `emit_boundary` (buildContext host hook trait + Invalid boundary
+- [x] 10. `emit_boundary` + cache_warming + tool_result + tool_call +
+      provider hooks + resources_discover + input **DONE**:
+      BoundaryBuildContext = Value-fn; initial throw escapes, per-handler
+      rebuild failure → `Invalid boundary entries: <msg>` + valid:false
+      (return `{entries:[],continue:false,context,valid:false}`), entries
+      override by present-key, `continue` truthy-coerced, return keys in TS
+      order. cache_warming = event.action unless a present override (last
+      wins, null overrides). tool_result = ordered patch of one
+      currentEvent, content-without-structuredContent DELETES it, return
+      carries only present fields. tool_call = truthy results accumulate,
+      truthy block short-circuits, **throws propagate with no emitError**.
+      before_provider_request = present result replaces (null replaces);
+      headers = in-place mutation read-back; resources = non-empty lists
+      tagged {path, extensionPath}; input = transform chain, handled
+      short-circuit, `images ??` keep, unchanged → continue. 6 tests.
         entries) + `emit_cache_warming_decision` + `emit_tool_result`
         (delete-structuredContent) + `emit_tool_call` (truthy + block +
         rethrow) + `emit_before_provider_request`/`_headers` +
         `emit_resources_discover` + `emit_input`
-- [ ] 11. `emit_context` (2-phase; sameMessages Value-eq;
+- [x] 11. `emit_context` **DONE**: phase 1 (context) = visible filter,
+      snapshot, fresh event; returned = `messages ?? (same ? undefined :
+      visible)`; falsy → continue; restoreSystemMessages (sameMessages =
+      Value-eq stand-in; head = getCurrentSystemMessage replay: contentText
+      "\n" join, section patch/null-delete, toolsAdded/Removed by name,
+      timestamp ?? 0, undefined iff no timestamp and no tools). Phase 2
+      (context_with_system) = returned `messages ?? current`, leading-system
+      loss reported (exact message) but honored. 3 tests.
         restoreSystemMessages head; leading-system-lost error)
 - [x] 12. `system_prompt.rs`: `normalize_options_raw` (full JS semantics) +
         `build_system_prompt_state` + `build_system_prompt` +

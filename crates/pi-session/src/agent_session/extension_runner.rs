@@ -37,7 +37,7 @@ use pi_core::mcp_servers::{
 use serde_json::{json, Map, Value};
 
 use super::exec::{exec_command, ExecResult};
-use super::system_prompt::{build_system_prompt, normalize_options_raw, DocPaths};
+use super::system_prompt::{build_system_prompt, content_text_raw, normalize_options_raw, DocPaths};
 use super::ExtensionHost;
 
 /// TS default `invalidate()` message (loader.ts L192 / runner.ts L729).
@@ -101,6 +101,152 @@ fn js_truthy(value: &Value) -> bool {
 		Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
 		Value::String(s) => !s.is_empty(),
 		_ => true,
+	}
+}
+
+/// `entries` rebuild hook handed to `emitBoundary`.
+pub type BoundaryBuildContext =
+	Arc<dyn Fn(Vec<Value>) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
+
+fn set_field(object: &mut Value, key: &str, value: Value) {
+	if let Some(map) = object.as_object_mut() {
+		map.insert(key.to_string(), value);
+	}
+}
+
+/// `sameMessages(left, right)` — TS compares element *identity*; the port
+/// compares JSON values (documented divergence for in-place message
+/// mutation).
+fn same_messages(left: &[Value], right: &[Value]) -> bool {
+	left.len() == right.len() && left.iter().zip(right).all(|(a, b)| a == b)
+}
+
+/// `getCurrentSystemMessage(messages)` — replay every system message into
+/// one leading message (content joined `"\n\n"`, section patches by name,
+/// tools resolved by name). `undefined` when no system message carries a
+/// timestamp and no tools were added.
+fn get_current_system_message(messages: &[Value]) -> Result<Option<Value>, String> {
+	let mut content: Vec<String> = Vec::new();
+	let mut sections: Vec<(String, String)> = Vec::new();
+	let mut timestamp: Option<Value> = None;
+	for message in messages {
+		if message.get("role").and_then(Value::as_str) != Some("system") {
+			continue;
+		}
+		if timestamp.is_none() {
+			if let Some(value) = message.get("timestamp") {
+				if !value.is_null() {
+					timestamp = Some(value.clone());
+				}
+			}
+		}
+		let text = match message.get("content") {
+			None => {
+				return Err("Cannot read properties of undefined (reading 'filter')".to_string())
+			}
+			Some(value) => content_text_raw(value, "\n")?,
+		};
+		if !text.is_empty() {
+			content.push(text);
+		}
+		if let Some(sections_value) = message.get("sections") {
+			if !sections_value.is_null() {
+				let entries: Vec<(String, Value)> = match sections_value {
+					Value::Object(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+					Value::String(s) => s
+						.char_indices()
+						.map(|(i, c)| (i.to_string(), json!(c.to_string())))
+						.collect(),
+					_ => Vec::new(),
+				};
+				for (name, value) in entries {
+					if value.is_null() {
+						sections.retain(|(existing, _)| existing != &name);
+					} else if let Some(slot) = sections.iter_mut().find(|(existing, _)| existing == &name) {
+						slot.1 = value.as_str().unwrap_or_default().to_string();
+					} else {
+						sections.push((name, value.as_str().unwrap_or_default().to_string()));
+					}
+				}
+			}
+		}
+	}
+	// `getCurrentTools`: replay toolsRemoved/toolsAdded deltas in order.
+	let mut tools: Vec<(String, Value)> = Vec::new();
+	for message in messages {
+		if message.get("role").and_then(Value::as_str) != Some("system") {
+			continue;
+		}
+		for (key, remove) in [("toolsRemoved", true), ("toolsAdded", false)] {
+			let Some(delta) = message.get(key) else { continue };
+			if delta.is_null() {
+				continue;
+			}
+			let Some(delta) = delta.as_array() else {
+				return Err(format!("message.{key} is not iterable"));
+			};
+			for tool in delta {
+				let name = tool.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+				if remove {
+					tools.retain(|(existing, _)| existing != &name);
+				} else if let Some(slot) = tools.iter_mut().find(|(existing, _)| existing == &name) {
+					slot.1 = tool.clone();
+				} else {
+					tools.push((name, tool.clone()));
+				}
+			}
+		}
+	}
+	if timestamp.is_none() && tools.is_empty() {
+		return Ok(None);
+	}
+	let mut result = Map::new();
+	result.insert("role".to_string(), json!("system"));
+	result.insert("content".to_string(), json!(content.join("\n\n")));
+	if !sections.is_empty() {
+		let mut map = Map::new();
+		for (name, value) in sections {
+			map.insert(name, json!(value));
+		}
+		result.insert("sections".to_string(), Value::Object(map));
+	}
+	if !tools.is_empty() {
+		result.insert("toolsAdded".to_string(), json!(tools.into_iter().map(|(_, tool)| tool).collect::<Vec<_>>()));
+	}
+	result.insert("timestamp".to_string(), timestamp.unwrap_or(json!(0)));
+	Ok(Some(Value::Object(result)))
+}
+
+/// `restoreSystemMessages(current, visible, returned)` — an unchanged
+/// conversation keeps every system message; a changed one gets the replayed
+/// head prepended.
+fn restore_system_messages(
+	current: &[Value],
+	visible: &[Value],
+	returned: &[Value],
+) -> Result<Vec<Value>, String> {
+	if same_messages(returned, visible) {
+		return Ok(current.to_vec());
+	}
+	match get_current_system_message(current)? {
+		Some(head) => {
+			let mut result = vec![head];
+			result.extend_from_slice(returned);
+			Ok(result)
+		}
+		None => Ok(returned.to_vec()),
+	}
+}
+
+/// `if (result?.x?.length) out.push(...result.x.map(path => ({path,
+/// extensionPath})))`.
+fn collect_paths(result: &Value, key: &str, extension_path: &str, out: &mut Vec<Value>) {
+	if let Some(Value::Array(paths)) = result.get(key) {
+		if !paths.is_empty() {
+			for path in paths {
+				out.push(json!({"path": path, "extensionPath": extension_path}));
+			}
+		}
 	}
 }
 
@@ -1908,10 +2054,6 @@ impl ExtensionRunner {
 		}
 	}
 
-	fn ctx_call(&self, method: &str) -> Result<Value, String> {
-		self.ctx_call_args(method, &[])
-	}
-
 	/// `emitUserBash(event)` — the first non-undefined handler result must
 	/// validate as exactly one of `{operations}` or `{result}`; a handler
 	/// throw or an invalid result is reported and **rethrown**.
@@ -1945,6 +2087,452 @@ impl ExtensionRunner {
 			}
 		}
 		Ok(None)
+	}
+
+	/// `emitCacheWarmingDecision(event)` — the event's own action unless a
+	/// handler overrides it (`result.action !== undefined`); last wins.
+	pub async fn emit_cache_warming_decision(&self, event: Value) -> Value {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let event_type = event.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+		let mut action = event.get("action").cloned().unwrap_or(Value::Null);
+		for (extension_path, handlers) in self.snapshot_handlers(&event_type) {
+			for (_, handler) in handlers {
+				match handler(event.clone(), ctx.clone()).await {
+					Ok(HandlerOutcome { result: Some(result), .. }) => {
+						// `result?.action !== undefined` — present null overrides.
+						if let Some(next) = result.get("action") {
+							action = next.clone();
+						}
+					}
+					Ok(_) => {}
+					Err(error) => {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": event_type,
+							"error": error,
+						}));
+					}
+				}
+			}
+		}
+		action
+	}
+
+	/// `emitToolResult(event)` — the single `currentEvent` is patched in
+	/// order; replacing `content` without `structuredContent` DELETES the
+	/// stale structured content; the return carries only present fields.
+	pub async fn emit_tool_result(&self, event: Value) -> Result<Option<Value>, String> {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let mut current_event = event.clone();
+		if !current_event.is_object() {
+			current_event = json!({});
+		}
+		let mut modified = false;
+		for (extension_path, handlers) in self.snapshot_handlers("tool_result") {
+			for (_, handler) in handlers {
+				match handler(current_event.clone(), ctx.clone()).await {
+					Ok(HandlerOutcome { result: Some(handler_result), .. })
+						if js_truthy(&handler_result) =>
+					{
+						if let Some(content) = handler_result.get("content") {
+							set_field(&mut current_event, "content", content.clone());
+							if handler_result.get("structuredContent").is_none() {
+								if let Some(object) = current_event.as_object_mut() {
+									object.remove("structuredContent");
+								}
+							}
+							modified = true;
+						}
+						if let Some(details) = handler_result.get("details") {
+							set_field(&mut current_event, "details", details.clone());
+							modified = true;
+						}
+						if let Some(structured) = handler_result.get("structuredContent") {
+							set_field(&mut current_event, "structuredContent", structured.clone());
+							modified = true;
+						}
+						if let Some(is_error) = handler_result.get("isError") {
+							set_field(&mut current_event, "isError", is_error.clone());
+							modified = true;
+						}
+						if let Some(usage) = handler_result.get("usage") {
+							set_field(&mut current_event, "usage", usage.clone());
+							modified = true;
+						}
+					}
+					Ok(_) => {}
+					Err(error) => {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": "tool_result",
+							"error": error,
+						}));
+					}
+				}
+			}
+		}
+		if !modified {
+			return Ok(None);
+		}
+		let mut result = Map::new();
+		for key in ["content", "details", "structuredContent", "isError", "usage"] {
+			if let Some(value) = current_event.get(key) {
+				result.insert(key.to_string(), value.clone());
+			}
+		}
+		Ok(Some(Value::Object(result)))
+	}
+
+	/// `emitToolCall(event)` — truthy results accumulate (last wins), a
+	/// truthy `block` short-circuits; handler throws are NOT caught.
+	pub async fn emit_tool_call(&self, event: Value) -> Result<Option<Value>, String> {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let mut result: Option<Value> = None;
+		for (_, handlers) in self.snapshot_handlers("tool_call") {
+			for (_, handler) in handlers {
+				let outcome = handler(event.clone(), ctx.clone()).await?;
+				if let Some(handler_result) = outcome.result {
+					if js_truthy(&handler_result) {
+						if handler_result.get("block").map(js_truthy).unwrap_or(false) {
+							return Ok(Some(handler_result));
+						}
+						result = Some(handler_result);
+					}
+				}
+			}
+		}
+		Ok(result)
+	}
+
+	/// `emitBeforeProviderRequest(payload)` — any non-undefined result
+	/// replaces the payload (last wins).
+	pub async fn emit_before_provider_request(&self, payload: Value) -> Value {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let mut current = payload;
+		for (extension_path, handlers) in self.snapshot_handlers("before_provider_request") {
+			for (_, handler) in handlers {
+				let event = json!({"type": "before_provider_request", "payload": current.clone()});
+				match handler(event, ctx.clone()).await {
+					Ok(HandlerOutcome { result: Some(result), .. }) => current = result,
+					Ok(_) => {}
+					Err(error) => {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": "before_provider_request",
+							"error": error,
+						}));
+					}
+				}
+			}
+		}
+		current
+	}
+
+	/// `emitBeforeProviderHeaders(headers)` — handlers mutate `headers` in
+	/// place (return value ignored); mutations accumulate.
+	pub async fn emit_before_provider_headers(&self, headers: Value) -> Value {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let mut current = headers;
+		for (extension_path, handlers) in self.snapshot_handlers("before_provider_headers") {
+			for (_, handler) in handlers {
+				let event = json!({"type": "before_provider_headers", "headers": current.clone()});
+				match handler(event, ctx.clone()).await {
+					Ok(HandlerOutcome { event: returned, .. }) => {
+						if let Some(next) = returned.get("headers") {
+							current = next.clone();
+						}
+					}
+					Err(error) => {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": "before_provider_headers",
+							"error": error,
+						}));
+					}
+				}
+			}
+		}
+		current
+	}
+
+	/// `emitResourcesDiscover(cwd, reason)` — collects each handler's
+	/// non-empty path lists tagged with the extension path.
+	pub async fn emit_resources_discover(&self, cwd: &str, reason: Value) -> Value {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let mut skill_paths: Vec<Value> = Vec::new();
+		let mut prompt_paths: Vec<Value> = Vec::new();
+		let mut theme_paths: Vec<Value> = Vec::new();
+		for (extension_path, handlers) in self.snapshot_handlers("resources_discover") {
+			for (_, handler) in handlers {
+				let event = json!({"type": "resources_discover", "cwd": cwd, "reason": reason.clone()});
+				match handler(event, ctx.clone()).await {
+					Ok(HandlerOutcome { result: Some(result), .. }) => {
+						collect_paths(&result, "skillPaths", &extension_path, &mut skill_paths);
+						collect_paths(&result, "promptPaths", &extension_path, &mut prompt_paths);
+						collect_paths(&result, "themePaths", &extension_path, &mut theme_paths);
+					}
+					Ok(_) => {}
+					Err(error) => {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": "resources_discover",
+							"error": error,
+						}));
+					}
+				}
+			}
+		}
+		json!({"skillPaths": skill_paths, "promptPaths": prompt_paths, "themePaths": theme_paths})
+	}
+
+	/// `emitInput(text, images, source, streamingBehavior)` — transforms
+	/// chain, `handled` short-circuits; the final result is `transform` only
+	/// when something changed.
+	pub async fn emit_input(
+		&self,
+		text: &str,
+		images: Option<Value>,
+		source: Value,
+		streaming_behavior: Option<Value>,
+	) -> Value {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let original_text = json!(text);
+		let original_images = images.clone();
+		let mut current_text: Option<Value> = Some(original_text.clone());
+		let mut current_images: Option<Value> = original_images.clone();
+		for (extension_path, handlers) in self.snapshot_handlers("input") {
+			for (_, handler) in handlers {
+				let mut event = json!({"type": "input", "source": source});
+				if let Some(value) = &current_text {
+					event["text"] = value.clone();
+				}
+				if let Some(value) = &current_images {
+					event["images"] = value.clone();
+				}
+				if let Some(behavior) = &streaming_behavior {
+					event["streamingBehavior"] = behavior.clone();
+				}
+				match handler(event, ctx.clone()).await {
+					Ok(HandlerOutcome { result: Some(result), .. }) => {
+						match result.get("action").and_then(Value::as_str) {
+							Some("handled") => return result,
+							Some("transform") => {
+								// `currentText = result.text` (undefined stays
+								// undefined → the key disappears on jstr).
+								current_text = result.get("text").cloned();
+								if let Some(images) = result.get("images") {
+									if !images.is_null() {
+										current_images = Some(images.clone());
+									}
+								}
+							}
+							_ => {}
+						}
+					}
+					Ok(_) => {}
+					Err(error) => {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": "input",
+							"error": error,
+						}));
+					}
+				}
+			}
+		}
+		if current_text != Some(original_text) || current_images != original_images {
+			let mut result = Map::new();
+			result.insert("action".to_string(), json!("transform"));
+			if let Some(text) = current_text {
+				result.insert("text".to_string(), text);
+			}
+			if let Some(images) = current_images {
+				result.insert("images".to_string(), images);
+			}
+			Value::Object(result)
+		} else {
+			json!({"action": "continue"})
+		}
+	}
+
+	/// `emitBoundary(baseEvent, buildContext)` — the host rebuild hook runs
+	/// once up front (a throw escapes) and after every handler; a failing
+	/// rebuild marks the batch invalid (`Invalid boundary entries: …`).
+	pub async fn emit_boundary(
+		&self,
+		base_event: Value,
+		build_context: BoundaryBuildContext,
+	) -> Result<Value, String> {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let event_type = base_event.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+		let mut entries: Vec<Value> = Vec::new();
+		let mut should_continue = false;
+		let mut context = build_context(entries.clone()).await?;
+		let mut valid = true;
+		for (extension_path, handlers) in self.snapshot_handlers(&event_type) {
+			for (_, handler) in handlers {
+				let mut event = base_event.clone();
+				if let Some(object) = event.as_object_mut() {
+					object.insert("entries".to_string(), json!(entries));
+					object.insert("continue".to_string(), json!(should_continue));
+					object.insert("context".to_string(), context.clone());
+				}
+				match handler(event, ctx.clone()).await {
+					Ok(HandlerOutcome { result: Some(result), .. }) => {
+						if let Some(next) = result.get("entries") {
+							entries = next.as_array().cloned().unwrap_or_default();
+						}
+						if let Some(next) = result.get("continue") {
+							should_continue = js_truthy(next);
+						}
+					}
+					Ok(_) => {}
+					Err(error) => {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": event_type,
+							"error": error,
+						}));
+					}
+				}
+				match build_context(entries.clone()).await {
+					Ok(next) => {
+						context = next;
+						valid = true;
+					}
+					Err(message) => {
+						valid = false;
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": event_type,
+							"error": format!("Invalid boundary entries: {}", message),
+						}));
+					}
+				}
+			}
+		}
+		if valid {
+			Ok(json!({"entries": entries, "continue": should_continue, "context": context, "valid": true}))
+		} else {
+			Ok(json!({"entries": [], "continue": false, "context": context, "valid": false}))
+		}
+	}
+
+	/// `emitContext(messages)` — two phases: `context` handlers see the
+	/// conversation without system messages (with `restoreSystemMessages`
+	/// re-attaching the replay head), then `context_with_system` handlers
+	/// see the full transcript; losing a leading system message is reported
+	/// but honored.
+	pub async fn emit_context(&self, messages: Value) -> Result<Value, String> {
+		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let mut current: Vec<Value> = match messages {
+			Value::Array(array) => array,
+			_ => Vec::new(),
+		};
+
+		for (extension_path, handlers) in self.snapshot_handlers("context") {
+			for (_, handler) in handlers {
+				let outcome: Result<(), String> = async {
+					let visible: Vec<Value> = current
+						.iter()
+						.filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+						.cloned()
+						.collect();
+					let snapshot = visible.clone();
+					let event = json!({"type": "context", "messages": visible.clone()});
+					let outcome = handler(event, ctx.clone()).await?;
+					// In-place edits of `event.messages` are the visible array.
+					let visible_after: Vec<Value> = outcome
+						.event
+						.get("messages")
+						.and_then(Value::as_array)
+						.cloned()
+						.unwrap_or(visible);
+					// `handlerResult?.messages ?? (same ? undefined : visible)`.
+					let returned = match outcome
+						.result
+						.as_ref()
+						.and_then(|result| result.get("messages"))
+					{
+						Some(value) if !value.is_null() => Some(value.clone()),
+						_ => {
+							if same_messages(&visible_after, &snapshot) {
+								None
+							} else {
+								Some(json!(visible_after))
+							}
+						}
+					};
+					let Some(returned) = returned else { return Ok::<(), String>(()) };
+					// `if (!returned) continue` — jstr-model falsy values.
+					if !js_truthy(&returned) {
+						return Ok(());
+					}
+					let Some(returned) = returned.as_array() else {
+						return Err("returned is not iterable".to_string());
+					};
+					current = restore_system_messages(&current, &snapshot, returned)?;
+					Ok(())
+				}
+				.await;
+				if let Err(error) = outcome {
+					self.emit_error(&json!({
+						"extensionPath": extension_path,
+						"event": "context",
+						"error": error,
+					}));
+				}
+			}
+		}
+
+		for (extension_path, handlers) in self.snapshot_handlers("context_with_system") {
+			for (_, handler) in handlers {
+				let outcome: Result<(), String> = async {
+					let had_leading = current
+						.first()
+						.and_then(|message| message.get("role"))
+						.and_then(Value::as_str)
+						== Some("system");
+					let event = json!({"type": "context_with_system", "messages": current.clone()});
+					let outcome = handler(event, ctx.clone()).await?;
+					current = match outcome.result.as_ref().and_then(|result| result.get("messages")) {
+						Some(value) if !value.is_null() => value
+							.as_array()
+							.cloned()
+							.unwrap_or_else(|| current.clone()),
+						_ => outcome
+							.event
+							.get("messages")
+							.and_then(Value::as_array)
+							.cloned()
+							.unwrap_or_else(|| current.clone()),
+					};
+					let leading_now = current
+						.first()
+						.and_then(|message| message.get("role"))
+						.and_then(Value::as_str)
+						== Some("system");
+					if had_leading && !leading_now {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": "context_with_system",
+							"error": "Handler removed the leading system message; the request has no prompt or initial tool declarations. Keep it at index 0 or replace a dropped prefix with getCurrentSystemMessage().",
+						}));
+					}
+					Ok::<(), String>(())
+				}
+				.await;
+				if let Err(error) = outcome {
+					self.emit_error(&json!({
+						"extensionPath": extension_path,
+						"event": "context_with_system",
+						"error": error,
+					}));
+				}
+			}
+		}
+
+		Ok(json!(current))
 	}
 
 	/// `createToolContext(toolCallId, signal)` — the guarded `tools` getter
@@ -2897,6 +3485,391 @@ mod tests {
 		assert_eq!(api.send_message(json!({}), json!({})).unwrap_err(), DEFAULT_STALE_MESSAGE);
 	}
 
+	fn handler_returning(result: Value) -> ExtensionHandler {
+		Arc::new(move |event, _ctx| {
+			let result = result.clone();
+			Box::pin(async move { Ok(HandlerOutcome { event, result: Some(result) }) })
+		})
+	}
+
+	fn handler_undefined() -> ExtensionHandler {
+		Arc::new(|event, _ctx| Box::pin(async move { Ok(HandlerOutcome { event, result: None }) }))
+	}
+
+	#[tokio::test]
+	async fn emit_cache_warming_decision_overrides() {
+		let runner = runner_with_handlers(
+			"cache_warming_decision",
+			vec![handler_undefined(), handler_returning(json!({"action": "skip"}))],
+		)
+		.await;
+		let event = json!({"type": "cache_warming_decision", "action": "warm"});
+		assert_eq!(runner.emit_cache_warming_decision(event).await, json!("skip"));
+
+		// present null overrides; a result without the key keeps the action.
+		let runner = runner_with_handlers(
+			"cache_warming_decision",
+			vec![handler_returning(json!({})), handler_returning(json!({"action": null}))],
+		)
+		.await;
+		let event = json!({"type": "cache_warming_decision", "action": "warm"});
+		assert_eq!(runner.emit_cache_warming_decision(event).await, Value::Null);
+	}
+
+	#[tokio::test]
+	async fn emit_tool_result_patches_and_deletes_structured() {
+		let runner = runner_with_handlers(
+			"tool_result",
+			vec![handler_returning(json!({"content": [{"type": "text", "text": "new"}]}))],
+		)
+		.await;
+		let event = json!({
+			"type": "tool_result",
+			"toolCallId": "c1",
+			"content": [{"type": "text", "text": "old"}],
+			"details": {"d": 1},
+			"structuredContent": {"s": 1},
+			"isError": false,
+			"usage": {"tokens": 1},
+		});
+		let result = runner.emit_tool_result(event).await.unwrap().unwrap();
+		// content replaced; structuredContent deleted (not replaced together);
+		// the return carries only present fields, in TS key order.
+		assert_eq!(
+			result,
+			json!({
+				"content": [{"type": "text", "text": "new"}],
+				"details": {"d": 1},
+				"isError": false,
+				"usage": {"tokens": 1},
+			})
+		);
+		assert_eq!(
+			result.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+			vec!["content", "details", "isError", "usage"]
+		);
+
+		// no modifications → None; falsy results are ignored.
+		let runner = runner_with_handlers(
+			"tool_result",
+			vec![handler_returning(Value::Null), handler_undefined()],
+		)
+		.await;
+		let event = json!({"type": "tool_result", "content": [], "details": {}});
+		assert_eq!(runner.emit_tool_result(event).await.unwrap(), None);
+
+		// replacing structuredContent explicitly keeps the key.
+		let runner = runner_with_handlers(
+			"tool_result",
+			vec![handler_returning(json!({"content": [], "structuredContent": {"s": 2}}))],
+		)
+		.await;
+		let event = json!({"type": "tool_result", "content": [], "structuredContent": {"s": 1}});
+		let result = runner.emit_tool_result(event).await.unwrap().unwrap();
+		assert_eq!(result["structuredContent"], json!({"s": 2}));
+	}
+
+	#[tokio::test]
+	async fn emit_tool_call_truthy_block_and_rethrow() {
+		let runner = runner_with_handlers(
+			"tool_call",
+			vec![
+				handler_returning(json!({"block": false, "reason": "a"})),
+				handler_returning(json!({"block": true, "reason": "b"})),
+				handler_returning(json!({"block": false, "reason": "c"})),
+			],
+		)
+		.await;
+		let event = json!({"type": "tool_call", "toolName": "read"});
+		assert_eq!(
+			runner.emit_tool_call(event).await.unwrap(),
+			Some(json!({"block": true, "reason": "b"}))
+		);
+		// last truthy wins when nothing blocks.
+		let runner = runner_with_handlers(
+			"tool_call",
+			vec![
+				handler_returning(json!({"reason": "a"})),
+				handler_returning(json!({"reason": "b"})),
+			],
+		)
+		.await;
+		let event = json!({"type": "tool_call"});
+		assert_eq!(
+			runner.emit_tool_call(event).await.unwrap(),
+			Some(json!({"reason": "b"}))
+		);
+		// throws propagate with NO emitError.
+		let thrower: ExtensionHandler =
+			Arc::new(|_event, _ctx| Box::pin(async { Err("tc boom".to_string()) }));
+		let runner = runner_with_handlers("tool_call", vec![thrower]).await;
+		let errors: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+		let listener = Arc::clone(&errors);
+		runner.on_error(Arc::new(move |error| listener.lock().unwrap().push(error.clone())));
+		assert_eq!(runner.emit_tool_call(json!({"type": "tool_call"})).await.unwrap_err(), "tc boom");
+		assert!(errors.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn emit_provider_hooks_and_resources() {
+		let runner = runner_with_handlers(
+			"before_provider_request",
+			vec![handler_returning(Value::Null), handler_returning(json!({"x": 1}))],
+		)
+		.await;
+		assert_eq!(
+			runner.emit_before_provider_request(json!({"p": 0})).await,
+			json!({"x": 1})
+		);
+
+		// headers: in-place mutation read back, return value ignored.
+		let mutator: ExtensionHandler = Arc::new(|mut event, _ctx| {
+			Box::pin(async move {
+				event["headers"]["authorization"] = json!("token");
+				Ok(HandlerOutcome { event, result: Some(json!({"ignored": true})) })
+			})
+		});
+		let runner = runner_with_handlers("before_provider_headers", vec![mutator]).await;
+		assert_eq!(
+			runner.emit_before_provider_headers(json!({"accept": "a"})).await,
+			json!({"accept": "a", "authorization": "token"})
+		);
+
+		// resources_discover: non-empty lists tagged with the extension path
+		// (`<inline>` here); empty lists contribute nothing.
+		let runner = runner_with_handlers(
+			"resources_discover",
+			vec![
+				handler_returning(json!({"skillPaths": ["/s1"], "promptPaths": [], "themePaths": ["/t1"]})),
+				handler_returning(json!({"skillPaths": ["/s2"]})),
+			],
+		)
+		.await;
+		assert_eq!(
+			runner.emit_resources_discover("/proj", json!("startup")).await,
+			json!({
+				"skillPaths": [
+					{"path": "/s1", "extensionPath": "<inline>"},
+					{"path": "/s2", "extensionPath": "<inline>"}
+				],
+				"promptPaths": [],
+				"themePaths": [{"path": "/t1", "extensionPath": "<inline>"}]
+			})
+		);
+	}
+
+	#[tokio::test]
+	async fn emit_input_transform_chain_and_handled() {
+		let transform: ExtensionHandler = Arc::new(|event, _ctx| {
+			Box::pin(async move {
+				let text = event["text"].as_str().unwrap_or("").to_string();
+				Ok(HandlerOutcome {
+					event,
+					result: Some(json!({"action": "transform", "text": format!("{text}!")})),
+				})
+			})
+		});
+		let runner = runner_with_handlers("input", vec![transform]).await;
+		assert_eq!(
+			runner.emit_input("hi", None, json!("user"), None).await,
+			json!({"action": "transform", "text": "hi!"})
+		);
+		// nothing changed → continue.
+		let runner = runner_with_handlers("input", vec![handler_undefined()]).await;
+		assert_eq!(
+			runner.emit_input("hi", Some(json!([{"type": "image"}])), json!("user"), None).await,
+			json!({"action": "continue"})
+		);
+		// handled short-circuits and returns the handler result as-is.
+		let runner = runner_with_handlers(
+			"input",
+			vec![handler_returning(json!({"action": "handled", "text": "x"}))],
+		)
+		.await;
+		assert_eq!(
+			runner.emit_input("hi", None, json!("user"), None).await,
+			json!({"action": "handled", "text": "x"})
+		);
+	}
+
+	#[tokio::test]
+	async fn emit_boundary_entries_context_validity() {
+		// buildContext echoes the entries it receives.
+		let build: BoundaryBuildContext = Arc::new(|entries: Vec<Value>| {
+			Box::pin(async move { Ok(json!({"count": entries.len()})) })
+		});
+		let runner = runner_with_handlers(
+			"turn_end",
+			vec![
+				handler_returning(json!({"entries": [{"k": 1}], "continue": true})),
+				handler_returning(json!({"entries": [{"k": 1}, {"k": 2}]})),
+			],
+		)
+		.await;
+		let result = runner
+			.emit_boundary(json!({"type": "turn_end", "turn": 3}), build)
+			.await
+			.unwrap();
+		assert_eq!(
+			result,
+			json!({
+				"entries": [{"k": 1}, {"k": 2}],
+				"continue": true,
+				"context": {"count": 2},
+				"valid": true
+			})
+		);
+		assert_eq!(
+			result.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+			vec!["entries", "continue", "context", "valid"]
+		);
+
+		// a failing rebuild marks invalid; the error is reported per handler.
+		let build: BoundaryBuildContext = Arc::new(|entries: Vec<Value>| {
+			Box::pin(async move {
+				if entries.len() > 1 {
+					Err("bad draft".to_string())
+				} else {
+					Ok(json!({"count": entries.len()}))
+				}
+			})
+		});
+		let runner = runner_with_handlers(
+			"turn_end",
+			vec![handler_returning(json!({"entries": [{"k": 1}, {"k": 2}]}))],
+		)
+		.await;
+		let errors: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+		let listener = Arc::clone(&errors);
+		runner.on_error(Arc::new(move |error| listener.lock().unwrap().push(error.clone())));
+		let result = runner.emit_boundary(json!({"type": "turn_end"}), build).await.unwrap();
+		assert_eq!(result, json!({"entries": [], "continue": false, "context": {"count": 0}, "valid": false}));
+		let errors = errors.lock().unwrap().clone();
+		assert_eq!(errors[0]["error"], json!("Invalid boundary entries: bad draft"));
+
+		// the initial buildContext throw escapes (no catch).
+		let build: BoundaryBuildContext =
+			Arc::new(|_entries| Box::pin(async { Err("init boom".to_string()) }));
+		let runner = runner_with_handlers("turn_end", vec![]).await;
+		assert_eq!(
+			runner.emit_boundary(json!({"type": "turn_end"}), build).await.unwrap_err(),
+			"init boom"
+		);
+	}
+
+	#[tokio::test]
+	async fn emit_context_restores_system_head() {
+		let original = json!([
+			{"role": "system", "content": "HEAD", "timestamp": 7},
+			{"role": "user", "content": [{"type": "text", "text": "hi"}]}
+		]);
+		// unchanged (undefined result) keeps the transcript as-is.
+		let runner = runner_with_handlers("context", vec![handler_undefined()]).await;
+		assert_eq!(runner.emit_context(original.clone()).await.unwrap(), original);
+
+		// a replaced list gets the replayed head prepended.
+		let runner = runner_with_handlers(
+			"context",
+			vec![handler_returning(json!({"messages": [{"role": "user", "content": "new"}]}))],
+		)
+		.await;
+		assert_eq!(
+			runner.emit_context(original.clone()).await.unwrap(),
+			json!([
+				{"role": "system", "content": "HEAD", "timestamp": 7},
+				{"role": "user", "content": "new"}
+			])
+		);
+
+		// an in-place edit (no return) is detected against the snapshot.
+		let pusher: ExtensionHandler = Arc::new(|mut event, _ctx| {
+			Box::pin(async move {
+				if let Some(messages) = event["messages"].as_array_mut() {
+					messages.push(json!({"role": "assistant", "content": "added"}));
+				}
+				Ok(HandlerOutcome { event, result: None })
+			})
+		});
+		let runner = runner_with_handlers("context", vec![pusher]).await;
+		assert_eq!(
+			runner.emit_context(original).await.unwrap(),
+			json!([
+				{"role": "system", "content": "HEAD", "timestamp": 7},
+				{"role": "user", "content": [{"type": "text", "text": "hi"}]},
+				{"role": "assistant", "content": "added"}
+			])
+		);
+	}
+
+	#[test]
+	fn current_system_message_replays_parts() {
+		// contentText joins multi-block content with "\n"; sections patch by
+		// name (null deletes); tools resolve by name in order.
+		let messages = json!([
+			{"role": "system", "content": [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}], "timestamp": 1},
+			{"role": "user", "content": "u"},
+			{"role": "system", "content": "C", "sections": {"x": "1", "y": "2"}, "toolsAdded": [{"name": "read", "v": 1}]},
+			{"role": "system", "content": "", "sections": {"x": null}, "toolsAdded": [{"name": "bash", "v": 2}], "toolsRemoved": [{"name": "read"}]}
+		]);
+		let head = get_current_system_message(messages.as_array().unwrap()).unwrap().unwrap();
+		assert_eq!(
+			head,
+			json!({
+				"role": "system",
+				"content": "A\nB\n\nC",
+				"sections": {"y": "2"},
+				"toolsAdded": [{"name": "bash", "v": 2}],
+				"timestamp": 1
+			})
+		);
+		assert_eq!(
+			head.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+			vec!["role", "content", "sections", "toolsAdded", "timestamp"]
+		);
+		// no timestamps and no tools → undefined, even with content.
+		let none = get_current_system_message(&[json!({"role": "system", "content": "x"})])
+			.unwrap();
+		assert_eq!(none, None);
+		// tools alone suffice.
+		let tools_only = get_current_system_message(&[json!({
+			"role": "system",
+			"content": "",
+			"toolsAdded": [{"name": "t"}]
+		})])
+		.unwrap()
+		.unwrap();
+		assert_eq!(tools_only["timestamp"], json!(0));
+	}
+
+	#[tokio::test]
+	async fn emit_context_with_system_reports_lost_head() {
+		let original = json!([
+			{"role": "system", "content": "S", "timestamp": 1},
+			{"role": "user", "content": "u"}
+		]);
+		let runner = runner_with_handlers(
+			"context_with_system",
+			vec![handler_returning(json!({"messages": [{"role": "user", "content": "only"}]}))],
+		)
+		.await;
+		let errors: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+		let listener = Arc::clone(&errors);
+		runner.on_error(Arc::new(move |error| listener.lock().unwrap().push(error.clone())));
+		assert_eq!(
+			runner.emit_context(original).await.unwrap(),
+			json!([{"role": "user", "content": "only"}])
+		);
+		let errors = errors.lock().unwrap().clone();
+		assert_eq!(errors.len(), 1);
+		assert!(errors[0]["error"].as_str().unwrap().starts_with("Handler removed the leading system message;"));
+		// keeping the head is silent.
+		let runner = runner_with_handlers("context_with_system", vec![handler_undefined()]).await;
+		assert!(runner
+			.emit_context(json!([{"role": "system", "content": "S", "timestamp": 1}]))
+			.await
+			.is_ok());
+	}
+
 	#[test]
 	fn user_bash_result_validator() {
 		let valid_result = json!({
@@ -3043,11 +4016,11 @@ mod tests {
 		let runner = ExtensionRunner::new(vec![], runtime, "/proj", None);
 		// createContext class-field defaults (pre-bind); the `isIdle`/
 		// `getSystemPrompt`-style members are METHODS (ctx_call).
-		assert_eq!(runner.ctx_call("isIdle").unwrap(), json!(true));
-		assert_eq!(runner.ctx_call("isProjectTrusted").unwrap(), json!(true));
-		assert_eq!(runner.ctx_call("hasPendingMessages").unwrap(), json!(false));
-		assert_eq!(runner.ctx_call("getContextUsage").unwrap(), Value::Null);
-		assert_eq!(runner.ctx_call("getSystemPrompt").unwrap(), json!(""));
+		assert_eq!(runner.ctx_call_args("isIdle", &[]).unwrap(), json!(true));
+		assert_eq!(runner.ctx_call_args("isProjectTrusted", &[]).unwrap(), json!(true));
+		assert_eq!(runner.ctx_call_args("hasPendingMessages", &[]).unwrap(), json!(false));
+		assert_eq!(runner.ctx_call_args("getContextUsage", &[]).unwrap(), Value::Null);
+		assert_eq!(runner.ctx_call_args("getSystemPrompt", &[]).unwrap(), json!(""));
 		assert_eq!(runner.ctx_read("signal").unwrap(), Value::Null);
 		assert_eq!(runner.ctx_read("scopedModels").unwrap(), json!([]));
 		assert_eq!(runner.ctx_read("model").unwrap(), Value::Null);
@@ -3068,11 +4041,11 @@ mod tests {
 			Arc::new(TestContextActions),
 			ProviderHooks::default(),
 		);
-		assert_eq!(runner.ctx_call("isIdle").unwrap(), json!(false));
-		assert_eq!(runner.ctx_call("isProjectTrusted").unwrap(), json!(false));
-		assert_eq!(runner.ctx_call("hasPendingMessages").unwrap(), json!(true));
-		assert_eq!(runner.ctx_call("getContextUsage").unwrap(), json!({"tokens": 5}));
-		assert_eq!(runner.ctx_call("getSystemPrompt").unwrap(), json!("SYS"));
+		assert_eq!(runner.ctx_call_args("isIdle", &[]).unwrap(), json!(false));
+		assert_eq!(runner.ctx_call_args("isProjectTrusted", &[]).unwrap(), json!(false));
+		assert_eq!(runner.ctx_call_args("hasPendingMessages", &[]).unwrap(), json!(true));
+		assert_eq!(runner.ctx_call_args("getContextUsage", &[]).unwrap(), json!({"tokens": 5}));
+		assert_eq!(runner.ctx_call_args("getSystemPrompt", &[]).unwrap(), json!("SYS"));
 		assert_eq!(runner.ctx_read("signal").unwrap(), json!("sig"));
 		assert_eq!(runner.ctx_read("scopedModels").unwrap(), json!(["s"]));
 		assert_eq!(runner.ctx_read("model").unwrap(), json!({"id": "m"}));
