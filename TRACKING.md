@@ -1,8 +1,39 @@
 # pi-rs Port Tracking
 
-# pi-rs Port Tracking
+## ⚠️ Current checkpoint (2026-10-22) — resume here
 
-## ⚠️ Current checkpoint (2026-10-20) — resume here
+**State: phase 4 tranche 5 (mcp-connection) COMPLETE and
+parity-green (2851/2851).** Working tree at the last checkpoint
+was mid-tranche; everything since (runtime.rs, harnesses, 52
+mcc/ cases) landed and is committed as the tranche-5 feat+docs
+pair. Full record: the "Phase 4 tranche 5" roadmap entry below +
+`docs/plans/phase4-tranche5-mcp-connection.md` (kept as the
+design/decision record — client async→sync mapping, runtime port
+design incl. the take_close_fired/process_client_close seam and
+client-id-seq model, harness protocol, case constraints).
+
+**Next up** (per `docs/plans/phase3-mcp-extensions.md` steps 7-10
+and the roadmap tail): extension-runner remaining slices
+(discovery, command/tool execution, real ExtensionContext), mcp
+extension wiring + mcp-section, tools/* slices, then the shared
+typebox-walker refactor.
+
+**Toolchain note:** bash must export
+`RUSTUP_HOME=$HOME/AI/.rustup CARGO_HOME=$HOME/AI/.cargo PATH=$HOME/AI/.cargo/bin:$PATH`
+(cargo lives in ~/AI, not ~/.cargo, because of sandbox access guards).
+Parity: `node parity/run-parity.mjs` (PI_REPO default
+`/home/shinobi/AI/pi-repo`).
+
+**Sandbox note (bwrap):** every bash call gets a FRESH private
+/tmp. The pi-photon `ground_truth_byte_parity` test reads
+/tmp/imgtest/, so generate the fixtures (node
+scripts/gen-photon-ground-truth.mjs — its header lists the
+parity/fixtures/ copies) AND run `cargo test -p pi-photon` in the
+SAME bash call. A plain `cargo test --workspace` from a fresh
+call fails only that test — environmental, not a regression.
+(Last full run: 2054 passed, 0 failed, fixtures in place.)
+
+## Previous checkpoint (2026-10-20) — superseded
 
 **State: facade wave COMPLETE and parity-green (1760/1760).**
 Landed on main through 0f55321:
@@ -1552,9 +1583,61 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       ~/AI/pi-repo (persistent reference checkout) instead of
       /tmp/pi-repo (wiped per bwrap bash call); photon ground
       truth generator made ESM-correct.
+- [x] **Phase 4 tranche 5 — mcp-connection
+      (pi-mcp client.ts + extensions/mcp/runtime.ts).**
+      `crates/pi-extensions/src/mcp/client.rs` (~1270 LOC): full
+      McpClient port — McpErrorKind taxonomy (jsonrpc/http/
+      auth-required/session-expired/oauth-required/type/closed),
+      connect handshake (initialize → supported-protocol check
+      → notifications/initialized), request/notify with the
+      mailbox+task deferral model (transport listeners push
+      ClientEvents; each op drains exactly the range appended
+      during it; nested sends drain recursively; server→client
+      requests deferred via tasks, unknown methods answered
+      -32601 synchronously), parked-request timeout pump +
+      notifications/cancelled, list pagination (listAll/listPage,
+      validation, duplicate-cursor, MAX_LIST_PAGES),
+      readResource/callTool validation, name defaulting.
+      `runtime.rs` (~1185 LOC): McpServerConnection port —
+      ServerState machine (connecting/connected/disconnected/
+      needs-auth/failed/closed), connectOnce (client "pi"
+      /"1.3.0", pathToFileURL root, capability gating,
+      instructions trim, error path closes client), with_client
+      (read-only transient retry, session-expired reconnect,
+      needs-auth promotion — all by client-id seq),
+      open() connect retries (url only: [250,1000]; stdio
+      none), connect_failed → needs-auth vs failed,
+      handleClientClose via the take_close_fired/
+      process_client_close seam (Rust can't hold client
+      closures; TS dropped clients not retained — documented),
+      tools/list_changed refresh (results discarded when the
+      client went stale — matches TS's client!==this.client
+      check, discovered via a stale unit-test expectation),
+      withoutTemplates METHOD_NOT_FOUND → [], log sink
+      through mcp::log::McpServerLog, close ordering (state=
+      closed + changed() before client.close()),
+      presence-only auth seam (McpAuthProvider + credential
+      store trait). transport.rs refactored: TransportError
+      gone (all failures McpErrorKind), FakeTransport
+      send_steps are per-send BATCHES (the handshake alone is
+      3 sends). Harness `mcp-connection`
+      (mcp_connection_harness.rs + ts-harness entry; both sides
+      script per-send batches + pinned per-step Date; shared
+      MemoryMcpLogFs), 52 cases (mcc/) covering connect +
+      callTool/resources/pagination/validation flows, read-only
+      transient retry vs callTool no-retry, connect retries
+      (url vs stdio), session-expired, auth flows (needs-auth +
+      sign-in message vs propagated), timeouts +
+      notifications/cancelled, transport drops → disconnected
+      + reconnect-on-next-op, emit close/ping/roots/unknown,
+      list_changed refresh (incl. the handshake-window
+      stale-client case), message logging, reconnect/signOut/
+      close ordering, snapshots, harness argument errors.
+      Suite **2851/2851** (full parity incl. filesystem
+      snapshots). Clippy clean on all new code. pi-extensions
+      40 unit tests; one stale expectation fixed (see above).
 - [ ] Remaining roadmap (see docs/plans/phase3-mcp-extensions.md
-      steps 7-10): pi-extensions crate (mcp log/transport/fake
-      + runtime connection state machine), extension-runner
-      remaining slices (discovery, command/tool execution, real
+      steps 7-10): extension-runner remaining slices
+      (discovery, command/tool execution, real
       ExtensionContext), mcp extension wiring + mcp-section,
       tools/* slices, typebox-walker refactor.
