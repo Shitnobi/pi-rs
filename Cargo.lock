@@ -519,6 +519,7 @@ name = "pi-session"
 version = "0.1.0"
 dependencies = [
  "fancy-regex",
+ "libc",
  "pi-agent",
  "pi-core",
  "pi-providers",
