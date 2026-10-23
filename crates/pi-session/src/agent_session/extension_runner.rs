@@ -36,6 +36,7 @@ use pi_core::mcp_servers::{
 };
 use serde_json::{json, Map, Value};
 
+use super::exec::{exec_command, ExecResult};
 use super::system_prompt::{build_system_prompt, normalize_options_raw, DocPaths};
 use super::ExtensionHost;
 
@@ -766,6 +767,8 @@ pub struct ExtensionApi {
 	runtime: ExtensionRuntime,
 	loading: Arc<Mutex<LoadingState>>,
 	bus: Option<Arc<EventBusController>>,
+	/// The loader's resolved cwd — `pi.exec`'s `options?.cwd ?? cwd`.
+	cwd: String,
 }
 
 /// Unsubscribe handle for `pi.on` (the returned function).
@@ -809,6 +812,114 @@ impl ExtensionApi {
 			drop(loading);
 			change.apply(&self.runtime)
 		}
+	}
+
+	// ---- Action methods (`assertActive()` then runtime delegation) -----
+
+	/// `pi.sendMessage(message, options?)`.
+	pub fn send_message(&self, message: Value, options: Value) -> Result<(), String> {
+		self.assert_active()?;
+		self.runtime.send_message(message, options)
+	}
+
+	/// `pi.sendUserMessage(content, options?)`.
+	pub fn send_user_message(&self, content: Value, options: Value) -> Result<(), String> {
+		self.assert_active()?;
+		self.runtime.send_user_message(content, options)
+	}
+
+	/// `pi.appendEntry(customType, data?)`.
+	pub fn append_entry(&self, custom_type: &str, data: Value) -> Result<(), String> {
+		self.assert_active()?;
+		self.runtime.append_entry(custom_type, data)
+	}
+
+	/// `pi.setSessionName(name)`.
+	pub fn set_session_name(&self, name: &str) -> Result<(), String> {
+		self.assert_active()?;
+		self.runtime.set_session_name(name)
+	}
+
+	/// `pi.getSessionName()` (`undefined` → `Value::Null`).
+	pub fn get_session_name(&self) -> Result<Value, String> {
+		self.assert_active()?;
+		self.runtime.get_session_name()
+	}
+
+	/// `pi.setLabel(entryId, label)`.
+	pub fn set_label(&self, entry_id: &str, label: Value) -> Result<(), String> {
+		self.assert_active()?;
+		self.runtime.set_label(entry_id, label)
+	}
+
+	/// `pi.getActiveTools()`.
+	pub fn get_active_tools(&self) -> Result<Vec<String>, String> {
+		self.assert_active()?;
+		self.runtime.get_active_tools()
+	}
+
+	/// `pi.getAllTools()`.
+	pub fn get_all_tools(&self) -> Result<Value, String> {
+		self.assert_active()?;
+		self.runtime.get_all_tools()
+	}
+
+	/// `pi.getSettings()`.
+	pub fn get_settings(&self) -> Result<Value, String> {
+		self.assert_active()?;
+		self.runtime.get_settings()
+	}
+
+	/// `pi.setActiveTools(toolNames)`.
+	pub fn set_active_tools(&self, names: &[String]) -> Result<(), String> {
+		self.assert_active()?;
+		self.runtime.set_active_tools(names)
+	}
+
+	/// `pi.refreshTools()`.
+	pub fn refresh_tools(&self) {
+		self.runtime.refresh_tools();
+	}
+
+	/// `pi.getCommands()`.
+	pub fn get_commands(&self) -> Result<Value, String> {
+		self.assert_active()?;
+		self.runtime.get_commands()
+	}
+
+	/// `pi.setModel(model)` — `Err` models the rejected promise.
+	pub fn set_model(&self, model: Value) -> Result<Value, String> {
+		self.assert_active()?;
+		self.runtime.set_model(model)
+	}
+
+	/// `pi.getThinkingLevel()`.
+	pub fn get_thinking_level(&self) -> Result<Value, String> {
+		self.assert_active()?;
+		self.runtime.get_thinking_level()
+	}
+
+	/// `pi.setThinkingLevel(level)`.
+	pub fn set_thinking_level(&self, level: Value) -> Result<(), String> {
+		self.assert_active()?;
+		self.runtime.set_thinking_level(level)
+	}
+
+	/// `pi.exec(command, args, options?)` — `options.cwd ?? loadingCwd`;
+	/// argument validation and process semantics live in [`exec_command`].
+	pub async fn exec(
+		&self,
+		command: Value,
+		args: Value,
+		options: Value,
+	) -> Result<ExecResult, String> {
+		self.assert_active()?;
+		let cwd = options
+			.get("cwd")
+			.and_then(Value::as_str)
+			.map(str::to_string)
+			.unwrap_or_else(|| self.cwd.clone());
+		exec_command(&command, &args, Some(&cwd), &options, None).await
 	}
 
 	/// `pi.on(event, handler)` — returns the unsubscribe token.
@@ -1013,11 +1124,6 @@ impl ExtensionApi {
 			.map(|(_, v)| v.clone()))
 	}
 
-	pub fn get_active_tools(&self) -> Result<Vec<String>, String> {
-		self.assert_active()?;
-		self.runtime.get_active_tools()
-	}
-
 	/// `pi.registerProvider(name, config)`.
 	pub fn register_provider(&self, name: &str, config: Option<&Value>) -> Result<(), String> {
 		self.assert_active()?;
@@ -1186,7 +1292,7 @@ impl ExtensionApi {
 /// visible to both (TS object reference semantics).
 pub async fn load_extension_from_factory(
 	factory: FactoryFn,
-	_cwd: &str,
+	cwd: &str,
 	bus: Option<Arc<EventBusController>>,
 	runtime: &ExtensionRuntime,
 	extension_path: &str,
@@ -1222,6 +1328,7 @@ pub async fn load_extension_from_factory(
 			next_handler_id: 0,
 		})),
 		bus,
+		cwd: cwd.to_string(),
 	};
 	match factory(&api).await {
 		Ok(()) => match api.commit() {
@@ -2214,6 +2321,41 @@ mod tests {
 		assert!(seen[0].contains("- Main documentation: R"), "{}", seen[0]);
 		assert!(seen[0].contains("<cwd>\n/p\n</cwd>"));
 		assert_eq!(seen[1], format!("ctx:{}", &seen[0]["event:".len()..]));
+	}
+
+	#[tokio::test]
+	async fn api_actions_pre_bind_and_exec() {
+		let runtime = ExtensionRuntime::new();
+		let captured: Arc<Mutex<Option<ExtensionApi>>> = Arc::new(Mutex::new(None));
+		let captured_factory = Arc::clone(&captured);
+		let results: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+		let results_factory = Arc::clone(&results);
+		let factory: FactoryFn = Arc::new(move |pi: &ExtensionApi| {
+			*captured_factory.lock().unwrap() = Some(pi.clone());
+			let results = Arc::clone(&results_factory);
+			let pi = pi.clone();
+			Box::pin(async move {
+				// pre-bind: assertActive passes (loading ≠ failed), the runtime
+				// stub throws.
+				match pi.send_message(json!({"customType": "t"}), json!({})) {
+					Ok(()) => results.lock().unwrap().push("ok".to_string()),
+					Err(message) => results.lock().unwrap().push(format!("!{message}")),
+				}
+				// pi.exec runs during loading with the loader cwd.
+				let exec = pi.exec(json!("echo"), json!(["hi"]), json!({})).await.unwrap();
+				results.lock().unwrap().push(format!("exec:{}:{}", exec.stdout, exec.code));
+				Ok(())
+			})
+		});
+		let _extension =
+			load_extension_from_factory(factory, "/", None, &runtime, "<inline>").await.unwrap();
+		let results = results.lock().unwrap().clone();
+		assert_eq!(results[0], format!("!{NOT_INITIALIZED}"));
+		assert_eq!(results[1], "exec:hi\n:0");
+		// A stale runtime fails assertActive with the stale message.
+		let api = captured.lock().unwrap().clone().unwrap();
+		runtime.invalidate(None);
+		assert_eq!(api.send_message(json!({}), json!({})).unwrap_err(), DEFAULT_STALE_MESSAGE);
 	}
 
 	#[tokio::test]

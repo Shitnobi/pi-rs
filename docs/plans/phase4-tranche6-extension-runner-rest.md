@@ -513,7 +513,12 @@ code, killed}`:
       with the SHORT message ("Extension runtime not initialized"). Unit
       test covers the matrix.
        stub matrix (setModel rejected-promise = async Err)
-- [ ] 3. `ExtensionApi` action methods + `pi.exec` (assertActive + runtime
+- [x] 3. `ExtensionApi` action methods + `pi.exec` **DONE**: all 15
+      actions = `assertActive()` (failed-load / stale messages) then runtime
+      delegation; `pi.exec` = assertActive → `execCommand(command, args,
+      options.cwd ?? loadingCwd, options)` (API carries the loader cwd).
+      Test: pre-bind API call throws the loader stub, exec runs during
+      loading, stale runtime fails assertActive.
        delegation)
 - [ ] 4. Full `ContextActions` + `CommandContextActions` traits +
        `bind_command_context`
