@@ -156,9 +156,16 @@ impl CtxView {
 	/// Invoke one context method (TS `ctx.shutdown()`); `Err` = the guarded
 	/// call threw (stale ctx).
 	pub fn call(&self, method: &str) -> Result<Value, String> {
+		self.call_args(method, &[])
+	}
+
+	/// [`CtxView::call`] with positional arguments (`ctx.compact(options)`).
+	pub fn call_args(&self, method: &str, args: &[Value]) -> Result<Value, String> {
 		match self {
 			CtxView::Raw(_) => Err("not a function".to_string()),
-			CtxView::Runner(shared) => ExtensionRunner { shared: Arc::clone(shared) }.ctx_call(method),
+			CtxView::Runner(shared) => {
+				ExtensionRunner { shared: Arc::clone(shared) }.ctx_call_args(method, args)
+			}
 			CtxView::BeforeAgentStart { shared, renderer } => {
 				if method == "getSystemPrompt" {
 					if let Some(message) = shared.stale_message.lock().unwrap().clone() {
@@ -166,7 +173,7 @@ impl CtxView {
 					}
 					return renderer().map(|prompt| json!(prompt));
 				}
-				ExtensionRunner { shared: Arc::clone(shared) }.ctx_call(method)
+				ExtensionRunner { shared: Arc::clone(shared) }.ctx_call_args(method, args)
 			}
 		}
 	}
@@ -1770,53 +1777,91 @@ impl ExtensionRunner {
 		if let Some(message) = self.shared.stale_message.lock().unwrap().clone() {
 			return Err(message);
 		}
+		let actions = self.shared.context_actions.lock().unwrap().clone();
 		match field {
-			"cwd" => Ok(json!(self.shared.cwd)),
+			// Non-modelable objects (`ui`/`sessionManager`/`modelRegistry`
+			// carry getters and functions); the harness reaches `ui`
+			// through dedicated runner calls, never by reading it.
+			"ui" | "sessionManager" | "modelRegistry" => Ok(Value::Null),
 			"mode" => Ok(json!(*self.shared.mode.lock().unwrap())),
 			"hasUI" => Ok(json!(self.has_ui())),
-			// TS class-field defaults are `() => true`; `bindCore` replaces
-			// them with the bound context actions.
-			"isIdle" => Ok(json!(self
-				.shared
-				.context_actions
-				.lock()
-				.unwrap()
-				.as_ref()
-				.map(|actions| actions.is_idle())
-				.unwrap_or(true))),
-			"isProjectTrusted" => Ok(json!(self
-				.shared
-				.context_actions
-				.lock()
-				.unwrap()
-				.as_ref()
-				.map(|actions| actions.is_project_trusted())
-				.unwrap_or(true))),
-			"model" => Ok(self
-				.shared
-				.context_actions
-				.lock()
-				.unwrap()
+			"cwd" => Ok(json!(self.shared.cwd)),
+			"model" => Ok(actions
 				.as_ref()
 				.and_then(|actions| actions.get_model())
 				.unwrap_or(Value::Null)),
+			"scopedModels" => Ok(json!(actions
+				.as_ref()
+				.map(|actions| actions.get_scoped_models())
+				.unwrap_or_default())),
+			// `getThinkingLevel()` is the loader stub pre-bind (throws).
 			"thinkingLevel" => self.shared.runtime.get_thinking_level(),
+			"signal" => Ok(actions
+				.as_ref()
+				.and_then(|actions| actions.get_signal())
+				.unwrap_or(Value::Null)),
 			_ => Ok(Value::Null),
 		}
 	}
 
-	/// Guarded context method invocation (`ctx.shutdown()`).
-	fn ctx_call(&self, method: &str) -> Result<Value, String> {
+	/// Guarded context method invocation (`ctx.shutdown()`, `ctx.compact()`).
+	pub fn ctx_call_args(&self, method: &str, args: &[Value]) -> Result<Value, String> {
 		if let Some(message) = self.shared.stale_message.lock().unwrap().clone() {
 			return Err(message);
 		}
+		let actions = self.shared.context_actions.lock().unwrap().clone();
 		match method {
-			"shutdown" => {
-				self.shutdown();
+			"isIdle" => Ok(json!(actions
+				.as_ref()
+				.map(|actions| actions.is_idle())
+				.unwrap_or(true))),
+			"isProjectTrusted" => Ok(json!(actions
+				.as_ref()
+				.map(|actions| actions.is_project_trusted())
+				.unwrap_or(true))),
+			"abort" => {
+				if let Some(actions) = &actions {
+					actions.abort();
+				}
 				Ok(Value::Null)
 			}
+			"hasPendingMessages" => Ok(json!(actions
+				.as_ref()
+				.map(|actions| actions.has_pending_messages())
+				.unwrap_or(false))),
+			"shutdown" => {
+				if let Some(actions) = &actions {
+					actions.shutdown();
+				}
+				Ok(Value::Null)
+			}
+			"getContextUsage" => Ok(actions
+				.as_ref()
+				.and_then(|actions| actions.get_context_usage())
+				.unwrap_or(Value::Null)),
+			"compact" => {
+				if let Some(actions) = &actions {
+					actions.compact(args.first().cloned().unwrap_or(Value::Null))?;
+				}
+				Ok(Value::Null)
+			}
+			"getSystemPrompt" => Ok(json!(actions
+				.as_ref()
+				.map(|actions| actions.get_system_prompt())
+				.unwrap_or_default())),
+			"getSystemPromptOptions" => Ok(actions
+				.as_ref()
+				.and_then(|actions| actions.get_system_prompt_options())
+				.unwrap_or_else(|| {
+					normalize_options_raw(&json!({"cwd": self.shared.cwd}))
+						.unwrap_or_else(|_| json!({}))
+				})),
 			_ => Ok(Value::Null),
 		}
+	}
+
+	fn ctx_call(&self, method: &str) -> Result<Value, String> {
+		self.ctx_call_args(method, &[])
 	}
 
 	/// `hasHandlers(eventType)`.
@@ -2584,6 +2629,85 @@ mod tests {
 		let api = captured.lock().unwrap().clone().unwrap();
 		runtime.invalidate(None);
 		assert_eq!(api.send_message(json!({}), json!({})).unwrap_err(), DEFAULT_STALE_MESSAGE);
+	}
+
+	struct NoActions;
+
+	impl RuntimeActions for NoActions {
+		fn send_message(&self, _message: Value, _options: Value) -> Result<(), String> { Ok(()) }
+		fn send_user_message(&self, _content: Value, _options: Value) -> Result<(), String> { Ok(()) }
+		fn append_entry(&self, _custom_type: &str, _data: Value) -> Result<(), String> { Ok(()) }
+		fn set_session_name(&self, _name: &str) -> Result<(), String> { Ok(()) }
+		fn get_session_name(&self) -> Result<Value, String> { Ok(Value::Null) }
+		fn set_label(&self, _entry_id: &str, _label: Value) -> Result<(), String> { Ok(()) }
+		fn get_active_tools(&self) -> Vec<String> { vec!["read".to_string()] }
+		fn get_all_tools(&self) -> Result<Value, String> { Ok(json!([])) }
+		fn get_settings(&self) -> Result<Value, String> { Ok(json!({})) }
+		fn set_active_tools(&self, _names: &[String]) -> Result<(), String> { Ok(()) }
+		fn refresh_tools(&self) {}
+		fn get_commands(&self) -> Result<Value, String> { Ok(json!([])) }
+		fn set_model(&self, _model: Value) -> Result<Value, String> { Ok(json!(true)) }
+		fn get_thinking_level(&self) -> Value { json!("high") }
+		fn set_thinking_level(&self, _level: Value) -> Result<(), String> { Ok(()) }
+	}
+
+	struct TestContextActions;
+
+	impl ContextActions for TestContextActions {
+		fn get_model(&self) -> Option<Value> { Some(json!({"id": "m"})) }
+		fn get_scoped_models(&self) -> Vec<Value> { vec![json!("s")] }
+		fn is_idle(&self) -> bool { false }
+		fn is_project_trusted(&self) -> bool { false }
+		fn get_signal(&self) -> Option<Value> { Some(json!("sig")) }
+		fn abort(&self) {}
+		fn has_pending_messages(&self) -> bool { true }
+		fn shutdown(&self) {}
+		fn get_context_usage(&self) -> Option<Value> { Some(json!({"tokens": 5})) }
+		fn compact(&self, _options: Value) -> Result<(), String> { Ok(()) }
+		fn get_system_prompt(&self) -> String { "SYS".to_string() }
+	}
+
+	#[tokio::test]
+	async fn ctx_reads_defaults_and_bound() {
+		let runtime = ExtensionRuntime::new();
+		let runner = ExtensionRunner::new(vec![], runtime, "/proj", None);
+		// createContext class-field defaults (pre-bind); the `isIdle`/
+		// `getSystemPrompt`-style members are METHODS (ctx_call).
+		assert_eq!(runner.ctx_call("isIdle").unwrap(), json!(true));
+		assert_eq!(runner.ctx_call("isProjectTrusted").unwrap(), json!(true));
+		assert_eq!(runner.ctx_call("hasPendingMessages").unwrap(), json!(false));
+		assert_eq!(runner.ctx_call("getContextUsage").unwrap(), Value::Null);
+		assert_eq!(runner.ctx_call("getSystemPrompt").unwrap(), json!(""));
+		assert_eq!(runner.ctx_read("signal").unwrap(), Value::Null);
+		assert_eq!(runner.ctx_read("scopedModels").unwrap(), json!([]));
+		assert_eq!(runner.ctx_read("model").unwrap(), Value::Null);
+		assert_eq!(runner.ctx_read("cwd").unwrap(), json!("/proj"));
+		assert_eq!(runner.ctx_read("mode").unwrap(), json!("print"));
+		assert_eq!(runner.ctx_read("hasUI").unwrap(), json!(false));
+		// reading a method (function) is a stand-in: Null.
+		assert_eq!(runner.ctx_read("nope").unwrap(), Value::Null);
+		// thinkingLevel = the loader stub pre-bind.
+		assert_eq!(runner.ctx_read("thinkingLevel").unwrap_err(), NOT_INITIALIZED);
+		// getSystemPromptOptions falls back to normalize({cwd}).
+		let options = runner.ctx_call_args("getSystemPromptOptions", &[]).unwrap();
+		assert_eq!(options["cwd"], json!("/proj"));
+
+		// post-bind delegation.
+		runner.bind_core(
+			Arc::new(NoActions),
+			Arc::new(TestContextActions),
+			ProviderHooks::default(),
+		);
+		assert_eq!(runner.ctx_call("isIdle").unwrap(), json!(false));
+		assert_eq!(runner.ctx_call("isProjectTrusted").unwrap(), json!(false));
+		assert_eq!(runner.ctx_call("hasPendingMessages").unwrap(), json!(true));
+		assert_eq!(runner.ctx_call("getContextUsage").unwrap(), json!({"tokens": 5}));
+		assert_eq!(runner.ctx_call("getSystemPrompt").unwrap(), json!("SYS"));
+		assert_eq!(runner.ctx_read("signal").unwrap(), json!("sig"));
+		assert_eq!(runner.ctx_read("scopedModels").unwrap(), json!(["s"]));
+		assert_eq!(runner.ctx_read("model").unwrap(), json!({"id": "m"}));
+		assert_eq!(runner.ctx_read("thinkingLevel").unwrap(), json!("high"));
+		assert_eq!(runner.ctx_call_args("compact", &[json!({"x": 1})]).unwrap(), Value::Null);
 	}
 
 	struct TestUi {

@@ -547,7 +547,14 @@ code, killed}`:
       custom.
        `with_ui_prompt` (kind/title/start/end + finish double-guard) +
        `get_ui_context` proxy
-- [ ] 7. `ctx_read` full getter map (getter-vs-method assert semantics;
+- [x] 7. `ctx_read` full getter map **DONE**: getters = ui/sessionManager/
+      modelRegistry (Null stand-ins: function bags), mode, hasUI, cwd,
+      model, scopedModels, **thinkingLevel (loader stub throws pre-bind)**,
+      signal; methods = `ctx_call`/`ctx_call_args`: isIdle/isProjectTrusted/
+      hasPendingMessages/getContextUsage/getSystemPrompt/compact/abort/
+      shutdown with the class-field defaults pre-bind (true/true/false/
+      undefined/""/no-op) and `getSystemPromptOptions` →
+      normalize({cwd}). Test pins both sides.
        class-field defaults; jstr stand-ins)
 - [ ] 8. `create_tool_context`/`create_command_context` (guarded; nested-
        call fallback; executeTool options merge)
