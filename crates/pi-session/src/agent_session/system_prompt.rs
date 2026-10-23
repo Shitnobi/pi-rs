@@ -96,7 +96,7 @@ fn spread_object(v: &Value) -> Map<String, Value> {
 fn replace_or_err(v: &Value, name: &str) -> Result<String, String> {
 	match v {
 		Value::String(s) => Ok(s.clone()),
-		Value::Null => Err(format!("Cannot read properties of null (reading 'replace')")),
+		Value::Null => Err("Cannot read properties of null (reading 'replace')".to_string()),
 		_ => Err(format!("{}.replace is not a function", name)),
 	}
 }
