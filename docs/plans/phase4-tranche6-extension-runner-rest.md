@@ -556,7 +556,16 @@ code, killed}`:
       undefined/""/no-op) and `getSystemPromptOptions` →
       normalize({cwd}). Test pins both sides.
        class-field defaults; jstr stand-ins)
-- [ ] 8. `create_tool_context`/`create_command_context` (guarded; nested-
+- [x] 8. `create_tool_context`/`create_command_context` **DONE**:
+      ToolContextView = guarded `tools` getter (absent → []) +
+      `execute_tool` with the exact canned fallback
+      (`{toolCall:{type,id:"<id>/0",name,arguments:{}}, result:{content:
+      [text "Nested tool calls are not available in this context"],
+      details:{}}, isError:true}`) and the `signal: options.signal ??
+      signal` merge; CommandContextView = getSystemPromptOptions +
+      waitForIdle/newSession/fork/navigateTree/switchSession/reload with
+      the default `{cancelled:false}`/no-op handlers; every entry guarded
+      by the shared stale check. Test: fallback object, defaults, stale.
        call fallback; executeTool options merge)
 - [ ] 9. `is_user_bash_event_result` + `emit_user_bash` (validate → throw
        Invalid-user_bash… → rethrow)
