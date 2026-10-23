@@ -534,7 +534,22 @@ code, killed}`:
         `build_system_prompt_state` + `build_system_prompt` +
         `contentText`/`getSystemMessageText` (null-content TypeError) +
         cwd.replace TypeError + sections truthy checks
-- [ ] 13. `emit_before_agent_start` (ctx.getSystemPrompt override; readonly
+- [x] 13. `emit_before_agent_start` + `ExtensionHandler` mutation
+      read-back **DONE**: `HandlerOutcome { event, result }` — handlers hand
+      their event copy back, so in-place edits are observable (TS aliasing)
+      → `emitContext` messages / `emitBeforeProviderHeaders` headers /
+      `before_agent_start.systemPromptOptions` live-ref all modelable.
+      Emitter: leading `normalize_options_raw` (throw ESCAPES), per-handler
+      fresh `{...trigger, type, systemPromptOptions: current, systemPrompt}`
+      event, `ctx.getSystemPrompt` = assertActive + render(live options),
+      truthy-result gate (message truthy-push; `systemPrompt !== undefined`
+      = present-key, **null reassigns**), in-place options write-back,
+      handler errors → `emitError`. Runner gained `set_doc_paths`
+      (host injects; default empty). 8 unit tests (merge/null-reassign/
+      live-options/normalize-throw/render-surfaces/event+ctx render).
+      **Divergence**: `event.systemPrompt` is materialized per handler
+      (options change only between handlers; a render error omits the key
+      where TS throws at read — reads surface via ctx.getSystemPrompt).
         systemPrompt getter; truthy result; `!== undefined` systemPrompt)
 - [ ] 14. Harness: microtask engine for mcp AND ui_prompt (replaces
        `drain_mcp_events`; push `Res{job,0}` at mutation-apply (active) /

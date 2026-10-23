@@ -78,7 +78,9 @@ fn make_handler(spec: &Value, log: &Log) -> Result<ExtensionHandler, String> {
 			if let Some(message) = throws {
 				return Err(message);
 			}
-			Ok(returns)
+			// Hand the (possibly mutated) event back: in-place edits model
+			// TS handler mutation of the aliased event object.
+			Ok(HandlerOutcome { event, result: returns })
 		})
 	}))
 }

@@ -10,9 +10,10 @@
 //! - jiti module loading is out of scope: extensions load from `FactoryFn`
 //!   closures (`loadExtensionFromFactory`); path discovery is a later
 //!   tranche.
-//! - Handlers receive a cloned event snapshot per invocation (TS passes the
-//!   same live object; the parity scripts never mutate it) and a `CtxView`
-//!   standing in for the lazy `ExtensionContext` getters.
+//! - Handlers receive their own event copy per invocation (TS passes the
+//!   same live object) and hand it back in [`HandlerOutcome`]; emitters
+//!   read in-place edits back, so mutation semantics match the TS. The
+//!   generic `emit` still ignores event edits (no TS emitter reads them).
 //! - `ExtensionError.stack` is never populated (the harness records errors
 //!   without it).
 //! - The `mcp_servers_change` listener queues its emit; the host drains it
@@ -35,6 +36,7 @@ use pi_core::mcp_servers::{
 };
 use serde_json::{json, Map, Value};
 
+use super::system_prompt::{build_system_prompt, normalize_options_raw, DocPaths};
 use super::ExtensionHost;
 
 /// TS default `invalidate()` message (loader.ts L192 / runner.ts L729).
@@ -64,10 +66,21 @@ const RESERVED_KEYBINDINGS: [&str; 17] = [
 	"tui.input.copy",
 ];
 
-/// One event handler: `(event, ctx) -> Ok(Some(result)) | Ok(None)
-/// (undefined) | Err(thrown)`.
-pub type ExtensionHandler =
-	Arc<dyn Fn(Value, CtxView) -> BoxFuture<'static, Result<Option<Value>, String>> + Send + Sync>;
+/// What a handler hands back: its event (handlers own the copy, so
+/// in-place edits — `event.messages`, `event.headers`,
+/// `event.systemPromptOptions` — are read back by the emitter, exactly
+/// like TS's aliased event object) plus the `handlerResult`
+/// (`Ok(None)` = undefined; `Err` = throw).
+pub struct HandlerOutcome {
+	pub event: Value,
+	pub result: Option<Value>,
+}
+
+/// One event handler: `(event, ctx) -> Ok(HandlerOutcome) |
+/// Err(thrown)`.
+pub type ExtensionHandler = Arc<
+	dyn Fn(Value, CtxView) -> BoxFuture<'static, Result<HandlerOutcome, String>> + Send + Sync,
+>;
 
 /// A command handler (`(args, ctx) -> Result<(), String>`); execution is a
 /// later tranche, the type keeps registrations 1:1.
@@ -112,6 +125,13 @@ fn js_typeof(value: &Value) -> &'static str {
 pub enum CtxView {
 	Runner(Arc<RunnerShared>),
 	Raw(Value),
+	/// `emitBeforeAgentStart`'s ctx: the `createContext()` descriptors plus
+	/// the injected `getSystemPrompt` getter (`assertActive` + lazy render
+	/// against the live options).
+	BeforeAgentStart {
+		shared: Arc<RunnerShared>,
+		renderer: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
+	},
 }
 
 impl CtxView {
@@ -121,6 +141,14 @@ impl CtxView {
 		match self {
 			CtxView::Raw(value) => Ok(value.get(field).cloned().unwrap_or(Value::Null)),
 			CtxView::Runner(shared) => ExtensionRunner { shared: Arc::clone(shared) }.ctx_read(field),
+			// `getSystemPrompt` is a function property: reading it yields a
+			// function (JSON-undefined); the harness calls it via `call`.
+			CtxView::BeforeAgentStart { shared, .. } => {
+				if field == "getSystemPrompt" {
+					return Ok(Value::Null);
+				}
+				ExtensionRunner { shared: Arc::clone(shared) }.ctx_read(field)
+			}
 		}
 	}
 
@@ -130,6 +158,15 @@ impl CtxView {
 		match self {
 			CtxView::Raw(_) => Err("not a function".to_string()),
 			CtxView::Runner(shared) => ExtensionRunner { shared: Arc::clone(shared) }.ctx_call(method),
+			CtxView::BeforeAgentStart { shared, renderer } => {
+				if method == "getSystemPrompt" {
+					if let Some(message) = shared.stale_message.lock().unwrap().clone() {
+						return Err(message);
+					}
+					return renderer().map(|prompt| json!(prompt));
+				}
+				ExtensionRunner { shared: Arc::clone(shared) }.ctx_call(method)
+			}
 		}
 	}
 }
@@ -1103,6 +1140,9 @@ pub struct RunnerShared {
 	mcp_event_queue: Mutex<Vec<Value>>,
 	shortcut_diagnostics: Mutex<Vec<Value>>,
 	model_registry: Option<Arc<dyn ModelRegistrySeam>>,
+	/// Host paths for the default `docs` prompt section (TS resolves them
+	/// from the package install; see [`ExtensionRunner::set_doc_paths`]).
+	doc_paths: Mutex<DocPaths>,
 }
 
 /// TS `ExtensionRunner` — the tranche-1 core slice.
@@ -1135,6 +1175,7 @@ impl ExtensionRunner {
 				mcp_event_queue: Mutex::new(Vec::new()),
 				shortcut_diagnostics: Mutex::new(Vec::new()),
 				model_registry,
+				doc_paths: Mutex::new(DocPaths::default()),
 			}),
 		}
 	}
@@ -1331,7 +1372,7 @@ impl ExtensionRunner {
 		for (extension_path, handlers) in self.snapshot_handlers(&event_type) {
 			for (_, handler) in handlers {
 				match handler(event.clone(), ctx.clone()).await {
-					Ok(handler_result) => {
+					Ok(HandlerOutcome { result: handler_result, .. }) => {
 						if is_session_before && handler_result.as_ref().is_some_and(js_truthy) {
 							result = handler_result;
 							if result.as_ref().and_then(|r| r.get("cancel")) == Some(&Value::Bool(true)) {
@@ -1364,7 +1405,7 @@ impl ExtensionRunner {
 					object.insert("message".to_string(), current_message.clone());
 				}
 				match handler(current_event, ctx.clone()).await {
-					Ok(handler_result) => {
+					Ok(HandlerOutcome { result: handler_result, .. }) => {
 						let replacement = handler_result
 							.as_ref()
 							.and_then(|result| result.get("message"))
@@ -1411,6 +1452,97 @@ impl ExtensionRunner {
 	}
 
 	/// `emitError(error)`.
+	/// Host injection for the default `docs` prompt section paths.
+	pub fn set_doc_paths(&self, paths: DocPaths) {
+		*self.shared.doc_paths.lock().unwrap() = paths;
+	}
+
+	fn doc_paths(&self) -> DocPaths {
+		self.shared.doc_paths.lock().unwrap().clone()
+	}
+
+	/// `emitBeforeAgentStart(trigger, systemPromptOptions)` — the leading
+	/// normalize may throw (the emitter rejects; V8 error text); handler
+	/// errors are reported. Returns `(messages, systemPromptOptions)`.
+	pub async fn emit_before_agent_start(
+		&self,
+		trigger: Value,
+		system_prompt_options: Value,
+	) -> Result<(Vec<Value>, Value), String> {
+		let mut current_options = normalize_options_raw(&system_prompt_options)?;
+		let paths = self.doc_paths();
+		let mut messages: Vec<Value> = Vec::new();
+		for (extension_path, handlers) in self.snapshot_handlers("before_agent_start") {
+			for (_, handler) in handlers {
+				// `ctx.getSystemPrompt()` = assertActive + render(live options).
+				let render_shared = Arc::clone(&self.shared);
+				let render_options = current_options.clone();
+				let render_paths = paths.clone();
+				let renderer: Arc<dyn Fn() -> Result<String, String> + Send + Sync> =
+					Arc::new(move || {
+						if let Some(message) = render_shared.stale_message.lock().unwrap().clone() {
+							return Err(message);
+						}
+						build_system_prompt(&render_options, &render_paths)
+					});
+				let ctx = CtxView::BeforeAgentStart {
+					shared: Arc::clone(&self.shared),
+					renderer,
+				};
+
+				// `{...trigger, type, get systemPrompt(), systemPromptOptions:
+				// currentOptions}` — fresh per handler. TS renders the getter
+				// lazily; options change only between handlers, so the value is
+				// materialized here (a render error leaves the key absent where
+				// TS throws at read — plan divergence list).
+				let mut event = trigger.clone();
+				if let Some(object) = event.as_object_mut() {
+					object.insert("type".to_string(), json!("before_agent_start"));
+					object.insert("systemPromptOptions".to_string(), current_options.clone());
+					if let Ok(prompt) = build_system_prompt(&current_options, &paths) {
+						object.insert("systemPrompt".to_string(), json!(prompt));
+					}
+				}
+
+				match handler(event, ctx).await {
+					Ok(HandlerOutcome { event: returned_event, result }) => {
+						// In TS the event's options object IS `currentOptions`:
+						// in-place edits are observable in the return value.
+						if let Some(options) = returned_event.get("systemPromptOptions") {
+							if options != &current_options {
+								current_options = options.clone();
+							}
+						}
+						if let Some(result) = result {
+							if js_truthy(&result) {
+								if let Some(message) = result.get("message") {
+									if js_truthy(message) {
+										messages.push(message.clone());
+									}
+								}
+								// `result.systemPrompt !== undefined` — present
+								// null reassigns (probe-pinned).
+								if let Some(prompt) = result.get("systemPrompt") {
+									if let Some(object) = current_options.as_object_mut() {
+										object.insert("forceSystemPrompt".to_string(), prompt.clone());
+									}
+								}
+							}
+						}
+					}
+					Err(error) => {
+						self.emit_error(&json!({
+							"extensionPath": extension_path,
+							"event": "before_agent_start",
+							"error": error,
+						}));
+					}
+				}
+			}
+		}
+		Ok((messages, current_options))
+	}
+
 	pub fn emit_error(&self, error: &Value) {
 		for (_, listener) in self.shared.error_listeners.lock().unwrap().iter() {
 			listener(error);
@@ -1708,7 +1840,7 @@ pub async fn emit_project_trust_event(
 	for (extension_path, handlers) in runner.snapshot_handlers("project_trust") {
 		for (_, handler) in handlers {
 			match handler(event.clone(), ctx.clone()).await {
-				Ok(handler_result) => {
+				Ok(HandlerOutcome { result: handler_result, .. }) => {
 					// TS reads `handlerResult.trusted` inside the try: an
 					// undefined/null result throws a TypeError that is
 					// recorded as a handler error.
@@ -1800,14 +1932,178 @@ mod tests {
 		assert!(runtime.flag_values().is_empty());
 	}
 
+	async fn runner_with_handlers(
+		event: &'static str,
+		handlers: Vec<ExtensionHandler>,
+	) -> ExtensionRunner {
+		let runtime = ExtensionRuntime::new();
+		let factory: FactoryFn = Arc::new(move |pi: &ExtensionApi| {
+			let pi = pi.clone();
+			let handlers: Vec<ExtensionHandler> = handlers.clone();
+			Box::pin(async move {
+				for handler in handlers {
+					pi.on(event, handler).unwrap();
+				}
+				Ok(())
+			})
+		});
+		let extension = load_extension_from_factory(factory, "/proj", None, &runtime, "<inline>")
+			.await
+			.unwrap();
+		ExtensionRunner::new(vec![extension], runtime, "/proj", None)
+	}
+
+	#[tokio::test]
+	async fn before_agent_start_merges_message_and_force() {
+		let handler: ExtensionHandler = Arc::new(|_event, _ctx| {
+			Box::pin(async {
+				Ok(HandlerOutcome {
+					event: json!({}),
+					result: Some(json!({
+						"message": {"role": "user", "content": [{"type": "text", "text": "m"}]},
+						"systemPrompt": "X",
+					})),
+				})
+			})
+		});
+		let runner = runner_with_handlers("before_agent_start", vec![handler]).await;
+		let (messages, options) = runner
+			.emit_before_agent_start(json!({"prompt": "p"}), json!({"cwd": "/p", "customPrompt": "CP"}))
+			.await
+			.unwrap();
+		assert_eq!(messages, vec![json!({"role": "user", "content": [{"type": "text", "text": "m"}]})]);
+		assert_eq!(options["forceSystemPrompt"], json!("X"));
+		assert_eq!(options["customPrompt"], json!("CP"));
+	}
+
+	#[tokio::test]
+	async fn before_agent_start_null_reassigns_and_truthy_gate() {
+		// `result.systemPrompt !== undefined` → null RESETS; a falsey result
+		// and a falsey message are skipped.
+		let handler: ExtensionHandler = Arc::new(|_event, _ctx| {
+			Box::pin(async {
+				Ok(HandlerOutcome {
+					event: json!({}),
+					result: Some(json!({"systemPrompt": null, "message": null})),
+				})
+			})
+		});
+		let runner = runner_with_handlers("before_agent_start", vec![handler]).await;
+		let (messages, options) =
+			runner.emit_before_agent_start(json!({}), json!({"cwd": "/p"})).await.unwrap();
+		assert!(messages.is_empty());
+		assert_eq!(options["forceSystemPrompt"], Value::Null);
+		assert!(options.as_object().unwrap().contains_key("forceSystemPrompt"));
+	}
+
+	#[tokio::test]
+	async fn before_agent_start_live_options_object() {
+		// TS: `event.systemPromptOptions` is the live `currentOptions` ref.
+		let handler: ExtensionHandler = Arc::new(|mut event, _ctx| {
+			Box::pin(async move {
+				event["systemPromptOptions"]["customPrompt"] = json!("NEW");
+				Ok(HandlerOutcome { event, result: None })
+			})
+		});
+		let runner = runner_with_handlers("before_agent_start", vec![handler]).await;
+		let (_, options) =
+			runner.emit_before_agent_start(json!({}), json!({"cwd": "/p"})).await.unwrap();
+		assert_eq!(options["customPrompt"], json!("NEW"));
+	}
+
+	#[tokio::test]
+	async fn before_agent_start_normalize_throws_out() {
+		let runner = runner_with_handlers("before_agent_start", vec![]).await;
+		let err = runner
+			.emit_before_agent_start(json!({}), json!({"selectedTools": 5}))
+			.await
+			.unwrap_err();
+		assert_eq!(
+			err,
+			"(input.selectedTools ?? [\"read\", \"bash\", \"edit\", \"write\"]) is not iterable"
+		);
+	}
+
+	#[tokio::test]
+	async fn before_agent_start_render_surfaces_and_handler_errors() {
+		// forceSystemPrompt: null → both the event getter and ctx render throw;
+		// the handler observes the ctx error, and its own throw is reported.
+		let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+		let seen_handler = Arc::clone(&seen);
+		let handler: ExtensionHandler = Arc::new(move |event, ctx| {
+			let seen = Arc::clone(&seen_handler);
+			Box::pin(async move {
+				seen.lock().unwrap().push(format!("event:{}", event.get("systemPrompt").is_some()));
+				match ctx.call("getSystemPrompt") {
+					Ok(value) => seen.lock().unwrap().push(format!("call:{}", value)),
+					Err(message) => seen.lock().unwrap().push(format!("call!{}", message)),
+				}
+				Err("boom".to_string())
+			})
+		});
+		let runner = runner_with_handlers("before_agent_start", vec![handler]).await;
+		let errors: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+		let errors_listener = Arc::clone(&errors);
+		runner.on_error(Arc::new(move |error| {
+			errors_listener.lock().unwrap().push(error.clone());
+		}));
+		let (messages, options) = runner
+			.emit_before_agent_start(json!({}), json!({"cwd": "/p", "forceSystemPrompt": null}))
+			.await
+			.unwrap();
+		assert!(messages.is_empty());
+		assert_eq!(options["forceSystemPrompt"], Value::Null);
+		// event.systemPrompt omitted (render error) — TS throws at read.
+		let seen = seen.lock().unwrap().clone();
+		assert_eq!(seen[0], "event:false");
+		assert_eq!(seen[1], "call!Cannot read properties of null (reading 'filter')");
+		let errors = errors.lock().unwrap().clone();
+		assert_eq!(errors.len(), 1);
+		assert_eq!(errors[0]["event"], json!("before_agent_start"));
+		assert_eq!(errors[0]["error"], json!("boom"));
+	}
+
+	#[tokio::test]
+	async fn before_agent_start_event_and_ctx_render() {
+		let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+		let seen_handler = Arc::clone(&seen);
+		let handler: ExtensionHandler = Arc::new(move |event, ctx| {
+			let seen = Arc::clone(&seen_handler);
+			Box::pin(async move {
+				let prompt = event["systemPrompt"].as_str().unwrap_or("<none>").to_string();
+				seen.lock().unwrap().push(format!("event:{prompt}"));
+				let via_ctx = ctx.call("getSystemPrompt").unwrap();
+				seen.lock().unwrap().push(format!("ctx:{}", via_ctx.as_str().unwrap_or("")));
+				Ok(HandlerOutcome { event, result: None })
+			})
+		});
+		let runner = runner_with_handlers("before_agent_start", vec![handler]).await;
+		runner.set_doc_paths(DocPaths {
+			readme: "R".to_string(),
+			docs: "D".to_string(),
+			examples: "E".to_string(),
+		});
+		let (_, options) = runner
+			.emit_before_agent_start(json!({"prompt": "p"}), json!({"cwd": "/p"}))
+			.await
+			.unwrap();
+		assert!(options["customPrompt"].is_null());
+		let seen = seen.lock().unwrap().clone();
+		// default cluster renders (no customPrompt) with the injected paths.
+		assert!(seen[0].starts_with("event:You are an expert coding assistant"));
+		assert!(seen[0].contains("- Main documentation: R"), "{}", seen[0]);
+		assert!(seen[0].contains("<cwd>\n/p\n</cwd>"));
+		assert_eq!(seen[1], format!("ctx:{}", &seen[0]["event:".len()..]));
+	}
+
 	#[tokio::test]
 	async fn emit_cancel_short_circuits() {
 		let runtime = ExtensionRuntime::new();
 		let factory: FactoryFn = Arc::new(|pi: &ExtensionApi| {
 			let pi = pi.clone();
 			Box::pin(async move {
-				let handler: ExtensionHandler = Arc::new(|_event, _ctx| {
-					Box::pin(async { Ok(Some(json!({"cancel": true}))) })
+				let handler: ExtensionHandler = Arc::new(|event, _ctx| {
+					Box::pin(async move { Ok(HandlerOutcome { event, result: Some(json!({"cancel": true})) }) })
 				});
 				pi.on("session_before_switch", handler).unwrap();
 				Ok(())
