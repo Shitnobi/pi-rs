@@ -13337,6 +13337,46 @@ cases.push(
 		{ op: "mcpList" },
 		{ op: "reportUnhandledMcpServers" },
 	]),
+	// Engine traces (Addendum B): two mutations in ONE op interleave
+	// handler-by-handler (h1:A, h1:B, h2:A, h2:B — not h1,h2,h1,h2).
+	exr("mcp-two-mutations-two-handlers", [
+		{
+			op: "load",
+			path: "/ext/a.js",
+			script: [
+				{ step: "on", event: "mcp_servers_change", handler: { id: 1 } },
+				{ step: "on", event: "mcp_servers_change", handler: { id: 2 } },
+				{ step: "captureApi", key: "a" },
+			],
+		},
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{
+			op: "api",
+			key: "a",
+			steps: [
+				{ step: "registerMcpServer", name: "alpha", config: { command: "node" } },
+				{ step: "registerMcpServer", name: "beta", config: { command: "node" } },
+			],
+		},
+		{ op: "mcpList" },
+	]),
+	// Load-time mutation after bindCore: handler 1's body lands BEFORE the
+	// load mark; handler 2 after it (h1, load:b:ok, h2).
+	exr("mcp-late-load-interleave", [
+		{ op: "load", path: "/ext/a.js", script: [] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{
+			op: "load",
+			path: "/ext/b.js",
+			script: [
+				{ step: "on", event: "mcp_servers_change", handler: { id: 1 } },
+				{ step: "on", event: "mcp_servers_change", handler: { id: 2 } },
+				{ step: "registerMcpServer", name: "early", config: { command: "node" } },
+			],
+		},
+	]),
 	exr("mcp-pre-bind-report", [
 		{
 			op: "load",

@@ -322,7 +322,37 @@ pub enum CtxView {
 	},
 }
 
+/// `createContext()` members that are functions (`typeof v === "function"`).
+pub fn is_context_method(field: &str) -> bool {
+	matches!(
+		field,
+		"isIdle"
+			| "isProjectTrusted"
+			| "abort"
+			| "hasPendingMessages"
+			| "shutdown"
+			| "getContextUsage"
+			| "compact"
+			| "getSystemPrompt"
+	)
+}
+
 impl CtxView {
+	/// Harness read semantics: `typeof v === "function" ? v() : v` — method
+	/// members are CALLED, getters are read; `Raw` contexts are plain values.
+	pub fn read_field(&self, field: &str) -> Result<Value, String> {
+		match self {
+			CtxView::Raw(value) => Ok(value.get(field).cloned().unwrap_or(Value::Null)),
+			_ => {
+				if is_context_method(field) {
+					self.call(field)
+				} else {
+					self.read(field)
+				}
+			}
+		}
+	}
+
 	/// Read one context field, mirroring the TS guarded getter/method.
 	/// `Err` = the getter threw (stale ctx, unbound runtime action).
 	pub fn read(&self, field: &str) -> Result<Value, String> {
@@ -1616,12 +1646,20 @@ pub struct RunnerShared {
 	ui_prompt_queue: Mutex<Vec<Value>>,
 	/// `mcp_servers_change` events queued by the registry listener; drained
 	/// by [`ExtensionRunner::drain_mcp_events`].
-	mcp_event_queue: Mutex<Vec<Value>>,
+	mcp_event_queue: Mutex<Vec<McpEventJob>>,
 	shortcut_diagnostics: Mutex<Vec<Value>>,
 	model_registry: Option<Arc<dyn ModelRegistrySeam>>,
 	/// Host paths for the default `docs` prompt section (TS resolves them
 	/// from the package install; see [`ExtensionRunner::set_doc_paths`]).
 	doc_paths: Mutex<DocPaths>,
+}
+
+/// One deferred `mcp_servers_change` emit: the event plus the handler
+/// snapshot taken at push time (a handler registered later in the same op
+/// does not observe the mutation).
+pub struct McpEventJob {
+	pub event: Value,
+	pub handlers: Vec<(String, Vec<ExtensionHandler>)>,
 }
 
 /// TS `ExtensionRunner` — the tranche-1 core slice.
@@ -1892,11 +1930,16 @@ impl ExtensionRunner {
 					.iter()
 					.map(|server| serde_json::to_value(server).unwrap_or(Value::Null))
 					.collect::<Vec<_>>();
-				shared
-					.mcp_event_queue
-					.lock()
-					.unwrap()
-					.push(json!({ "type": "mcp_servers_change", "servers": event_servers }));
+				let runner = ExtensionRunner { shared: Arc::clone(&shared) };
+				let job = McpEventJob {
+					event: json!({ "type": "mcp_servers_change", "servers": event_servers }),
+					handlers: runner
+						.snapshot_handlers("mcp_servers_change")
+						.into_iter()
+						.map(|(path, handlers)| (path, handlers.into_iter().map(|(_, handler)| handler).collect()))
+						.collect(),
+				};
+				shared.mcp_event_queue.lock().unwrap().push(job);
 				// The listener runs with the registry lock held (it fires
 				// inside register/unregister), so the unhandled-server report
 				// consumes the passed list instead of re-locking.
@@ -1942,22 +1985,20 @@ impl ExtensionRunner {
 	/// Drain queued `mcp_servers_change` emits (the TS fires them with `void
 	/// this.emit(...)`; the harness settles symmetrically).
 	pub async fn drain_mcp_events(&self) {
-		loop {
-			let event = {
-				let mut queue = self.shared.mcp_event_queue.lock().unwrap();
-				if queue.is_empty() {
-					None
-				} else {
-					Some(queue.remove(0))
-				}
-			};
-			match event {
-				Some(event) => {
-					self.emit(event).await;
-				}
-				None => break,
-			}
+		for job in self.drain_mcp_jobs() {
+			self.emit(job.event).await;
 		}
+	}
+
+	/// Hand the deferred jobs to the host (the parity harness schedules the
+	/// handler microtasks itself — see the plan's Addendum B).
+	pub fn drain_mcp_jobs(&self) -> Vec<McpEventJob> {
+		std::mem::take(&mut *self.shared.mcp_event_queue.lock().unwrap())
+	}
+
+	/// The `createContext()` view (used by the host for stepped emits).
+	pub fn ctx(&self) -> CtxView {
+		CtxView::Runner(Arc::clone(&self.shared))
 	}
 
 	fn assert_active_shared(&self) -> Result<(), String> {

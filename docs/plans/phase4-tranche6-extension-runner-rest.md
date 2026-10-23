@@ -625,7 +625,17 @@ code, killed}`:
       (options change only between handlers; a render error omits the key
       where TS throws at read — reads surface via ctx.getSystemPrompt).
         systemPrompt getter; truthy result; `!== undefined` systemPrompt)
-- [ ] 14. Harness: microtask engine for mcp AND ui_prompt (replaces
+- [x] 14. Harness microtask engine **DONE**: runner queues `McpEventJob`
+      (event + handler snapshot at push time), `drain_mcp_jobs()`, `ctx()`;
+      the harness runs a `VecDeque<Step>` engine (`Body` = one handler
+      microtask, `Loop` = emit-loop continuation, `Mark` = awaited-continuation
+      log line), drained after every op (the `setImmediate` settle). Load
+      resolution pushes mcp job starts BEFORE its `load:…:ok` mark.
+      Verified live: `exr/mcp-two-mutations-two-handlers` = h1,h1,h2,h2
+      (Trace 1) and `exr/mcp-late-load-interleave` = h1,h1,load:…:ok,h2,h2
+      (Trace 2) pass against the dist. Zero-handler jobs are skipped.
+      `ui_prompt_*` events drain per op (full emit; handler-body interleave
+      still simplified — see item 16 note).
        `drain_mcp_events`; push `Res{job,0}` at mutation-apply (active) /
        commit-apply (loading) + `OpMark` at load-resolution + `Start{job}`
        at ui_prompt start/end — see Addendum B)
