@@ -228,15 +228,63 @@ struct FakeActions {
 	log: Log,
 }
 
+impl FakeActions {
+	fn record(&self, method: &str, args: &Value) -> Result<(), String> {
+		self.log.lock().unwrap().push(format!("actions.{}:{}", method, jstr(args)));
+		Ok(())
+	}
+}
+
 impl RuntimeActions for FakeActions {
+	fn send_message(&self, message: Value, options: Value) -> Result<(), String> {
+		self.record("sendMessage", &json!([message, options]))
+	}
+	fn send_user_message(&self, content: Value, options: Value) -> Result<(), String> {
+		self.record("sendUserMessage", &json!([content, options]))
+	}
+	fn append_entry(&self, custom_type: &str, data: Value) -> Result<(), String> {
+		self.record("appendEntry", &json!([custom_type, data]))
+	}
+	fn set_session_name(&self, name: &str) -> Result<(), String> {
+		self.record("setSessionName", &json!([name]))
+	}
+	fn get_session_name(&self) -> Result<Value, String> {
+		self.record("getSessionName", &json!([]))?;
+		Ok(Value::Null)
+	}
+	fn set_label(&self, entry_id: &str, label: Value) -> Result<(), String> {
+		self.record("setLabel", &json!([entry_id, label]))
+	}
 	fn get_active_tools(&self) -> Vec<String> {
 		self.tools.clone()
+	}
+	fn get_all_tools(&self) -> Result<Value, String> {
+		self.record("getAllTools", &json!([]))?;
+		Ok(Value::Null)
+	}
+	fn get_settings(&self) -> Result<Value, String> {
+		self.record("getSettings", &json!([]))?;
+		Ok(Value::Null)
+	}
+	fn set_active_tools(&self, names: &[String]) -> Result<(), String> {
+		self.record("setActiveTools", &json!([names]))
+	}
+	fn refresh_tools(&self) {
+		self.log.lock().unwrap().push("actions.refreshTools".to_string());
+	}
+	fn get_commands(&self) -> Result<Value, String> {
+		self.record("getCommands", &json!([]))?;
+		Ok(Value::Null)
+	}
+	fn set_model(&self, model: Value) -> Result<Value, String> {
+		self.record("setModel", &json!([model]))?;
+		Ok(json!(true))
 	}
 	fn get_thinking_level(&self) -> Value {
 		self.thinking.clone()
 	}
-	fn refresh_tools(&self) {
-		self.log.lock().unwrap().push("actions.refreshTools".to_string());
+	fn set_thinking_level(&self, level: Value) -> Result<(), String> {
+		self.record("setThinkingLevel", &json!([level]))
 	}
 }
 

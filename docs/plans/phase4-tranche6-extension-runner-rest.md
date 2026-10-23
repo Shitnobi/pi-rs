@@ -505,7 +505,13 @@ code, killed}`:
       string-coerced** ([5] → "5", [null] → "null"); no shell; timeout >
       0 (full JS ToNumber); pre-aborted + ENOENT+pre-aborted =
       killed:true; 29 tests + clippy clean
-- [ ] 2. `extension_runner.rs`: full `ExtensionActions` trait + pre-bind
+- [x] 2. `extension_runner.rs`: full `ExtensionActions` trait + pre-bind
+      stub matrix **DONE**: `RuntimeActions` = all 15 actions (Value-typed;
+      `Err` = throw / rejected promise); pre-bind stubs = loader.ts L158
+      ("Extension runtime not initialized. Action methods cannot be called
+      during extension loading."), `refreshTools` no-op, `setModel` rejects
+      with the SHORT message ("Extension runtime not initialized"). Unit
+      test covers the matrix.
        stub matrix (setModel rejected-promise = async Err)
 - [ ] 3. `ExtensionApi` action methods + `pi.exec` (assertActive + runtime
        delegation)
