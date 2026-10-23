@@ -4,8 +4,8 @@
 //! (`protocol/jsonrpc.ts`), the [`McpTransport`] contract
 //! (`transports/transport.ts`), and a scripted [`FakeTransport`].
 //!
-//! The real client (`client.ts`, 621 LOC) is ported in a later tranche as
-//! a synchronous state machine over this seam; TS asynchrony maps to:
+//! The client ([`super::client`]) is a synchronous state machine over this
+//! seam; TS asynchrony maps to:
 //! - message/error/close delivery is synchronous (TS
 //!   `InMemoryTransport` defers with `queueMicrotask`),
 //! - listener registration returns a subscription id instead of an
@@ -13,11 +13,14 @@
 //! - `AbortSignal` in `McpTransportSendOptions` is flattened to the
 //!   [`SendOptions::aborted`] flag ("the sender no longer waits for a
 //!   reply"),
-//! - request timeouts sleep through an injected [`SleepFn`].
+//! - request timeouts sleep through an injected [`SleepFn`],
+//! - thrown errors are [`McpErrorKind`] values (the TS error classes).
 
 use std::collections::VecDeque;
 
 use serde_json::Value;
+
+use super::client::McpErrorKind;
 
 /// `DEFAULT_MAX_MESSAGE_BYTES` (transports/transport.ts).
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -81,39 +84,6 @@ pub fn is_json_rpc_response(value: &Value) -> bool {
 
 /// Default `McpConnectionClosedError` message (protocol/jsonrpc.ts).
 pub const MCP_CONNECTION_CLOSED_MESSAGE: &str = "MCP connection closed";
-
-/// An error thrown by a transport operation: the TS `McpConnectionClosedError`
-/// (client state machine treats it specially) or any other thrown `Error`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransportError {
-    /// `McpConnectionClosedError` — default message
-    /// [`MCP_CONNECTION_CLOSED_MESSAGE`].
-    ConnectionClosed(String),
-    /// Any other thrown `Error`; the payload is `error.message`.
-    Other(String),
-}
-
-impl TransportError {
-    /// `new McpConnectionClosedError()`.
-    pub fn connection_closed() -> Self {
-        TransportError::ConnectionClosed(MCP_CONNECTION_CLOSED_MESSAGE.to_string())
-    }
-
-    /// `error.message`.
-    pub fn message(&self) -> &str {
-        match self {
-            TransportError::ConnectionClosed(m) | TransportError::Other(m) => m,
-        }
-    }
-}
-
-impl std::fmt::Display for TransportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.message())
-    }
-}
-
-impl std::error::Error for TransportError {}
 
 /// Injected delay for the client runtime's request timeouts (TS
 /// `setTimeout`-based timers): sleeps `ms` milliseconds. Harnesses inject
@@ -222,17 +192,18 @@ impl TransportEvents {
 /// The transport contract `McpClient.connect` drives
 /// (`transports/transport.ts`): `start` the connection, `send` messages,
 /// `close` once, and deliver incoming messages, errors and the close event
-/// through the registered listeners.
+/// through the registered listeners. Failures are [`McpErrorKind`] values —
+/// whatever the TS transport threw.
 pub trait McpTransport {
     /// `start()`: begin the connection. May deliver messages or report
     /// errors synchronously (scripted transports) — TS transports do so
     /// asynchronously.
-    fn start(&mut self) -> Result<(), TransportError>;
+    fn start(&mut self) -> Result<(), McpErrorKind>;
     /// `send(message, options?)`: dispatch one message. Must not dispatch
     /// (or retry) after `options.aborted` or after `close`.
-    fn send(&mut self, message: &JsonRpcMessage, options: SendOptions) -> Result<(), TransportError>;
+    fn send(&mut self, message: &JsonRpcMessage, options: SendOptions) -> Result<(), McpErrorKind>;
     /// `close()`: idempotent; emits `onClose` at most once.
-    fn close(&mut self) -> Result<(), TransportError>;
+    fn close(&mut self) -> Result<(), McpErrorKind>;
     /// `onMessage(listener)` — returns the subscription id for
     /// [`McpTransport::off_message`].
     fn on_message(&mut self, listener: MessageListener) -> usize;
@@ -260,27 +231,30 @@ pub enum FakeStep {
     Message(JsonRpcMessage),
     /// Report an error to the `onError` listeners.
     Error(String),
-    /// Fail the operation (`start`/`send`) with this error.
-    Fail(TransportError),
     /// Close the transport: marks it closed and emits `onClose`; the
     /// current operation still succeeds.
     Close,
+    /// Fail the operation (`start`/`send`) with this error.
+    Fail(McpErrorKind),
 }
 
 /// Scripted transport for tests and the parity harness (the seam's stand-in
-/// for `transports/in-memory.ts`). `start_steps` run during [`FakeTransport::start`];
-/// each [`FakeTransport::send`] consumes `send_steps` until the queue is
-/// empty or a [`FakeStep::Fail`] ends it with an error — a send with no
-/// steps left succeeds silently.
+/// for `transports/in-memory.ts`). `start_steps` run during
+/// [`FakeTransport::start`] (first start only). Each
+/// [`FakeTransport::send`] pops **one batch** from `send_steps` and runs it
+/// — a send whose batch is missing (queue empty) or empty succeeds
+/// silently. Batches make scripts line up with the client's send sequence
+/// (initialize, notifications/initialized, tools/list, …): the TS harness
+/// fake shifts one batch per send the same way.
 #[derive(Default)]
 pub struct FakeTransport {
     events: TransportEvents,
     started: bool,
     closed: bool,
     /// Steps `start()` performs, in order (first start only).
-    pub start_steps: VecDeque<FakeStep>,
-    /// Steps each `send()` performs, in order.
-    pub send_steps: VecDeque<FakeStep>,
+    pub start_steps: Vec<FakeStep>,
+    /// One batch of steps per `send()`, in order.
+    pub send_steps: VecDeque<Vec<FakeStep>>,
     /// Every message passed to `send()`, in order.
     pub sent: Vec<JsonRpcMessage>,
     /// The [`SendOptions`] recorded alongside [`FakeTransport::sent`].
@@ -295,22 +269,21 @@ impl FakeTransport {
     }
 
     /// Run `steps` against the listeners; a `Fail` step aborts with its
-    /// error (remaining steps are dropped).
-    fn run_steps(&mut self, steps: &mut VecDeque<FakeStep>) -> Result<(), TransportError> {
-        while let Some(step) = steps.pop_front() {
+    /// error (remaining steps of the batch are dropped).
+    fn run_steps(&mut self, steps: &[FakeStep]) -> Result<(), McpErrorKind> {
+        for step in steps {
             match step {
-                FakeStep::Message(message) => self.events.emit_message(&message),
-                FakeStep::Error(message) => self.events.emit_error(&message),
+                FakeStep::Message(message) => self.events.emit_message(message),
+                FakeStep::Error(message) => self.events.emit_error(message),
                 FakeStep::Close => {
                     self.closed = true;
                     self.events.emit_close();
                 }
-                FakeStep::Fail(error) => return Err(error),
+                FakeStep::Fail(error) => return Err(error.clone()),
             }
         }
         Ok(())
     }
-
 
     /// `emitError` is exposed so tests can simulate transport-level
     /// failures (like `InMemoryTransport.emitError`).
@@ -320,15 +293,15 @@ impl FakeTransport {
 }
 
 impl McpTransport for FakeTransport {
-    fn start(&mut self) -> Result<(), TransportError> {
+    fn start(&mut self) -> Result<(), McpErrorKind> {
         if self.closed {
-            return Err(TransportError::connection_closed());
+            return Err(McpErrorKind::connection_closed());
         }
         let first = !self.started;
         self.started = true;
         if first {
-            let mut steps = std::mem::take(&mut self.start_steps);
-            let result = self.run_steps(&mut steps);
+            let steps = std::mem::take(&mut self.start_steps);
+            let result = self.run_steps(&steps);
             self.start_steps = steps;
             result
         } else {
@@ -336,19 +309,17 @@ impl McpTransport for FakeTransport {
         }
     }
 
-    fn send(&mut self, message: &JsonRpcMessage, options: SendOptions) -> Result<(), TransportError> {
+    fn send(&mut self, message: &JsonRpcMessage, options: SendOptions) -> Result<(), McpErrorKind> {
         if !self.started || self.closed {
-            return Err(TransportError::connection_closed());
+            return Err(McpErrorKind::connection_closed());
         }
         self.sent.push(message.clone());
         self.sent_options.push(options);
-        let mut steps = std::mem::take(&mut self.send_steps);
-        let result = self.run_steps(&mut steps);
-        self.send_steps = steps;
-        result
+        let batch = self.send_steps.pop_front().unwrap_or_default();
+        self.run_steps(&batch)
     }
 
-    fn close(&mut self) -> Result<(), TransportError> {
+    fn close(&mut self) -> Result<(), McpErrorKind> {
         if self.closed {
             return Ok(());
         }
@@ -391,6 +362,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn other(message: &str) -> McpErrorKind {
+        McpErrorKind::Other { message: message.to_string() }
+    }
+
     #[test]
     fn json_rpc_validators() {
         assert!(is_json_rpc_request(&json!({ "jsonrpc": "2.0", "id": 1, "method": "x" })));
@@ -425,11 +400,10 @@ mod tests {
 
         transport
             .start_steps
-            .push_back(FakeStep::Message(json!({ "jsonrpc": "2.0", "method": "hello" })));
-        transport.send_steps.push_back(FakeStep::Error("boom".to_string()));
+            .push(FakeStep::Message(json!({ "jsonrpc": "2.0", "method": "hello" })));
         transport
             .send_steps
-            .push_back(FakeStep::Message(json!({ "jsonrpc": "2.0", "id": 1, "result": 42 })));
+            .push_back(vec![FakeStep::Error("boom".to_string()), FakeStep::Message(json!({ "jsonrpc": "2.0", "id": 1, "result": 42 }))]);
 
         transport.start().unwrap();
         transport
@@ -441,7 +415,7 @@ mod tests {
         assert_eq!(transport.sent.len(), 1);
         assert_eq!(transport.sent[0]["method"], "ask");
 
-        // No steps left: the send succeeds silently; options are recorded.
+        // No batch left: the send succeeds silently; options are recorded.
         transport
             .send(&json!({ "jsonrpc": "2.0", "id": 2, "method": "again" }), SendOptions { aborted: true })
             .unwrap();
@@ -463,10 +437,10 @@ mod tests {
         let err = transport
             .send(&json!({ "jsonrpc": "2.0", "id": 1, "method": "x" }), SendOptions::default())
             .unwrap_err();
-        assert_eq!(err, TransportError::connection_closed());
+        assert_eq!(err, McpErrorKind::connection_closed());
         assert_eq!(err.message(), "MCP connection closed");
         // start() after close fails too.
-        assert_eq!(transport.start().unwrap_err(), TransportError::connection_closed());
+        assert_eq!(transport.start().unwrap_err(), McpErrorKind::connection_closed());
     }
 
     #[test]
@@ -475,20 +449,22 @@ mod tests {
         let err = transport
             .send(&json!({ "jsonrpc": "2.0", "id": 1, "method": "x" }), SendOptions::default())
             .unwrap_err();
-        assert_eq!(err, TransportError::connection_closed());
+        assert_eq!(err, McpErrorKind::connection_closed());
     }
 
     #[test]
     fn fake_transport_fail_step_and_close_step() {
         let mut transport = FakeTransport::new();
-        transport.start_steps.push_back(FakeStep::Fail(TransportError::Other("nope".to_string())));
+        transport.start_steps.push(FakeStep::Fail(other("nope")));
         assert_eq!(transport.start().unwrap_err().message(), "nope");
 
         let mut transport = FakeTransport::new();
         transport
             .send_steps
-            .push_back(FakeStep::Message(json!({ "jsonrpc": "2.0", "method": "m" })));
-        transport.send_steps.push_back(FakeStep::Close);
+            .push_back(vec![
+                FakeStep::Message(json!({ "jsonrpc": "2.0", "method": "m" })),
+                FakeStep::Close,
+            ]);
         transport.start().unwrap();
         transport
             .send(&json!({ "jsonrpc": "2.0", "id": 1, "method": "x" }), SendOptions::default())
@@ -497,7 +473,7 @@ mod tests {
         // Closed by the step: the next send fails.
         assert_eq!(
             transport.send(&json!({ "jsonrpc": "2.0", "id": 2, "method": "x" }), SendOptions::default()),
-            Err(TransportError::connection_closed())
+            Err(McpErrorKind::connection_closed())
         );
     }
 
@@ -510,14 +486,8 @@ mod tests {
         transport.off_message(id);
         transport.set_protocol_version("2025-06-18");
         transport.start().unwrap();
-        transport.events_emit_for_test();
+        transport.events.emit_message(&json!({ "jsonrpc": "2.0", "method": "m" }));
         assert_eq!(*seen.borrow(), 0);
         assert_eq!(transport.protocol_versions, vec!["2025-06-18".to_string()]);
-    }
-
-    impl FakeTransport {
-        fn events_emit_for_test(&mut self) {
-            self.events.emit_message(&json!({ "jsonrpc": "2.0", "method": "m" }));
-        }
     }
 }

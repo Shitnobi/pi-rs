@@ -1991,6 +1991,315 @@ async function runModule(tool, args, cwd) {
 			fs.rmSync(base, { recursive: true, force: true });
 		}
 	}
+	if (tool === "mcp-connection") {
+		// extensions/mcp/runtime.js + the pi-mcp client: McpServerConnection
+		// over scripted fake transports (one script per connection attempt,
+		// one step batch per send). Mirrors
+		// crates/pi-cli/src/mcp_connection_harness.rs; see the harness
+		// constraints in docs/plans/phase4-tranche5-mcp-connection.md.
+		const fs = require("fs");
+		const os = require("os");
+		const { pathToFileURL } = require("url");
+		const piMcpDist = path.join(PI_REPO, "node_modules", "@earendil-works", "pi-mcp", "dist");
+		const piMcp = await import(pathToFileURL(path.join(piMcpDist, "index.js")).href);
+		const piMcpOauth = await import(pathToFileURL(path.join(piMcpDist, "oauth", "index.js")).href);
+		const runtime = await import(pathToFileURL(path.join(distDir, "extensions", "mcp", "runtime.js")).href);
+		const logMod = await import(pathToFileURL(path.join(distDir, "extensions", "mcp", "log.js")).href);
+		const entryObj = args.entry;
+		if (entryObj === undefined || entryObj === null || typeof entryObj !== "object" || Array.isArray(entryObj)) {
+			throw new Error("missing entry");
+		}
+		if (typeof entryObj.name !== "string") throw new Error("entry.name must be a string");
+		if (entryObj.config === undefined || entryObj.config === null || typeof entryObj.config !== "object" || Array.isArray(entryObj.config)) {
+			throw new Error("entry.config must be an object");
+		}
+		if (args.cwd !== undefined && args.cwd !== null && typeof args.cwd !== "string") {
+			throw new Error("cwd must be a string");
+		}
+		const cwd = args.cwd ?? "/tmp/pi-parity-mcc";
+		if (args.logPath !== undefined && args.logPath !== null && typeof args.logPath !== "string") {
+			throw new Error("logPath must be a string");
+		}
+		const logPath = args.logPath ?? undefined;
+		if (!Array.isArray(args.steps)) throw new Error("missing steps");
+		if (!Array.isArray(args.transports)) throw new Error("missing transports");
+		const makeError = (spec) => {
+			if (spec === undefined || spec === null || typeof spec !== "object" || Array.isArray(spec)) {
+				throw new Error("fail must be an object");
+			}
+			if (typeof spec.kind !== "string") throw new Error("fail must have a kind");
+			const message = (key) => (typeof spec[key] === "string" ? spec[key] : "");
+			switch (spec.kind) {
+				case "http":
+					if (typeof spec.status !== "number" || !Number.isInteger(spec.status) || spec.status < 0) {
+						throw new Error("http fail must have a status");
+					}
+					return new piMcp.McpHttpError(spec.status, message("message"), message("body"));
+				case "authRequired":
+					return new piMcp.McpAuthRequiredError({ headers: { get: () => null } }, message("body"));
+				case "sessionExpired":
+					return new piMcp.McpSessionExpiredError(message("body"));
+				case "oauthRequired":
+					return new piMcpOauth.McpOAuthAuthorizationRequiredError();
+				case "typeError":
+					return new TypeError(message("message"));
+				case "error":
+					return new Error(message("message"));
+				case "closed":
+					return new piMcp.McpConnectionClosedError(spec.message === undefined ? undefined : message("message"));
+				default:
+					throw new Error("unknown fail kind: " + spec.kind);
+			}
+		};
+		const parseStep = (step) => {
+			if (step === undefined || step === null || typeof step !== "object" || Array.isArray(step)) {
+				throw new Error("transport steps must be objects");
+			}
+			if (step.message !== undefined) return { kind: "message", message: step.message };
+			if (step.error !== undefined) return { kind: "error", text: typeof step.error === "string" ? step.error : "" };
+			if (step.close === true) return { kind: "close" };
+			if (step.fail !== undefined) return { kind: "fail", error: makeError(step.fail) };
+			throw new Error("transport steps must be message/error/close/fail");
+		};
+		const scripts = args.transports.map((script) => {
+			if (script === undefined || script === null || typeof script !== "object" || Array.isArray(script)) {
+				throw new Error("transports entries must be objects");
+			}
+			let startSteps = [];
+			if (script.startSteps !== undefined && script.startSteps !== null) {
+				if (!Array.isArray(script.startSteps)) throw new Error("startSteps must be an array");
+				startSteps = script.startSteps.map(parseStep);
+			}
+			let sendSteps = [];
+			if (script.sendSteps !== undefined && script.sendSteps !== null) {
+				if (!Array.isArray(script.sendSteps)) throw new Error("sendSteps must be an array");
+				sendSteps = script.sendSteps.map((batch) => {
+					if (!Array.isArray(batch)) throw new Error("sendSteps entries must be arrays");
+					return batch.map(parseStep);
+				});
+			}
+			return { startSteps, sendSteps };
+		});
+		class ParityFakeTransport {
+			constructor(script) {
+				this.script = script ?? { startSteps: [], sendSteps: [] };
+				this.started = false;
+				this.closed = false;
+				this.sent = [];
+				this.listeners = { message: [], error: [], close: [] };
+			}
+			onMessage(listener) {
+				this.listeners.message.push(listener);
+				return () => {
+					const i = this.listeners.message.indexOf(listener);
+					if (i >= 0) this.listeners.message.splice(i, 1);
+				};
+			}
+			onError(listener) {
+				this.listeners.error.push(listener);
+				return () => {
+					const i = this.listeners.error.indexOf(listener);
+					if (i >= 0) this.listeners.error.splice(i, 1);
+				};
+			}
+			onClose(listener) {
+				this.listeners.close.push(listener);
+				return () => {
+					const i = this.listeners.close.indexOf(listener);
+					if (i >= 0) this.listeners.close.splice(i, 1);
+				};
+			}
+			async start() {
+				if (this.closed) throw new piMcp.McpConnectionClosedError();
+				const first = !this.started;
+				this.started = true;
+				if (!first) return;
+				const batch = [];
+				const failure = this.#run(this.script.startSteps, batch);
+				this.#deliver(batch);
+				if (failure !== undefined) throw failure;
+			}
+			async send(message) {
+				if (!this.started || this.closed) throw new piMcp.McpConnectionClosedError();
+				this.sent.push(message);
+				const batch = [];
+				const failure = this.#run(this.script.sendSteps.shift() ?? [], batch);
+				this.#deliver(batch);
+				if (failure !== undefined) throw failure;
+			}
+			async close() {
+				if (this.closed) return;
+				this.closed = true;
+				this.#emitClose();
+			}
+			emit(message) {
+				for (const listener of [...this.listeners.message]) listener(message);
+			}
+			emitError(text) {
+				for (const listener of [...this.listeners.error]) listener(typeof text === "string" ? text : "");
+			}
+			#run(steps, batch) {
+				for (const step of steps) {
+					if (step.kind === "message") batch.push(step);
+					else if (step.kind === "error") batch.push(step);
+					else if (step.kind === "close") batch.push(step);
+					else if (step.kind === "fail") return step.error;
+				}
+				return undefined;
+			}
+			#deliver(batch) {
+				for (const step of batch) {
+					if (step.kind === "message") {
+						for (const listener of [...this.listeners.message]) listener(step.message);
+					} else if (step.kind === "error") {
+						for (const listener of [...this.listeners.error]) listener(step.text);
+					} else {
+						this.closed = true;
+						this.#emitClose();
+					}
+				}
+			}
+			#emitClose() {
+				for (const listener of [...this.listeners.close]) listener();
+			}
+		}
+		const transports = [];
+		const createTransport = () => {
+			const fake = new ParityFakeTransport(scripts.shift());
+			transports.push(fake);
+			return fake;
+		};
+		const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-parity-mcc-"));
+		const markers = [];
+		let nowMs = 0;
+		const RealDate = Date;
+		const PinnedDate = class extends RealDate {
+			constructor(...ctorArgs) {
+				if (ctorArgs.length === 0) super(nowMs);
+				else super(...ctorArgs);
+			}
+			static now() {
+				return nowMs;
+			}
+		};
+		globalThis.Date = PinnedDate;
+		const results = [];
+		const markersPerStep = [];
+		const requestOptions = (step) => {
+			if (step.options === undefined || step.options === null) return {};
+			if (typeof step.options !== "object" || Array.isArray(step.options)) {
+				throw new Error("options must be an object");
+			}
+			if (step.options.timeoutMs !== undefined && step.options.timeoutMs !== null) {
+				if (typeof step.options.timeoutMs !== "number" || !Number.isInteger(step.options.timeoutMs) || step.options.timeoutMs < 0) {
+					throw new Error("options.timeoutMs must be an integer");
+				}
+			}
+			return { timeoutMs: step.options.timeoutMs };
+		};
+		const snapshotOf = (conn) => ({
+			state: conn.state,
+			error: conn.error ?? null,
+			tools: conn.tools,
+			hasResources: conn.hasResources,
+			instructions: conn.instructions ?? null,
+			challenge: conn.challenge ?? null,
+		});
+		const barrier = () => new Promise((resolve) => setImmediate(resolve));
+		try {
+			const conn = new runtime.McpServerConnection({
+				entry: { name: entryObj.name, config: entryObj.config },
+				cwd,
+				createTransport,
+				credentials: {
+					forServer: () => ({
+						load: async () => undefined,
+						save: async () => {},
+						withRefreshLock: async (run) => run(),
+					}),
+				},
+				onTools: () => markers.push("onTools"),
+				onChange: () => markers.push("onChange"),
+				log: logPath === undefined ? undefined : new logMod.McpServerLog(parityJoinRel(base, logPath)),
+			});
+			for (const step of args.steps) {
+				if (step === undefined || step === null || typeof step !== "object" || Array.isArray(step)) {
+					throw new Error("steps entries must be objects");
+				}
+				if (typeof step.op !== "string") throw new Error("missing op");
+				if (step.nowMs !== undefined && step.nowMs !== null) {
+					if (typeof step.nowMs !== "number" || !Number.isInteger(step.nowMs)) {
+						throw new Error("nowMs must be an integer");
+					}
+					nowMs = step.nowMs;
+				} else {
+					nowMs = 0;
+				}
+				const options = requestOptions(step);
+				let outcome = null;
+				try {
+					if (step.op === "callTool") {
+						if (typeof step.name !== "string") throw new Error("missing name");
+						outcome = await conn.callTool(step.name, step.args, options);
+					} else if (step.op === "readResource") {
+						if (typeof step.uri !== "string") throw new Error("missing uri");
+						outcome = await conn.readResource(step.uri, options);
+					} else if (step.op === "resourcesPage") {
+						outcome = await conn.resourcesPage(step.cursor, options);
+					} else if (step.op === "resourceTemplatesPage") {
+						outcome = await conn.resourceTemplatesPage(step.cursor, options);
+					} else if (step.op === "allResources") {
+						outcome = await conn.allResources(options);
+					} else if (step.op === "allResourceTemplates") {
+						outcome = await conn.allResourceTemplates(options);
+					} else if (step.op === "reconnect") {
+						await conn.reconnect();
+					} else if (step.op === "signOut") {
+						await conn.signOut();
+					} else if (step.op === "close") {
+						await conn.close();
+					} else if (step.op === "snapshot") {
+						outcome = snapshotOf(conn);
+					} else if (step.op === "emit") {
+						const fake = transports[transports.length - 1];
+						if (step.message !== undefined) {
+							if (fake !== undefined) fake.emit(step.message);
+						} else if (step.error !== undefined) {
+							if (fake !== undefined) fake.emitError(step.error);
+						} else if (step.close === true) {
+							if (fake !== undefined) await fake.close();
+						} else {
+							throw new Error("emit must have message, error, or close");
+						}
+					} else {
+						throw new Error("unknown mcp-connection op: " + step.op);
+					}
+				} catch (e) {
+					outcome = { error: e && e.message !== undefined ? e.message : String(e) };
+				}
+				await barrier();
+				markersPerStep.push(markers.splice(0, markers.length));
+				results.push(outcome === undefined ? null : outcome);
+			}
+			const files = {};
+			if (logPath !== undefined) {
+				try {
+					files[logPath.replace(/^\/+/, "")] = fs.readFileSync(parityJoinRel(base, logPath), "utf8");
+				} catch {
+					/* No log written. */
+				}
+			}
+			return {
+				results,
+				markers: markersPerStep,
+				sent: transports.flatMap((t) => t.sent),
+				files,
+			};
+		} finally {
+			globalThis.Date = RealDate;
+			fs.rmSync(base, { recursive: true, force: true });
+		}
+	}
 	if (tool === "tool-search") {
 		const tsm = require(path.join(distDir, "extensions", "tool-search", "tool.js"));
 		switch (args.fn) {

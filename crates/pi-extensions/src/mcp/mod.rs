@@ -1,4 +1,7 @@
-//! `extensions/mcp` ports: server log and the MCP client transport seam.
+//! `extensions/mcp` ports: server log and the MCP client runtime
+//! (client + connection over the transport seam).
 
+pub mod client;
 pub mod log;
+pub mod runtime;
 pub mod transport;

@@ -13805,6 +13805,250 @@ cases.push(
 		return c;
 	})(),
 
+	// mcp-connection (extensions/mcp/runtime.ts + pi-mcp client.ts port):
+	// McpServerConnection over scripted fake transports — connect handshake
+	// (initialize params, capability gating, instructions), request/reply
+	// flows (callTool, resources, templates, pagination + validation),
+	// retry semantics (read-only transient, session-expired, connect
+	// retries), auth flows (needs-auth vs propagated errors), timeouts
+	// (notifications/cancelled), transport drops (disconnected +
+	// reconnect), refreshes (tools/list_changed), server notifications
+	// (notifications/message logging), lifecycle ops (reconnect, signOut,
+	// close), and harness argument errors. Harness constraints: replies
+	// arrive in the same send's batch or the case tests timeouts with
+	// small timeoutMs; incoming server requests ride in dedicated batches.
+	...(() => {
+		const httpConfig = (extra) => ({ url: "https://example.test/mcp", ...(extra || {}) });
+		const stdioConfig = (extra) => ({ command: "run-server", ...(extra || {}) });
+		const msg = (m) => ({ message: m });
+		const resp = (id, result) => msg({ jsonrpc: "2.0", id, result });
+		const rpcErr = (id, code, message) => msg({ jsonrpc: "2.0", id, error: { code, message } });
+		const notif = (method, params) => msg({ jsonrpc: "2.0", method, ...(params === undefined ? {} : { params }) });
+		const fail = (spec) => ({ fail: spec });
+		const closeStep = { close: true };
+		const httpFail = (status, message, extra) => ({ kind: "http", status, ...(message === undefined ? {} : { message }), ...(extra || {}) });
+		const initResult = (capabilities, extra) => ({
+			protocolVersion: "2025-11-25",
+			capabilities,
+			serverInfo: { name: "srv", version: "1.0" },
+			...(extra || {}),
+		});
+		const caps = (tools, resources, extra) => ({
+			...(tools ? { tools: {} } : {}),
+			...(resources ? { resources: {} } : {}),
+			...(extra || {}),
+		});
+		// The connect handshake: initialize, notifications/initialized,
+		// then tools/list (when the server has the tools capability).
+		const connectSends = (initRes, toolsResult, ...extra) => [
+			[resp(1, initRes)],
+			[],
+			...(toolsResult === null ? [] : [[toolsResult]]),
+			...extra,
+		];
+		const tool = (name, inputSchema, extra) => ({ name, inputSchema, ...(extra || {}) });
+		const mcc = (name, config, steps, transports, extra) => ({
+			tool: "mcp-connection",
+			name: "mcc/" + name,
+			args: { entry: { name: "srv", config }, steps, transports, ...(extra || {}) },
+		});
+		const call = (name, args, options) => ({ op: "callTool", name, ...(args === undefined ? {} : { args }), ...(options || {}) });
+		const snap = { op: "snapshot" };
+		const c = [];
+		const push = (name, config, steps, transports, extra) => c.push(mcc(name, config, steps, transports, extra));
+
+		// --- connect + callTool ---
+		push("connect-calltool", httpConfig(), [call("greet", { who: "world" }), snap], [
+			{ startSteps: [], sendSteps: connectSends(initResult(caps(true, true), { instructions: "  be nice  " }), resp(2, { tools: [tool("greet", {})] }), resp(3, { content: [{ type: "text", text: "hi" }] })) },
+		]);
+		push("connect-no-tools-capability", httpConfig(), [call("greet"), snap], [
+			{ startSteps: [], sendSteps: [...connectSends(initResult(caps(false, false)), null), resp(2, { content: [] })] },
+		]);
+		push("connect-no-resources", httpConfig(), [snap], [
+			{ startSteps: [], sendSteps: connectSends(initResult(caps(true, false), { instructions: "   " }), resp(2, { tools: [] })) },
+		]);
+		push("connect-instructions-missing", httpConfig(), [snap], [
+			{ startSteps: [], sendSteps: connectSends(initResult(caps(true, true)), resp(2, { tools: [] })) },
+		]);
+		push("connect-invalid-initialize", httpConfig(), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [[resp(1, { protocolVersion: "2025-11-25", capabilities: {}, serverInfo: { name: "s" } })]] },
+		]);
+		push("connect-unsupported-protocol", httpConfig(), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [[resp(1, initResult(caps(true, true), { protocolVersion: "2024-01-01" }))]] },
+		]);
+		push("calltool-structured-only", httpConfig(), [call("t")], [
+			{ startSteps: [], sendSteps: connectSends(initResult(caps(true, true)), resp(2, { tools: [] }), resp(3, { structuredContent: { a: 1 } })) },
+		]);
+		push("calltool-invalid-content", httpConfig(), [call("t")], [
+			{ startSteps: [], sendSteps: connectSends(initResult(caps(true, true)), resp(2, { tools: [] }), resp(3, { content: "x" })) },
+		]);
+		push("calltool-rpc-error", httpConfig(), [call("t"), snap], [
+			{ startSteps: [], sendSteps: connectSends(initResult(caps(true, true)), resp(2, { tools: [] }), rpcErr(3, -32602, "bad args")) },
+		]);
+
+		// --- resources + templates ---
+		const resourceSends = connectSends(initResult(caps(true, true)), resp(2, { tools: [] }));
+		const res1 = { uri: "file:///a", name: "a", description: "first" };
+		const res2 = { uri: "file:///b" };
+		push("resources-page", httpConfig(), [{ op: "resourcesPage" }, { op: "resourcesPage", cursor: "c2" }], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { resources: [res1, res2], nextCursor: "c2" }), resp(4, { resources: [] })] },
+		]);
+		push("resources-all-name-defaults", httpConfig(), [{ op: "allResources" }], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { resources: [res1, res2], nextCursor: "x" }), resp(4, { resources: [res1], nextCursor: null }), resp(5, { resources: [] })] },
+		]);
+		push("resources-null-cursor-ends", httpConfig(), [{ op: "allResources" }], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { resources: [res2], nextCursor: "" })] },
+		]);
+		push("resources-duplicate-cursor", httpConfig(), [{ op: "allResources" }, snap], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { resources: [], nextCursor: "a" }), resp(4, { resources: [], nextCursor: "a" })] },
+		]);
+		push("resources-invalid-entry", httpConfig(), [{ op: "resourcesPage" }], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { resources: [{ name: 5 }] })] },
+		]);
+		push("resources-invalid-cursor", httpConfig(), [{ op: "resourcesPage" }], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { resources: [], nextCursor: 7 })] },
+		]);
+		push("resources-read", httpConfig(), [{ op: "readResource", uri: "file:///a" }], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { contents: [{ uri: "file:///a", text: "body" }] })] },
+		]);
+		push("resources-read-invalid", httpConfig(), [{ op: "readResource", uri: "file:///a" }], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { contents: [{ uri: "file:///a" }] })] },
+		]);
+		const tmpl = { uriTemplate: "file:///{x}", description: "t" };
+		push("templates-page-method-not-found", httpConfig(), [{ op: "resourceTemplatesPage" }], [
+			{ startSteps: [], sendSteps: [...resourceSends, rpcErr(3, -32601, "Method not found: resources/templates/list")] },
+		]);
+		push("templates-page", httpConfig(), [{ op: "resourceTemplatesPage" }], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { resourceTemplates: [tmpl, { uriTemplate: "file:///y" }] })] },
+		]);
+		push("templates-all-method-not-found", httpConfig(), [{ op: "allResourceTemplates" }], [
+			{ startSteps: [], sendSteps: [...resourceSends, rpcErr(3, -32601, "Method not found: resources/templates/list")] },
+		]);
+		push("templates-all-error", httpConfig(), [{ op: "allResourceTemplates" }, snap], [
+			{ startSteps: [], sendSteps: [...resourceSends, rpcErr(3, -32603, "boom")] },
+		]);
+
+		// --- retries ---
+		push("read-retries-transient", httpConfig(), [{ op: "readResource", uri: "file:///a" }], [
+			{ startSteps: [], sendSteps: [...resourceSends, [fail(httpFail(429, "rate limited"))], resp(4, { contents: [{ uri: "file:///a", text: "ok" }] })] },
+		]);
+		push("calltool-no-transient-retry", httpConfig(), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [...resourceSends, [fail(httpFail(503, "overloaded"))]] },
+		]);
+		push("read-server-error-not-retried", httpConfig(), [{ op: "readResource", uri: "file:///a" }, snap], [
+			{ startSteps: [], sendSteps: [...resourceSends, [fail(httpFail(501, "not implemented"))]] },
+		]);
+		push("connect-retries-transient-http", httpConfig(), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [[fail({ kind: "typeError", message: "fetch failed" })]] },
+			{ startSteps: [], sendSteps: connectSends(initResult(caps(true, true)), resp(2, { tools: [] }), resp(3, { content: [] })) },
+		]);
+		push("connect-no-retry-stdio", stdioConfig(), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [[fail({ kind: "typeError", message: "spawn failed" })]] },
+		]);
+		push("connect-nontransient-http-error", httpConfig(), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [[fail(httpFail(404, "no route"))]] },
+		]);
+		push("connect-exhausts-retries", httpConfig({ timeout: 1 }), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [[fail({ kind: "typeError", message: "fetch failed 1" })]] },
+			{ startSteps: [], sendSteps: [[fail({ kind: "typeError", message: "fetch failed 2" })]] },
+			{ startSteps: [], sendSteps: [[fail({ kind: "typeError", message: "fetch failed 3" })]] },
+		]);
+		push("session-expired-retries", httpConfig(), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [...resourceSends, [fail({ kind: "sessionExpired", body: "gone" })]] },
+			{ startSteps: [], sendSteps: connectSends(initResult(caps(true, true)), resp(2, { tools: [tool("t", {})] }), resp(3, { content: [] })) },
+		]);
+
+		// --- auth ---
+		push("auth-required-with-provider", httpConfig(), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [[fail({ kind: "authRequired" })]] },
+		]);
+		push("auth-required-login-provider", httpConfig({ auth: { provider: "anthropic" } }), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [[fail({ kind: "authRequired" })]] },
+		]);
+		push("auth-required-without-provider", httpConfig({ headers: { Authorization: "Bearer x" } }), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [[fail({ kind: "authRequired" })]] },
+		]);
+		push("oauth-required-stdio", stdioConfig(), [call("t"), snap], [
+			{ startSteps: [], sendSteps: [[fail({ kind: "oauthRequired" })]] },
+		]);
+
+		// --- timeouts ---
+		push("calltool-timeout", httpConfig(), [call("t", undefined, { options: { timeoutMs: 5 } }), snap], [
+			{ startSteps: [], sendSteps: [...resourceSends, [], []] },
+		]);
+
+		// --- transport drops ---
+		push("transport-close-mid-op", httpConfig(), [call("t"), snap, call("t"), snap], [
+			{ startSteps: [], sendSteps: [...resourceSends, [closeStep]] },
+			{ startSteps: [], sendSteps: connectSends(initResult(caps(true, true)), resp(2, { tools: [] }), resp(3, { content: [] })) },
+		]);
+		push("emit-close-disconnects", httpConfig(), [call("t"), { op: "emit", close: true }, snap], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { content: [] })] },
+		]);
+
+		// --- incoming requests + notifications (emit) ---
+		push("emit-ping", httpConfig(), [call("t"), { op: "emit", message: { jsonrpc: "2.0", id: 50, method: "ping" } }], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { content: [] })] },
+		]);
+		push("emit-roots-list", httpConfig(), [{ op: "emit", message: { jsonrpc: "2.0", id: 51, method: "roots/list" } }], [
+			{ startSteps: [], sendSteps: [...resourceSends] },
+		]);
+		push("emit-unknown-method", httpConfig(), [{ op: "emit", message: { jsonrpc: "2.0", id: 52, method: "x/y" } }], [
+			{ startSteps: [], sendSteps: [...resourceSends] },
+		]);
+		push("emit-error-only", httpConfig(), [{ op: "emit", error: "transport hiccup" }, snap], [
+			{ startSteps: [], sendSteps: [...resourceSends] },
+		]);
+		push("emit-invalid-message", httpConfig(), [{ op: "emit", message: { jsonrpc: "1.0", id: 1, method: "x" } }, snap], [
+			{ startSteps: [], sendSteps: [...resourceSends] },
+		]);
+		push("tools-list-changed-refresh", httpConfig(), [call("t"), snap], [
+			{
+				startSteps: [],
+				sendSteps: [
+					[resp(1, initResult(caps(true, true)))],
+					[],
+					[resp(2, { tools: [] }), notif("notifications/tools/list_changed")],
+					[resp(3, { tools: [tool("new-tool", {})] })],
+					[resp(4, { content: [] })],
+				],
+			},
+		]);
+		push("message-notification-logs", httpConfig(), [{ op: "callTool", name: "t", nowMs: 1000 }], [
+			{
+				startSteps: [],
+				sendSteps: [
+					[resp(1, initResult(caps(true, true))), notif("notifications/message", { level: "info", data: "hello" })],
+					[],
+					[resp(2, { tools: [] })],
+					[resp(3, { content: [] }), notif("notifications/message", { data: "again" })],
+				],
+			},
+		], { logPath: "logs/srv.log" });
+
+		// --- lifecycle ---
+		push("reconnect", httpConfig(), [call("t"), { op: "reconnect" }, snap], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { content: [] })] },
+			{ startSteps: [], sendSteps: connectSends(initResult(caps(true, true)), resp(2, { tools: [tool("x", {})] })) },
+		]);
+		push("signout", httpConfig(), [call("t"), { op: "signOut" }, snap], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { content: [] })] },
+		]);
+		push("close-then-call", httpConfig(), [call("t"), { op: "close" }, call("t"), snap], [
+			{ startSteps: [], sendSteps: [...resourceSends, resp(3, { content: [] })] },
+		]);
+
+		// --- harness argument errors ---
+		c.push({ tool: "mcp-connection", name: "mcc/err-missing-steps", args: { entry: { name: "srv", config: httpConfig() }, transports: [] } });
+		c.push({ tool: "mcp-connection", name: "mcc/err-missing-transports", args: { entry: { name: "srv", config: httpConfig() }, steps: [] } });
+		c.push({ tool: "mcp-connection", name: "mcc/err-bad-entry", args: { steps: [], transports: [] } });
+		c.push({ tool: "mcp-connection", name: "mcc/err-unknown-op", args: { entry: { name: "srv", config: httpConfig() }, steps: [{ op: "bogus" }], transports: [] } });
+		c.push({ tool: "mcp-connection", name: "mcc/err-bad-fail", args: { entry: { name: "srv", config: httpConfig() }, steps: [], transports: [{ startSteps: [{}], sendSteps: [] }] } });
+		c.push({ tool: "mcp-connection", name: "mcc/err-bad-timeout", args: { entry: { name: "srv", config: httpConfig() }, steps: [{ op: "callTool", name: "t", options: { timeoutMs: 1.5 } }], transports: [] } });
+
+		return c;
+	})(),
+
 	// -- harness error paths --------------------------------------------------------
 	{ tool: "extension-runner", name: "exr/missing-ops", args: {} },
 );

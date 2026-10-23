@@ -35,10 +35,11 @@ use pi_extensions::mcp::log::{McpLogFs, McpServerLog};
 
 const BASE: &str = "<base>";
 
-/// In-memory [`McpLogFs`] driven by the case's `files` map.
+/// In-memory [`McpLogFs`] driven by the case's `files` map. Shared by the
+/// `mcp-log` and `mcp-connection` harnesses.
 #[derive(Default)]
-struct MemoryMcpLogFs {
-    files: std::cell::RefCell<BTreeMap<String, Vec<u8>>>,
+pub struct MemoryMcpLogFs {
+    pub files: std::cell::RefCell<BTreeMap<String, Vec<u8>>>,
 }
 
 impl McpLogFs for MemoryMcpLogFs {
