@@ -29,9 +29,8 @@
 //! resolution) and the stderr tail (`StdioTransport` only — fake
 //! transports are never stdio, so `stderrTail` stays `None`).
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -103,7 +102,7 @@ impl McpAuthProvider {
 /// `McpOAuthCredentialStore` seam: the connection calls `forServer(name,
 /// url)` eagerly at construction when the server uses OAuth; nothing else
 /// happens without real flows.
-pub trait McpCredentialStore {
+pub trait McpCredentialStore: Send {
     fn for_server(&mut self, _name: &str, _url: &str) {}
 }
 
@@ -112,13 +111,20 @@ impl McpCredentialStore for () {}
 /// `McpServerLog` seam: `write(server, params)` with the clock modeled by
 /// the implementation (the TS harness pins `Date`). `params` is `None`
 /// when the notification carried no `params` (TS `undefined`).
-pub trait McpLogSink {
+pub trait McpLogSink: Send {
     fn write(&mut self, server: &str, params: Option<&Value>);
 }
 
+/// The `onTools` hook: receives a snapshot of the connected server.
+pub type ConnectionToolsHook = Box<dyn FnMut(&McpConnectionSnapshot) + Send>;
+
+/// The `onChange` hook.
+pub type ConnectionChangeHook = Box<dyn FnMut(&McpConnectionSnapshot) + Send>;
+
 /// `McpTransportFactory`.
-pub type TransportFactory =
-    Box<dyn FnMut(&McpServerEntry, &str, Option<&McpAuthProvider>) -> Box<dyn McpTransport>>;
+pub type TransportFactory = Box<
+    dyn FnMut(&McpServerEntry, &str, Option<&McpAuthProvider>) -> Box<dyn McpTransport> + Send,
+>;
 
 /// A deferred connection event (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,14 +141,31 @@ pub struct McpServerConnectionOptions {
     pub cwd: String,
     pub create_transport: TransportFactory,
     pub credentials: Box<dyn McpCredentialStore>,
-    /// `onTools(connection)` — harnesses record a marker.
-    pub on_tools: Box<dyn FnMut()>,
-    /// `onChange(connection)?` — harnesses record a marker.
-    pub on_change: Option<Box<dyn FnMut()>>,
+    /// `onTools(connection)` — invoked with a snapshot of the freshly
+    /// connected server.
+    pub on_tools: ConnectionToolsHook,
+    /// `onChange(connection)?` — invoked with a snapshot after every state
+    /// change.
+    pub on_change: Option<ConnectionChangeHook>,
     pub log: Option<Box<dyn McpLogSink>>,
     /// Injected timers: connect retries, the `withClient` transient retry,
     /// and client request timeouts.
     pub sleep: SleepFn,
+}
+
+/// What `onTools`/`onChange` receive. The TS callbacks get the live
+/// connection; a snapshot keeps the Rust callbacks from re-entering the
+/// connection while it is being mutated (they run under the same call).
+#[derive(Debug, Clone)]
+pub struct McpConnectionSnapshot {
+    pub name: String,
+    pub state: ServerState,
+    pub tools: Vec<Value>,
+    pub has_resources: bool,
+    pub instructions: Option<String>,
+    pub error: Option<String>,
+    pub oauth_url: Option<String>,
+    pub timeout_ms: u64,
 }
 
 /// `McpServerConnection` — one configured server. Reconnects lazily when a
@@ -171,10 +194,10 @@ pub struct McpServerConnection {
     cwd: String,
     create_transport: TransportFactory,
     auth_provider: Option<McpAuthProvider>,
-    on_tools: Box<dyn FnMut()>,
-    on_change: Option<Box<dyn FnMut()>>,
-    log: Option<Rc<RefCell<Box<dyn McpLogSink>>>>,
-    pending_events: Rc<RefCell<VecDeque<ConnEvent>>>,
+    on_tools: ConnectionToolsHook,
+    on_change: Option<ConnectionChangeHook>,
+    log: Option<Arc<Mutex<Box<dyn McpLogSink>>>>,
+    pending_events: Arc<Mutex<VecDeque<ConnEvent>>>,
     sleep: SleepFn,
 }
 
@@ -304,9 +327,23 @@ impl McpServerConnection {
             auth_provider,
             on_tools: options.on_tools,
             on_change: options.on_change,
-            log: options.log.map(|log| Rc::new(RefCell::new(log))),
-            pending_events: Rc::new(RefCell::new(VecDeque::new())),
+            log: options.log.map(|log| Arc::new(Mutex::new(log))),
+            pending_events: Arc::new(Mutex::new(VecDeque::new())),
             sleep: options.sleep,
+        }
+    }
+
+    /// The snapshot handed to `onTools`/`onChange`.
+    pub fn snapshot(&self) -> McpConnectionSnapshot {
+        McpConnectionSnapshot {
+            name: self.entry.name.clone(),
+            state: self.state,
+            tools: self.tools.clone(),
+            has_resources: self.has_resources,
+            instructions: self.instructions.clone(),
+            error: self.error.clone(),
+            oauth_url: self.oauth_url(),
+            timeout_ms: self.timeout_ms(),
         }
     }
 
@@ -553,7 +590,7 @@ impl McpServerConnection {
             let name = self.entry.name.clone();
             client.on_notification(
                 "notifications/message",
-                Box::new(move |params| log.borrow_mut().write(&name, params)),
+                Box::new(move |params| log.lock().unwrap().write(&name, params)),
             );
         }
         let transport = (self.create_transport)(&self.entry, &self.cwd, self.auth_provider.as_ref());
@@ -568,10 +605,10 @@ impl McpServerConnection {
         let queue = self.pending_events.clone();
         client.on_notification(
             "notifications/tools/list_changed",
-            Box::new(move |_| queue.borrow_mut().push_back(ConnEvent::ToolsListChanged(seq))),
+            Box::new(move |_| queue.lock().unwrap().push_back(ConnEvent::ToolsListChanged(seq))),
         );
         let queue = self.pending_events.clone();
-        client.on_close(Box::new(move || queue.borrow_mut().push_back(ConnEvent::ClientClosed(seq))));
+        client.on_close(Box::new(move || queue.lock().unwrap().push_back(ConnEvent::ClientClosed(seq))));
         // Servers without the tools capability (prompts or resources only)
         // do not answer tools/list.
         let tools = if is_truthy(client.server_capabilities().and_then(|c| c.get("tools"))) {
@@ -618,7 +655,8 @@ impl McpServerConnection {
             .filter(|s| !s.is_empty());
         self.state = ServerState::Connected;
         self.error = None;
-        (self.on_tools)();
+        let snapshot = self.snapshot();
+        (self.on_tools)(&snapshot);
         self.changed();
         Ok(seq)
     }
@@ -680,7 +718,8 @@ impl McpServerConnection {
                     return;
                 }
                 self.tools = tools;
-                (self.on_tools)();
+                let snapshot = self.snapshot();
+        (self.on_tools)(&snapshot);
             }
             Err(error) => {
                 self.error = Some(format!("Failed to refresh tools: {}", error.message()));
@@ -708,8 +747,11 @@ impl McpServerConnection {
 
     /// `changed`.
     fn changed(&mut self) {
-        if let Some(on_change) = &mut self.on_change {
-            on_change();
+        if self.on_change.is_some() {
+            let snapshot = self.snapshot();
+            if let Some(on_change) = &mut self.on_change {
+                on_change(&snapshot);
+            }
         }
     }
 
@@ -753,7 +795,7 @@ impl McpServerConnection {
     fn process_pending_events_with(&mut self, client: Option<&mut McpClient>) {
         let mut client = client;
         loop {
-            let event = self.pending_events.borrow_mut().pop_front();
+            let event = self.pending_events.lock().unwrap().pop_front();
             let Some(event) = event else { break };
             match event {
                 ConnEvent::ToolsListChanged(seq) => {
@@ -775,7 +817,6 @@ mod tests {
     use crate::mcp::client::LATEST_PROTOCOL_VERSION;
     use crate::mcp::transport::{FakeStep, FakeTransport, SendOptions};
     use serde_json::{json, Map};
-    use std::cell::RefCell as Cell;
     use std::collections::VecDeque;
 
     /// Recording sleep fn (no real sleeping).
@@ -837,53 +878,53 @@ mod tests {
 
     /// A `Box<dyn McpTransport>` over a shared `FakeTransport`, so the
     /// harness keeps handles to the transports the factory created.
-    struct SharedTransport(Rc<Cell<FakeTransport>>);
+    struct SharedTransport(Arc<Mutex<FakeTransport>>);
 
     impl McpTransport for SharedTransport {
         fn start(&mut self) -> Result<(), McpErrorKind> {
-            self.0.borrow_mut().start()
+            self.0.lock().unwrap().start()
         }
         fn send(&mut self, message: &Value, options: SendOptions) -> Result<(), McpErrorKind> {
-            self.0.borrow_mut().send(message, options)
+            self.0.lock().unwrap().send(message, options)
         }
         fn close(&mut self) -> Result<(), McpErrorKind> {
-            self.0.borrow_mut().close()
+            self.0.lock().unwrap().close()
         }
         fn on_message(&mut self, listener: super::super::transport::MessageListener) -> usize {
-            self.0.borrow_mut().on_message(listener)
+            self.0.lock().unwrap().on_message(listener)
         }
         fn on_error(&mut self, listener: super::super::transport::ErrorListener) -> usize {
-            self.0.borrow_mut().on_error(listener)
+            self.0.lock().unwrap().on_error(listener)
         }
         fn on_close(&mut self, listener: super::super::transport::CloseListener) -> usize {
-            self.0.borrow_mut().on_close(listener)
+            self.0.lock().unwrap().on_close(listener)
         }
         fn off_message(&mut self, id: usize) {
-            self.0.borrow_mut().off_message(id)
+            self.0.lock().unwrap().off_message(id)
         }
         fn off_error(&mut self, id: usize) {
-            self.0.borrow_mut().off_error(id)
+            self.0.lock().unwrap().off_error(id)
         }
         fn off_close(&mut self, id: usize) {
-            self.0.borrow_mut().off_close(id)
+            self.0.lock().unwrap().off_close(id)
         }
         fn set_protocol_version(&mut self, version: &str) {
-            self.0.borrow_mut().set_protocol_version(version)
+            self.0.lock().unwrap().set_protocol_version(version)
         }
     }
 
     struct Harness {
         connection: Option<McpServerConnection>,
-        transports: Rc<Cell<Vec<Rc<Cell<FakeTransport>>>>>,
-        scripts: Rc<Cell<VecDeque<Vec<Vec<FakeStep>>>>>,
-        markers: Rc<Cell<Vec<&'static str>>>,
+        transports: Arc<Mutex<Vec<Arc<Mutex<FakeTransport>>>>>,
+        scripts: Arc<Mutex<VecDeque<Vec<Vec<FakeStep>>>>>,
+        markers: Arc<Mutex<Vec<&'static str>>>,
     }
 
     impl Harness {
         fn new(entry: McpServerEntry) -> (Self, Sleeps) {
-            let transports: Rc<Cell<Vec<Rc<Cell<FakeTransport>>>>> = Rc::new(Cell::new(Vec::new()));
-            let scripts: Rc<Cell<VecDeque<Vec<Vec<FakeStep>>>>> = Rc::new(Cell::new(VecDeque::new()));
-            let markers: Rc<Cell<Vec<&'static str>>> = Rc::new(Cell::new(Vec::new()));
+            let transports: Arc<Mutex<Vec<Arc<Mutex<FakeTransport>>>>> = Arc::new(Mutex::new(Vec::new()));
+            let scripts: Arc<Mutex<VecDeque<Vec<Vec<FakeStep>>>>> = Arc::new(Mutex::new(VecDeque::new()));
+            let markers: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
             let (sleep, sleeps) = recorder();
             let factory_transports = transports.clone();
             let factory_scripts = scripts.clone();
@@ -891,24 +932,24 @@ mod tests {
                                 _cwd: &str,
                                 _auth: Option<&McpAuthProvider>|
                   -> Box<dyn McpTransport> {
-                let script = factory_scripts.borrow_mut().pop_front();
+                let script = factory_scripts.lock().unwrap().pop_front();
                 let mut transport = FakeTransport::new();
                 if let Some(script) = script {
                     transport.start_steps = script.first().cloned().unwrap_or_default();
                     transport.send_steps =
                         VecDeque::from(script.into_iter().skip(1).collect::<Vec<_>>());
                 }
-                let shared = Rc::new(Cell::new(transport));
-                factory_transports.borrow_mut().push(shared.clone());
+                let shared = Arc::new(Mutex::new(transport));
+                factory_transports.lock().unwrap().push(shared.clone());
                 Box::new(SharedTransport(shared))
             };
             let on_tools = {
                 let markers = markers.clone();
-                move || markers.borrow_mut().push("onTools")
+                move |_: &McpConnectionSnapshot| markers.lock().unwrap().push("onTools")
             };
             let on_change = {
                 let markers = markers.clone();
-                move || markers.borrow_mut().push("onChange")
+                move |_: &McpConnectionSnapshot| markers.lock().unwrap().push("onChange")
             };
             let connection = McpServerConnection::new(McpServerConnectionOptions {
                 entry,
@@ -929,7 +970,7 @@ mod tests {
         /// Scripts are consumed front-first; push the first transport's
         /// script first.
         fn push_script(&self, script: Vec<Vec<FakeStep>>) {
-            self.scripts.borrow_mut().push_back(script);
+            self.scripts.lock().unwrap().push_back(script);
         }
 
         fn conn(&mut self) -> &mut McpServerConnection {
@@ -938,11 +979,22 @@ mod tests {
 
         fn sent(&self) -> Vec<Value> {
             self.transports
-                .borrow()
+                .lock()
+                .unwrap()
                 .iter()
-                .flat_map(|t| t.borrow().sent.clone())
+                .flat_map(|t| t.lock().unwrap().sent.clone())
                 .collect()
         }
+    }
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn connection_and_client_are_send() {
+        assert_send::<McpServerConnection>();
+        assert_send::<McpClient>();
+        assert_send::<Box<dyn McpTransport>>();
+        assert_send::<Box<dyn McpLogSink>>();
     }
 
     #[test]
@@ -961,7 +1013,7 @@ mod tests {
         assert_eq!(h.conn().tools.len(), 1);
         assert_eq!(h.conn().name(), "srv");
         assert_eq!(
-            *h.markers.borrow(),
+            *h.markers.lock().unwrap(),
             vec!["onChange", "onTools", "onChange"],
             "connecting changed, then onTools + changed"
         );
@@ -1023,7 +1075,7 @@ mod tests {
         let _ = h.conn().call_tool("t", None, &RequestOptions::default());
         assert_eq!(h.conn().state, ServerState::Connected);
         assert_eq!(*sleeps.lock().unwrap(), vec![250]);
-        assert_eq!(h.transports.borrow().len(), 2);
+        assert_eq!(h.transports.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -1089,7 +1141,7 @@ mod tests {
         let result = h.conn().call_tool("t", None, &RequestOptions::default());
         assert!(result.is_ok(), "{:?}", result.err());
         assert_eq!(h.conn().state, ServerState::Connected);
-        assert_eq!(h.transports.borrow().len(), 2);
+        assert_eq!(h.transports.lock().unwrap().len(), 2);
     }
 
     #[test]
@@ -1101,7 +1153,7 @@ mod tests {
         assert_eq!(err.message(), "MCP connection closed");
         assert_eq!(h.conn().state, ServerState::Disconnected);
         assert_eq!(h.conn().error.as_deref(), Some("Connection closed"));
-        assert_eq!(*h.markers.borrow(), vec!["onChange", "onTools", "onChange", "onChange"]);
+        assert_eq!(*h.markers.lock().unwrap(), vec!["onChange", "onTools", "onChange", "onChange"]);
     }
 
     #[test]
@@ -1158,7 +1210,7 @@ mod tests {
         assert_eq!(h.sent()[5]["method"], "notifications/cancelled");
         assert_eq!(h.sent()[5]["params"]["requestId"], 4);
         assert_eq!(
-            *h.markers.borrow(),
+            *h.markers.lock().unwrap(),
             vec!["onChange", "onTools", "onChange"]
         );
     }
@@ -1172,7 +1224,7 @@ mod tests {
         let _ = h.conn().reconnect();
         assert_eq!(h.conn().state, ServerState::Connected);
         assert_eq!(h.conn().tools.len(), 1);
-        assert_eq!(h.transports.borrow().len(), 2);
+        assert_eq!(h.transports.lock().unwrap().len(), 2);
     }
 
     #[test]

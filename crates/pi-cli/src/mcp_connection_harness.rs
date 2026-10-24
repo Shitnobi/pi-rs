@@ -45,9 +45,8 @@
 //! incoming server requests ride in batches without response events;
 //! no emits while disconnected.
 
-use std::cell::{Cell, RefCell};
+use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
-use std::rc::Rc;
 
 use serde_json::{json, Map, Value};
 
@@ -64,38 +63,38 @@ const DEFAULT_CWD: &str = "/tmp/pi-parity-mcc";
 
 /// A `Box<dyn McpTransport>` over a shared `FakeTransport`, so the harness
 /// keeps handles to the transports the factory created (for `sent`).
-struct SharedTransport(Rc<RefCell<FakeTransport>>);
+struct SharedTransport(Arc<Mutex<FakeTransport>>);
 
 impl McpTransport for SharedTransport {
     fn start(&mut self) -> Result<(), McpErrorKind> {
-        self.0.borrow_mut().start()
+        self.0.lock().unwrap().start()
     }
     fn send(&mut self, message: &Value, options: SendOptions) -> Result<(), McpErrorKind> {
-        self.0.borrow_mut().send(message, options)
+        self.0.lock().unwrap().send(message, options)
     }
     fn close(&mut self) -> Result<(), McpErrorKind> {
-        self.0.borrow_mut().close()
+        self.0.lock().unwrap().close()
     }
     fn on_message(&mut self, listener: pi_extensions::mcp::transport::MessageListener) -> usize {
-        self.0.borrow_mut().on_message(listener)
+        self.0.lock().unwrap().on_message(listener)
     }
     fn on_error(&mut self, listener: pi_extensions::mcp::transport::ErrorListener) -> usize {
-        self.0.borrow_mut().on_error(listener)
+        self.0.lock().unwrap().on_error(listener)
     }
     fn on_close(&mut self, listener: pi_extensions::mcp::transport::CloseListener) -> usize {
-        self.0.borrow_mut().on_close(listener)
+        self.0.lock().unwrap().on_close(listener)
     }
     fn off_message(&mut self, id: usize) {
-        self.0.borrow_mut().off_message(id)
+        self.0.lock().unwrap().off_message(id)
     }
     fn off_error(&mut self, id: usize) {
-        self.0.borrow_mut().off_error(id)
+        self.0.lock().unwrap().off_error(id)
     }
     fn off_close(&mut self, id: usize) {
-        self.0.borrow_mut().off_close(id)
+        self.0.lock().unwrap().off_close(id)
     }
     fn set_protocol_version(&mut self, version: &str) {
-        self.0.borrow_mut().set_protocol_version(version)
+        self.0.lock().unwrap().set_protocol_version(version)
     }
 }
 
@@ -234,17 +233,15 @@ fn parse_options(step: &Value) -> Result<RequestOptions, String> {
 /// The log sink: `McpServerLog` over the shared in-memory fs with the
 /// step-pinned clock.
 struct HarnessLogSink {
-    fs: Rc<crate::mcp_log_harness::MemoryMcpLogFs>,
-    logger: RefCell<McpServerLog>,
-    now_ms: Rc<Cell<i64>>,
+    fs: Arc<crate::mcp_log_harness::MemoryMcpLogFs>,
+    logger: McpServerLog,
+    now_ms: Arc<Mutex<i64>>,
 }
 
 impl McpLogSink for HarnessLogSink {
     fn write(&mut self, server: &str, params: Option<&Value>) {
-        let now = self.now_ms.get();
-        self.logger
-            .borrow_mut()
-            .write(&*self.fs, server, params, now);
+        let now = *self.now_ms.lock().unwrap();
+        self.logger.write(&*self.fs, server, params, now);
     }
 }
 
@@ -252,7 +249,8 @@ impl McpLogSink for HarnessLogSink {
 fn log_file_contents(fs: &crate::mcp_log_harness::MemoryMcpLogFs, rel: &str) -> Option<Value> {
     let base = format!("<base>/{}", rel.trim_start_matches('/'));
     fs.files
-        .borrow()
+        .lock()
+        .unwrap()
         .get(&base)
         .map(|bytes| Value::String(String::from_utf8_lossy(bytes).into_owned()))
 }
@@ -307,13 +305,13 @@ pub fn run_mcp_connection_harness(input: &Value) -> Result<Value, String> {
     }
 
     // Shared harness state.
-    let transports: Rc<RefCell<Vec<Rc<RefCell<FakeTransport>>>>> = Rc::new(RefCell::new(Vec::new()));
-    let markers: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
-    let fs = Rc::new(crate::mcp_log_harness::MemoryMcpLogFs::default());
-    let now_ms: Rc<Cell<i64>> = Rc::new(Cell::new(0));
+    let transports: Arc<Mutex<Vec<Arc<Mutex<FakeTransport>>>>> = Arc::new(Mutex::new(Vec::new()));
+    let markers: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let fs = Arc::new(crate::mcp_log_harness::MemoryMcpLogFs::default());
+    let now_ms: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
 
     let factory_transports = transports.clone();
-    let factory_scripts = Rc::new(RefCell::new(scripts));
+    let factory_scripts = Arc::new(Mutex::new(scripts));
     let factory = move |_entry: &McpServerEntry,
                         _cwd: &str,
                         _auth: Option<&McpAuthProvider>|
@@ -321,35 +319,40 @@ pub fn run_mcp_connection_harness(input: &Value) -> Result<Value, String> {
         // A missing script behaves like the TS `scripts.shift()` returning
         // undefined: a transport whose sends all succeed silently.
         let (start_steps, send_batches) = factory_scripts
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .pop_front()
             .unwrap_or_default();
         let mut transport = FakeTransport::new();
         transport.start_steps = start_steps;
         transport.send_steps = VecDeque::from(send_batches);
-        let shared = Rc::new(RefCell::new(transport));
-        factory_transports.borrow_mut().push(shared.clone());
+        let shared = Arc::new(Mutex::new(transport));
+        factory_transports.lock().unwrap().push(shared.clone());
         Box::new(SharedTransport(shared))
     };
 
     let log: Option<Box<dyn McpLogSink>> = log_path.as_ref().map(|rel| {
         Box::new(HarnessLogSink {
             fs: fs.clone(),
-            logger: RefCell::new(McpServerLog::new(format!(
+            logger: McpServerLog::new(format!(
                 "<base>/{}",
                 rel.trim_start_matches('/')
-            ))),
+            )),
             now_ms: now_ms.clone(),
         }) as Box<dyn McpLogSink>
     });
 
     let on_tools = {
         let markers = markers.clone();
-        move || markers.borrow_mut().push("onTools")
+        move |_: &pi_extensions::mcp::runtime::McpConnectionSnapshot| {
+            markers.lock().unwrap().push("onTools")
+        }
     };
     let on_change = {
         let markers = markers.clone();
-        move || markers.borrow_mut().push("onChange")
+        move |_: &pi_extensions::mcp::runtime::McpConnectionSnapshot| {
+            markers.lock().unwrap().push("onChange")
+        }
     };
     // Real sleeping: request timeouts and connect retries advance real
     // time on both sides (TS timers).
@@ -369,9 +372,10 @@ pub fn run_mcp_connection_harness(input: &Value) -> Result<Value, String> {
 
     let mut results: Vec<Value> = Vec::new();
     let mut markers_per_step: Vec<Vec<Value>> = Vec::new();
-    let take_markers = |markers: &Rc<RefCell<Vec<&'static str>>>| -> Vec<Value> {
+    let take_markers = |markers: &Arc<Mutex<Vec<&'static str>>>| -> Vec<Value> {
         markers
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .drain(..)
             .map(|m| Value::String(m.to_string()))
             .collect()
@@ -384,13 +388,12 @@ pub fn run_mcp_connection_harness(input: &Value) -> Result<Value, String> {
             .get("op")
             .and_then(Value::as_str)
             .ok_or_else(|| "missing op".to_string())?;
-        match obj.get("nowMs") {
-            None => now_ms.set(0),
-            Some(v) => now_ms.set(
-                v.as_i64()
-                    .ok_or_else(|| "nowMs must be an integer".to_string())?,
-            ),
-        }
+        *now_ms.lock().unwrap() = match obj.get("nowMs") {
+            None => 0,
+            Some(v) => v
+                .as_i64()
+                .ok_or_else(|| "nowMs must be an integer".to_string())?,
+        };
         let options = parse_options(step)?;
         // Step-local failures (unknown op, missing fields, bad emit args)
         // become the step's `{ error }` outcome and the run continues, like
@@ -502,9 +505,10 @@ pub fn run_mcp_connection_harness(input: &Value) -> Result<Value, String> {
     }
 
     let sent: Vec<Value> = transports
-        .borrow()
+        .lock()
+        .unwrap()
         .iter()
-        .flat_map(|t| t.borrow().sent.clone())
+        .flat_map(|t| t.lock().unwrap().sent.clone())
         .collect();
     let mut files = Map::new();
     if let Some(rel) = &log_path {

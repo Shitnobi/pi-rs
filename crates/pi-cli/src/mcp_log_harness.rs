@@ -39,7 +39,7 @@ const BASE: &str = "<base>";
 /// `mcp-log` and `mcp-connection` harnesses.
 #[derive(Default)]
 pub struct MemoryMcpLogFs {
-    pub files: std::cell::RefCell<BTreeMap<String, Vec<u8>>>,
+    pub files: std::sync::Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 impl McpLogFs for MemoryMcpLogFs {
@@ -58,7 +58,7 @@ impl McpLogFs for MemoryMcpLogFs {
                 prefix.push('/');
             }
             prefix.push_str(part);
-            if self.files.borrow().contains_key(&prefix) {
+            if self.files.lock().unwrap().contains_key(&prefix) {
                 return Err(format!("ENOTDIR: not a directory, mkdir '{}'", dir));
             }
         }
@@ -66,13 +66,14 @@ impl McpLogFs for MemoryMcpLogFs {
     }
     fn size(&self, path: &str) -> Result<u64, String> {
         self.files
-            .borrow()
+            .lock()
+            .unwrap()
             .get(path)
             .map(|b| b.len() as u64)
             .ok_or_else(|| format!("ENOENT: no such file or directory, stat '{}'", path))
     }
     fn rename(&self, from: &str, to: &str) -> Result<(), String> {
-        let mut files = self.files.borrow_mut();
+        let mut files = self.files.lock().unwrap();
         match files.remove(from) {
             Some(content) => {
                 files.insert(to.to_string(), content);
@@ -83,7 +84,8 @@ impl McpLogFs for MemoryMcpLogFs {
     }
     fn append(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
         self.files
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .entry(path.to_string())
             .or_default()
             .extend_from_slice(bytes);
@@ -161,7 +163,7 @@ pub fn run_mcp_log_harness(input: &Value) -> Result<Value, String> {
     };
     let fs = MemoryMcpLogFs::default();
     for (rel, content) in files {
-        fs.files.borrow_mut().insert(join_base(&rel), content);
+        fs.files.lock().unwrap().insert(join_base(&rel), content);
     }
     let mut loggers: BTreeMap<String, McpServerLog> = BTreeMap::new();
     let mut results: Vec<Value> = Vec::new();
@@ -222,7 +224,7 @@ pub fn run_mcp_log_harness(input: &Value) -> Result<Value, String> {
         }
     }
     let mut out_files = Map::new();
-    for (path, bytes) in fs.files.borrow().iter() {
+    for (path, bytes) in fs.files.lock().unwrap().iter() {
         let rel = path
             .strip_prefix(&format!("{}/", BASE))
             .unwrap_or(path)

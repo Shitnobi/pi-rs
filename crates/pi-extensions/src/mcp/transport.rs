@@ -100,12 +100,12 @@ pub struct SendOptions {
 }
 
 /// A message listener (`McpTransportMessageListener`).
-pub type MessageListener = Box<dyn FnMut(&JsonRpcMessage)>;
+pub type MessageListener = Box<dyn FnMut(&JsonRpcMessage) + Send>;
 /// An error listener (`McpTransportErrorListener`), receiving
 /// `error.message`.
-pub type ErrorListener = Box<dyn FnMut(&str)>;
+pub type ErrorListener = Box<dyn FnMut(&str) + Send>;
 /// A close listener (`McpTransportCloseListener`).
-pub type CloseListener = Box<dyn FnMut()>;
+pub type CloseListener = Box<dyn FnMut() + Send>;
 
 /// Listener bookkeeping shared by transports (`TransportEvents`).
 /// [`TransportEvents::emit_close`] fires at most once per transport.
@@ -194,7 +194,7 @@ impl TransportEvents {
 /// `close` once, and deliver incoming messages, errors and the close event
 /// through the registered listeners. Failures are [`McpErrorKind`] values —
 /// whatever the TS transport threw.
-pub trait McpTransport {
+pub trait McpTransport: Send {
     /// `start()`: begin the connection. May deliver messages or report
     /// errors synchronously (scripted transports) — TS transports do so
     /// asynchronously.
@@ -390,13 +390,13 @@ mod tests {
     #[test]
     fn fake_transport_delivers_scripted_steps() {
         let mut transport = FakeTransport::new();
-        let messages = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let errors = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let closes = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let closes = std::sync::Arc::new(std::sync::Mutex::new(0));
         let (m1, e1, c1) = (messages.clone(), errors.clone(), closes.clone());
-        transport.on_message(Box::new(move |m| m1.borrow_mut().push(m.clone())));
-        transport.on_error(Box::new(move |e| e1.borrow_mut().push(e.to_string())));
-        transport.on_close(Box::new(move || *c1.borrow_mut() += 1));
+        transport.on_message(Box::new(move |m| m1.lock().unwrap().push(m.clone())));
+        transport.on_error(Box::new(move |e| e1.lock().unwrap().push(e.to_string())));
+        transport.on_close(Box::new(move || *c1.lock().unwrap() += 1));
 
         transport
             .start_steps
@@ -409,9 +409,9 @@ mod tests {
         transport
             .send(&json!({ "jsonrpc": "2.0", "id": 1, "method": "ask" }), SendOptions::default())
             .unwrap();
-        assert_eq!(messages.borrow().len(), 2);
-        assert_eq!(errors.borrow().len(), 1);
-        assert_eq!(errors.borrow()[0], "boom");
+        assert_eq!(messages.lock().unwrap().len(), 2);
+        assert_eq!(errors.lock().unwrap().len(), 1);
+        assert_eq!(errors.lock().unwrap()[0], "boom");
         assert_eq!(transport.sent.len(), 1);
         assert_eq!(transport.sent[0]["method"], "ask");
 
@@ -427,13 +427,13 @@ mod tests {
     #[test]
     fn fake_transport_close_semantics() {
         let mut transport = FakeTransport::new();
-        let closes = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let closes = std::sync::Arc::new(std::sync::Mutex::new(0));
         let c1 = closes.clone();
-        transport.on_close(Box::new(move || *c1.borrow_mut() += 1));
+        transport.on_close(Box::new(move || *c1.lock().unwrap() += 1));
         transport.start().unwrap();
         transport.close().unwrap();
         transport.close().unwrap(); // idempotent
-        assert_eq!(*closes.borrow(), 1);
+        assert_eq!(*closes.lock().unwrap(), 1);
         let err = transport
             .send(&json!({ "jsonrpc": "2.0", "id": 1, "method": "x" }), SendOptions::default())
             .unwrap_err();
@@ -480,14 +480,14 @@ mod tests {
     #[test]
     fn fake_transport_records_protocol_versions_and_unsubscribe() {
         let mut transport = FakeTransport::new();
-        let seen = std::rc::Rc::new(std::cell::RefCell::new(0));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(0));
         let s1 = seen.clone();
-        let id = transport.on_message(Box::new(move |_| *s1.borrow_mut() += 1));
+        let id = transport.on_message(Box::new(move |_| *s1.lock().unwrap() += 1));
         transport.off_message(id);
         transport.set_protocol_version("2025-06-18");
         transport.start().unwrap();
         transport.events.emit_message(&json!({ "jsonrpc": "2.0", "method": "m" }));
-        assert_eq!(*seen.borrow(), 0);
+        assert_eq!(*seen.lock().unwrap(), 0);
         assert_eq!(transport.protocol_versions, vec!["2025-06-18".to_string()]);
     }
 }

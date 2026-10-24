@@ -27,8 +27,8 @@
 //! and `AbortController` abort of incoming requests (handlers are
 //! synchronous here).
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+
 
 use serde_json::{json, Map, Value};
 
@@ -182,7 +182,7 @@ pub struct RequestOptions {
 /// `slot` is the promise settlement: set by a response, a send failure, or
 /// the timeout.
 struct PendingRequest {
-    slot: Rc<RefCell<Option<Result<Value, McpErrorKind>>>>,
+    slot: Arc<Mutex<Option<Result<Value, McpErrorKind>>>>,
 }
 
 /// A deferred `handleRequest` response send (TS `await` hop).
@@ -191,9 +191,9 @@ enum Task {
 }
 
 /// An `onNotification(method, listener)`-registered listener.
-pub type NotificationListener = Box<dyn FnMut(Option<&Value>)>;
+pub type NotificationListener = Box<dyn FnMut(Option<&Value>) + Send>;
 /// An `onError` listener.
-pub type ErrorListener = Box<dyn FnMut(&str)>;
+pub type ErrorListener = Box<dyn FnMut(&str) + Send>;
 
 /// Port of `McpClient`.
 pub struct McpClient {
@@ -207,14 +207,14 @@ pub struct McpClient {
     protocol_version_value: Option<String>,
     /// Insertion-ordered pending map, keyed by the JSON-encoded request id.
     pending: Vec<(String, PendingRequest)>,
-    mailbox: Rc<RefCell<Vec<ClientEvent>>>,
-    tasks: Rc<RefCell<Vec<Task>>>,
+    mailbox: Arc<Mutex<Vec<ClientEvent>>>,
+    tasks: Arc<Mutex<Vec<Task>>>,
     /// Transport-operation nesting depth; the task queue runs when it
     /// reaches zero.
     op_depth: usize,
     notification_listeners: Vec<(String, NotificationListener)>,
     error_listeners: Vec<ErrorListener>,
-    close_listeners: Vec<Box<dyn FnMut()>>,
+    close_listeners: Vec<Box<dyn FnMut() + Send>>,
     /// Injected `setTimeout` for request timeouts.
     sleep: SleepFn,
     /// The transport listener ids registered by `connect`, for `close`'s
@@ -238,8 +238,8 @@ impl McpClient {
             instructions_value: None,
             protocol_version_value: None,
             pending: Vec::new(),
-            mailbox: Rc::new(RefCell::new(Vec::new())),
-            tasks: Rc::new(RefCell::new(Vec::new())),
+            mailbox: Arc::new(Mutex::new(Vec::new())),
+            tasks: Arc::new(Mutex::new(Vec::new())),
             op_depth: 0,
             notification_listeners: Vec::new(),
             error_listeners: Vec::new(),
@@ -307,7 +307,7 @@ impl McpClient {
 
     /// `onClose(listener)` — called once when the connection closes,
     /// whether the transport dropped or `close()` was called.
-    pub fn on_close(&mut self, listener: Box<dyn FnMut()>) -> usize {
+    pub fn on_close(&mut self, listener: Box<dyn FnMut() + Send>) -> usize {
         self.close_listeners.push(listener);
         self.close_listeners.len() - 1
     }
@@ -328,15 +328,15 @@ impl McpClient {
         self.state = ClientState::Connecting;
         let mailbox = self.mailbox.clone();
         let id = transport.on_message(Box::new(move |message| {
-            mailbox.borrow_mut().push(ClientEvent::Message(message.clone()));
+            mailbox.lock().unwrap().push(ClientEvent::Message(message.clone()));
         }));
         let m_id = id;
         let mailbox = self.mailbox.clone();
         let e_id = transport.on_error(Box::new(move |message| {
-            mailbox.borrow_mut().push(ClientEvent::Error(message.to_string()));
+            mailbox.lock().unwrap().push(ClientEvent::Error(message.to_string()));
         }));
         let mailbox = self.mailbox.clone();
-        let c_id = transport.on_close(Box::new(move || mailbox.borrow_mut().push(ClientEvent::Close)));
+        let c_id = transport.on_close(Box::new(move || mailbox.lock().unwrap().push(ClientEvent::Close)));
         self.transport_listener_ids = Some((m_id, e_id, c_id));
         self.transport = Some(transport);
         let result = self.connect_handshake();
@@ -505,8 +505,8 @@ impl McpClient {
     /// harness calls the transport listeners directly, which runs the same
     /// `handleMessage`/`handleTransportClose` path synchronously.
     pub fn deliver_external(&mut self, event: ClientEvent) {
-        let start = self.mailbox.borrow().len();
-        self.mailbox.borrow_mut().push(event);
+        let start = self.mailbox.lock().unwrap().len();
+        self.mailbox.lock().unwrap().push(event);
         self.op_depth += 1;
         self.drain_from(start);
         self.op_depth -= 1;
@@ -521,7 +521,7 @@ impl McpClient {
     /// during the operation are processed in order (recursively for nested
     /// sends), and deferred tasks run when the outermost operation ends.
     fn with_transport_op<T>(&mut self, op: impl FnOnce(&mut Self) -> Result<T, McpErrorKind>) -> Result<T, McpErrorKind> {
-        let start = self.mailbox.borrow().len();
+        let start = self.mailbox.lock().unwrap().len();
         self.op_depth += 1;
         let result = op(self);
         self.drain_from(start);
@@ -536,10 +536,10 @@ impl McpClient {
     /// while processing are handled by the nested transport ops that
     /// appended them, so iterate to the fixed end.
     fn drain_from(&mut self, start: usize) {
-        let end = self.mailbox.borrow().len();
+        let end = self.mailbox.lock().unwrap().len();
         let mut index = start;
         while index < end {
-            let event = self.mailbox.borrow()[index].clone();
+            let event = self.mailbox.lock().unwrap()[index].clone();
             self.handle_event(event);
             index += 1;
         }
@@ -549,7 +549,7 @@ impl McpClient {
     /// own sends may queue more tasks.
     fn run_tasks(&mut self) {
         loop {
-            let task = self.tasks.borrow_mut().pop();
+            let task = self.tasks.lock().unwrap().pop();
             let Some(task) = task else { break };
             match task {
                 Task::SendResponse { message } => {
@@ -615,9 +615,9 @@ impl McpClient {
                 error["message"].as_str().unwrap_or_default().to_string(),
                 error.get("data").filter(|d| !d.is_null()).cloned(),
             );
-            *entry.slot.borrow_mut() = Some(Err(error));
+            *entry.slot.lock().unwrap() = Some(Err(error));
         } else {
-            *entry.slot.borrow_mut() = Some(Ok(message.get("result").cloned().unwrap_or(Value::Null)));
+            *entry.slot.lock().unwrap() = Some(Ok(message.get("result").cloned().unwrap_or(Value::Null)));
         }
     }
 
@@ -647,7 +647,7 @@ impl McpClient {
                     "id": message["id"].clone(),
                     "result": result,
                 });
-                self.tasks.borrow_mut().push(Task::SendResponse { message: response });
+                self.tasks.lock().unwrap().push(Task::SendResponse { message: response });
             }
             None => {
                 let response = json!({
@@ -688,7 +688,7 @@ impl McpClient {
     /// request and, when cancellable, tells the server.
     fn cancel_pending(&mut self, key: &str, error: McpErrorKind, notify_server: bool, reason: Option<&str>) {
         let Some(entry) = self.take_pending(key) else { return };
-        *entry.slot.borrow_mut() = Some(Err(error));
+        *entry.slot.lock().unwrap() = Some(Err(error));
         if notify_server && self.transport.is_some() {
             let mut params = Map::new();
             params.insert("requestId".to_string(), Value::from(key.parse::<u64>().unwrap_or(0)));
@@ -724,7 +724,7 @@ impl McpClient {
     /// `rejectPending` — settle every in-flight request with `error`.
     fn reject_pending(&mut self, error: McpErrorKind) {
         for (_, entry) in std::mem::take(&mut self.pending) {
-            *entry.slot.borrow_mut() = Some(Err(error.clone()));
+            *entry.slot.lock().unwrap() = Some(Err(error.clone()));
         }
     }
 
@@ -786,7 +786,7 @@ impl McpClient {
             .timeout_ms
             .or(self.options.request_timeout_ms)
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);
-        let slot = Rc::new(RefCell::new(None));
+        let slot = Arc::new(Mutex::new(None));
         let entry = PendingRequest { slot: slot.clone() };
         let key = id.to_string();
         self.pending.push((key.clone(), entry));
@@ -797,12 +797,12 @@ impl McpClient {
         if let Err(error) = send_result {
             // TS handles send failures in the `.catch` continuation; under
             // the harness constraints nothing runs in between.
-            if slot.borrow().is_none() {
+            if slot.lock().unwrap().is_none() {
                 self.cancel_pending(&key, error, false, None);
             }
         }
-        if slot.borrow().is_some() {
-            return slot.borrow_mut().take().unwrap();
+        if slot.lock().unwrap().is_some() {
+            return slot.lock().unwrap().take().unwrap();
         }
         // Parked: only the request timeout can settle the request under the
         // harness constraints (TS: the armed `setTimeout`). `timeoutMs <= 0`
@@ -812,8 +812,8 @@ impl McpClient {
             return Err(McpErrorKind::Other { message: "request parked with timeout disabled".to_string() });
         }
         (self.sleep)(timeout_ms);
-        if slot.borrow().is_some() {
-            return slot.borrow_mut().take().unwrap();
+        if slot.lock().unwrap().is_some() {
+            return slot.lock().unwrap().take().unwrap();
         }
         self.cancel_pending(
             &key,
@@ -821,7 +821,7 @@ impl McpClient {
             method != "initialize",
             Some("Request timed out"),
         );
-        let settled = slot.borrow_mut().take().unwrap();
+        let settled = slot.lock().unwrap().take().unwrap();
         settled
     }
 
