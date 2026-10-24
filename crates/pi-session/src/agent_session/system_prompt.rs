@@ -118,7 +118,7 @@ fn replace_or_err(v: &Value, name: &str) -> Result<String, String> {
 ///   (undefined) → key ABSENT (jstr drops it). `n(5)` jstrs 9 keys.
 /// - `selectedTools`: `[...(input.selectedTools ?? ["read", "bash",
 ///   "edit", "write"])]` — non-iterable non-nullish → throw
-///   `(input.selectedTools ?? ["read", "bash", "edit", "write"]) is not
+///   `(input.selectedTools ?? ["read","bash","edit","write"]) is not
 ///   iterable`; `"ab"` → `["a","b"]`; elements kept raw.
 /// - `hiddenTools` / `promptGuidelines`: `[...(input.x ?? [])]` (same
 ///   throw shape with their own `?? []` expression text).
@@ -150,7 +150,7 @@ pub fn normalize_options_raw(input: &Value) -> Result<Value, String> {
 
 	let selected_tools = match prop_or_err(input, "selectedTools")? {
 		Value::Null => vec![json!("read"), json!("bash"), json!("edit"), json!("write")],
-		v => spread_iterable(&v, "(input.selectedTools ?? [\"read\", \"bash\", \"edit\", \"write\"])")?,
+		v => spread_iterable(&v, "(input.selectedTools ?? [\"read\",\"bash\",\"edit\",\"write\"])")?,
 	};
 	let hidden_tools = match prop_or_err(input, "hiddenTools")? {
 		Value::Null => Vec::new(),
@@ -184,6 +184,9 @@ pub fn normalize_options_raw(input: &Value) -> Result<Value, String> {
 		v => spread_object(&v),
 	};
 	let _cwd = prop_or_err(input, "cwd")?;
+	// (The V8 message text below is the dist's, not this file's source:
+	// the arbiter renders `["read","bash","edit","write"]` WITHOUT
+	// spaces. Probe-pinned via normalizeBuildSystemPromptOptions.)
 	let context_files: Vec<Value> = {
 		let source = match prop_or_err(input, "contextFiles")? {
 			Value::Null => Vec::new(),
@@ -205,9 +208,12 @@ pub fn normalize_options_raw(input: &Value) -> Result<Value, String> {
 		source.iter().map(|s| Value::Object(spread_object(s))).collect()
 	};
 
+	// Key order mirrors the TS object literal: the raw reads sit at their
+	// literal positions (undefined-valued keys are jstr-dropped), so a later
+	// `currentOptions.forceSystemPrompt = …` assignment keeps position 2.
 	let mut out = Map::new();
 	if let Value::Object(m) = input {
-		for k in ["customPrompt", "forceSystemPrompt", "cwd"] {
+		for k in ["customPrompt", "forceSystemPrompt"] {
 			if let Some(v) = m.get(k) {
 				out.insert(k.to_string(), v.clone());
 			}
@@ -220,9 +226,54 @@ pub fn normalize_options_raw(input: &Value) -> Result<Value, String> {
 	out.insert("promptGuidelines".to_string(), Value::Array(prompt_guidelines));
 	out.insert("appendSystemPrompt".to_string(), append_system_prompt);
 	out.insert("sections".to_string(), Value::Object(sections));
+	if let Value::Object(m) = input {
+		if let Some(v) = m.get("cwd") {
+			out.insert("cwd".to_string(), v.clone());
+		}
+	}
 	out.insert("contextFiles".to_string(), Value::Array(context_files));
 	out.insert("skills".to_string(), Value::Array(skills));
 	Ok(Value::Object(out))
+}
+
+/// The TS literal key order of `normalizeBuildSystemPromptOptions`.
+const OPTIONS_KEY_ORDER: [&str; 12] = [
+	"customPrompt",
+	"forceSystemPrompt",
+	"selectedTools",
+	"hiddenTools",
+	"toolSnippets",
+	"toolGuidelines",
+	"promptGuidelines",
+	"appendSystemPrompt",
+	"sections",
+	"cwd",
+	"contextFiles",
+	"skills",
+];
+
+/// Restore the literal key order after a handler assigned into the live
+/// options object. In TS the normalize output always *has* every literal key
+/// (an undefined value still occupies its slot), so `options.customPrompt =
+/// x` on a previously-undefined field keeps position 0. JSON has no
+/// undefined, so the port re-inserts unknown-to-input keys in the canonical
+/// slot here.
+pub fn reorder_options_raw(options: &mut Value) {
+	let Some(object) = options.as_object() else {
+		return;
+	};
+	let mut out = Map::new();
+	for key in OPTIONS_KEY_ORDER {
+		if let Some(value) = object.get(key) {
+			out.insert(key.to_string(), value.clone());
+		}
+	}
+	for (key, value) in object {
+		if !out.contains_key(key) {
+			out.insert(key.clone(), value.clone());
+		}
+	}
+	*options = Value::Object(out);
 }
 
 // ============================================================================
@@ -855,15 +906,15 @@ mod raw_probes {
 		// non-iterable throws (full compiled expression text).
 		assert_eq!(
 			normalize_options_raw(&json!({"selectedTools": 5})).unwrap_err(),
-			"(input.selectedTools ?? [\"read\", \"bash\", \"edit\", \"write\"]) is not iterable"
+			"(input.selectedTools ?? [\"read\",\"bash\",\"edit\",\"write\"]) is not iterable"
 		);
 		assert_eq!(
 			normalize_options_raw(&json!({"selectedTools": {}})).unwrap_err(),
-			"(input.selectedTools ?? [\"read\", \"bash\", \"edit\", \"write\"]) is not iterable"
+			"(input.selectedTools ?? [\"read\",\"bash\",\"edit\",\"write\"]) is not iterable"
 		);
 		assert_eq!(
 			normalize_options_raw(&json!({"selectedTools": true})).unwrap_err(),
-			"(input.selectedTools ?? [\"read\", \"bash\", \"edit\", \"write\"]) is not iterable"
+			"(input.selectedTools ?? [\"read\",\"bash\",\"edit\",\"write\"]) is not iterable"
 		);
 		assert_eq!(
 			normalize_options_raw(&json!({"hiddenTools": 5})).unwrap_err(),

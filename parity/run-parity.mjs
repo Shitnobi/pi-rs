@@ -178,6 +178,9 @@ function runRs(caseInfo, dir) {
 		input: JSON.stringify(caseInfo.args),
 		encoding: "utf8",
 		maxBuffer: 256 * 1024 * 1024,
+		// The dist resolves README/docs/examples relative to its own package
+		// dir; give the Rust harness the same absolute paths.
+		env: { ...process.env, PI_PACKAGE_DIR: join(process.env.PI_REPO || "/home/shinobi/AI/pi-repo", "packages/coding-agent") },
 	});
 	if (r.error) return { __harnessError: String(r.error) };
 	// In-band errors (`{"error": ...}`) are printed to stdout but exit(1)

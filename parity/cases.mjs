@@ -13377,6 +13377,220 @@ cases.push(
 			],
 		},
 	]),
+	// ---- tranche 6: emitters -------------------------------------------
+	exr("emit-context-rewrites", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "context", handler: { id: 1, returns: { messages: [{ role: "user", content: "new" }] } } },
+			{ step: "on", event: "context_with_system", handler: { id: 2, eventReads: ["messages"] } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitContext", messages: [
+			{ role: "system", content: "HEAD", timestamp: 5 },
+			{ role: "user", content: "old" },
+		] },
+	]),
+	exr("emit-context-lost-head", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "context_with_system", handler: { id: 1, returns: { messages: [{ role: "user", content: "only" }] } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "emitContext", messages: [{ role: "system", content: "S", timestamp: 1 }] },
+	]),
+	exr("emit-tool-call-block", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "tool_call", handler: { id: 1, returns: { block: false, reason: "a" } } },
+			{ step: "on", event: "tool_call", handler: { id: 2, returns: { block: true } } },
+			{ step: "on", event: "tool_call", handler: { id: 3, returns: { block: false } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitToolCall", event: { type: "tool_call", toolName: "read" } },
+	]),
+	exr("emit-tool-call-throw", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "tool_call", handler: { id: 1, throws: "tc boom" } },
+		] },
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "emitToolCall", event: { type: "tool_call" } },
+	]),
+	exr("emit-tool-result-patch", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "tool_result", handler: { id: 1, returns: { content: [{ type: "text", text: "new" }], isError: true } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitToolResult", event: {
+			type: "tool_result", toolCallId: "c1",
+			content: [{ type: "text", text: "old" }],
+			details: { d: 1 }, structuredContent: { s: 1 }, isError: false, usage: { tokens: 1 },
+		} },
+	]),
+	exr("emit-cache-warming-null", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "cache_warming_decision", handler: { id: 1, returns: { action: null } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitCacheWarmingDecision", event: { type: "cache_warming_decision", action: "warm" } },
+	]),
+	exr("emit-provider-hooks", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "before_provider_request", handler: { id: 1, returns: null } },
+			{ step: "on", event: "before_provider_request", handler: { id: 2, eventReads: ["payload"], returns: { replaced: true } } },
+			{ step: "on", event: "before_provider_headers", handler: { id: 3, mutate: [{ path: ["headers", "authorization"], value: "token" }], returns: { ignored: true } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitBeforeProviderRequest", payload: { p: 0 } },
+		{ op: "emitBeforeProviderHeaders", headers: { accept: "a" } },
+	]),
+	exr("emit-resources-discover", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "resources_discover", handler: { id: 1, returns: { skillPaths: ["/s1"], themePaths: ["/t1"] } } },
+			{ step: "on", event: "resources_discover", handler: { id: 2, returns: { skillPaths: ["/s2"] } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitResourcesDiscover", cwd: "/proj", reason: "startup" },
+	]),
+	exr("emit-input-transform", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "input", handler: { id: 1, eventReads: ["text", "images"], returns: { action: "transform", text: "hi!" } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitInput", text: "hi", source: "user" },
+	]),
+	exr("emit-user-bash-invalid", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "user_bash", handler: { id: 1, returns: { nope: 1 } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "emitUserBash", event: { command: "ls" } },
+	]),
+	exr("emit-user-bash-valid", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "user_bash", handler: { id: 1, returns: { result: { output: "o", exitCode: 0, cancelled: false, truncated: false } } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitUserBash", event: { command: "ls" } },
+	]),
+	// ---- tranche 6: before_agent_start / contexts / ui / actions --------
+	exr("before-agent-start-merge", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "before_agent_start", handler: {
+				id: 1,
+				reads: ["cwd", "mode"],
+				eventReads: ["systemPromptOptions.customPrompt", "systemPrompt"],
+				returns: { message: { role: "user", content: "m" }, systemPrompt: "X" },
+			} },
+			{ step: "on", event: "before_agent_start", handler: {
+				id: 2,
+				calls: ["getSystemPrompt"],
+				eventReads: ["systemPromptOptions.forceSystemPrompt"],
+			} },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitBeforeAgentStart", trigger: { prompt: "p" }, systemPromptOptions: { cwd: "/proj", customPrompt: "CP" } },
+	]),
+	exr("before-agent-start-null-force", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "before_agent_start", handler: { id: 1, returns: { systemPrompt: null }, eventReads: ["systemPrompt"] } },
+			// `event.systemPrompt` after a null force is the plan's documented
+			// divergence (TS getter throws at read; the port omits the key).
+			// The same V8 error is observable through ctx.getSystemPrompt.
+			{ step: "on", event: "before_agent_start", handler: { id: 2, calls: ["getSystemPrompt"], eventReads: ["systemPromptOptions.forceSystemPrompt"] } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitBeforeAgentStart", trigger: {}, systemPromptOptions: { cwd: "/proj" } },
+	]),
+	exr("before-agent-start-normalize-throw", [
+		{ op: "load", path: "/ext/a.js", script: [] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitBeforeAgentStart", trigger: {}, systemPromptOptions: { selectedTools: 5 } },
+	]),
+	exr("before-agent-start-options-mutate", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "before_agent_start", handler: {
+				id: 1,
+				mutate: [{ path: ["systemPromptOptions", "customPrompt"], value: "MUT" }],
+			} },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitBeforeAgentStart", trigger: {}, systemPromptOptions: { cwd: "/proj" } },
+	]),
+	exr("tool-context-fallback", [
+		{ op: "load", path: "/ext/a.js", script: [] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "toolContextTools", id: "call-1" },
+		{ op: "toolContextExecuteTool", id: "call-1", name: "read", args: { p: 1 }, options: {} },
+	]),
+	exr("command-context-defaults", [
+		{ op: "load", path: "/ext/a.js", script: [] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "commandContext", method: "newSession", args: [{}] },
+		{ op: "commandContext", method: "fork", args: ["e", {}] },
+		{ op: "commandContext", method: "navigateTree", args: ["t", {}] },
+		{ op: "commandContext", method: "switchSession", args: ["/s", {}] },
+		{ op: "commandContext", method: "waitForIdle" },
+		{ op: "commandContext", method: "reload" },
+		{ op: "commandContext", method: "getSystemPromptOptions" },
+	]),
+	exr("ui-prompts-scripted", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "ui_prompt_start", handler: { id: 1 } },
+			{ step: "on", event: "ui_prompt_end", handler: { id: 2 } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "hasUI" },
+		{ op: "uiSelect", title: "Pick", options: ["a", "b"], opts: {} },
+		{ op: "setUIContext", ui: true, mode: "tui", uiScript: [{ returns: "picked" }, { returns: true }, { throws: "ui boom" }] },
+		{ op: "hasUI" },
+		{ op: "uiSelect", title: "Pick", options: ["a", "b"], opts: {} },
+		{ op: "uiConfirm", title: "Sure?", message: "m", opts: {} },
+		{ op: "uiInput", title: "Name", placeholder: "p", opts: {} },
+	]),
+	exr("api-actions", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "captureApi", key: "a" },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore", actions: { activeTools: ["read"], thinkingLevel: "high" } },
+		{ op: "apiCall", key: "a", method: "sendMessage", args: [{ customType: "t", content: "c" }, {}] },
+		{ op: "apiCall", key: "a", method: "getSessionName" },
+		{ op: "apiCall", key: "a", method: "getActiveTools" },
+		{ op: "apiCall", key: "a", method: "setActiveTools", args: [["bash"]] },
+		{ op: "apiCall", key: "a", method: "getThinkingLevel" },
+		{ op: "apiCall", key: "a", method: "setModel", args: ["m"] },
+		{ op: "apiCall", key: "a", method: "exec", args: ["echo", ["hi"], {}] },
+	]),
+	exr("ctx-reads-bound", [
+		{ op: "load", path: "/ext/a.js", script: [] },
+		{ op: "createRunner" },
+		{ op: "bindCore", contextActions: { isIdle: false, isProjectTrusted: false } },
+		{ op: "ctxRead", field: "isIdle" },
+		{ op: "ctxRead", field: "isProjectTrusted" },
+		{ op: "ctxRead", field: "hasPendingMessages" },
+		{ op: "ctxRead", field: "getContextUsage" },
+		{ op: "ctxRead", field: "getSystemPrompt" },
+		{ op: "ctxRead", field: "cwd" },
+		{ op: "ctxRead", field: "thinkingLevel" },
+	]),
 	exr("mcp-pre-bind-report", [
 		{
 			op: "load",

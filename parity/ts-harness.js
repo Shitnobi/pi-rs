@@ -3590,6 +3590,21 @@ async function runModule(tool, args, cwd) {
 						log.push(`h${id}.${method}!${e.message}`);
 					}
 				}
+				for (const path of spec.eventReads || []) {
+					try {
+						let v = event;
+						for (const part of String(path).split(".")) v = v == null ? undefined : v[part];
+						log.push(`h${id}.event.${path}=${jstr(v)}`);
+					} catch (e) {
+						log.push(`h${id}.event.${path}!${e.message}`);
+					}
+				}
+				for (const change of spec.mutate || []) {
+					const path = Array.isArray(change.path) ? change.path : [change.path];
+					let target = event;
+					for (const part of path.slice(0, -1)) target = target[part];
+					target[path[path.length - 1]] = change.value;
+				}
 				if (spec.throws !== undefined) throw spec.throws;
 				return spec.returns;
 			};
@@ -3717,15 +3732,50 @@ async function runModule(tool, args, cwd) {
 						};
 						runner.bindCore(
 							{
+								// Recording actions (mirror the Rust FakeActions log lines).
+								sendMessage: (m, o) => log.push("actions.sendMessage:" + jstr([m, o])),
+								sendUserMessage: (m, o) => log.push("actions.sendUserMessage:" + jstr([m, o])),
+								appendEntry: (t, d) => log.push("actions.appendEntry:" + jstr([t, d])),
+								setSessionName: (n) => log.push("actions.setSessionName:" + jstr([n])),
+								getSessionName: () => {
+									log.push("actions.getSessionName:" + jstr([]));
+									return null;
+								},
+								setLabel: (id, label) => log.push("actions.setLabel:" + jstr([id, label])),
 								getActiveTools: () => a.activeTools || [],
-								getThinkingLevel: () => a.thinkingLevel === undefined ? null : a.thinkingLevel,
+								getAllTools: () => {
+									log.push("actions.getAllTools:" + jstr([]));
+									return null;
+								},
+								getSettings: () => {
+									log.push("actions.getSettings:" + jstr([]));
+									return null;
+								},
+								setActiveTools: (names) => log.push("actions.setActiveTools:" + jstr([names])),
 								refreshTools: () => log.push("actions.refreshTools"),
+								getCommands: () => {
+									log.push("actions.getCommands:" + jstr([]));
+									return null;
+								},
+								setModel: (m) => {
+									log.push("actions.setModel:" + jstr([m]));
+									return true;
+								},
+								getThinkingLevel: () => a.thinkingLevel === undefined ? null : a.thinkingLevel,
+								setThinkingLevel: (level) => log.push("actions.setThinkingLevel:" + jstr([level])),
 							},
 							{
 								isIdle: () => c.isIdle === true,
 								isProjectTrusted: () => c.isProjectTrusted === true,
 								getModel: () => (c.model === undefined ? undefined : c.model),
+								getScopedModels: () => [],
+								getSignal: () => undefined,
+								abort: () => log.push("contextActions.abort"),
+								hasPendingMessages: () => false,
 								shutdown: () => log.push("contextActions.shutdown"),
+								getContextUsage: () => undefined,
+								compact: () => undefined,
+								getSystemPrompt: () => "",
 							},
 							pa === undefined
 								? undefined
@@ -3778,7 +3828,43 @@ async function runModule(tool, args, cwd) {
 							log.push("runner.getActiveTools!" + e.message);
 						}
 						break;
-					case "setUIContext": runner.setUIContext(op.ui ? {} : undefined, op.mode || "print"); break;
+					case "setUIContext": {
+						if (!op.ui) {
+							runner.setUIContext(undefined, op.mode || "print");
+							break;
+						}
+						const script = op.uiScript || [];
+						let index = 0;
+						const make = (method) => async (...args) => {
+							const data = method === "custom" ? args.slice(1) : args;
+							log.push(`ui.${method}:` + jstr(data));
+							const entry = script[index++];
+							if (entry) {
+								if (entry.throws !== undefined) throw new Error(entry.throws);
+								return entry.returns === undefined ? null : entry.returns;
+							}
+							if (method === "confirm") return false;
+							if (method === "getEditorText") return "";
+							if (method === "getAllThemes") return [];
+							if (method === "setTheme") return { success: false, error: "UI not available" };
+							if (method === "getToolsExpanded") return false;
+							return null;
+						};
+						const ui = {};
+						for (const method of [
+							"select", "confirm", "input", "notify", "onTerminalInput", "setStatus",
+							"setWorkingMessage", "setWorkingVisible", "setWorkingIndicator",
+							"setHiddenThinkingLabel", "setWidget", "setFooter", "setHeader",
+							"setTitle", "custom", "pasteToEditor", "setEditorText", "getEditorText",
+							"editor", "addAutocompleteProvider", "setEditorComponent",
+							"getEditorComponent", "getAllThemes", "getTheme", "setTheme",
+							"getToolsExpanded", "setToolsExpanded",
+						]) {
+							ui[method] = make(method);
+						}
+						runner.setUIContext(ui, op.mode || "print");
+						break;
+					}
 					case "hasUI": log.push(`hasUI:${runner.hasUI()}`); break;
 					case "shutdown": runner.shutdown(); break;
 					case "emitSessionShutdown": log.push(`sessionShutdown:${await emitSessionShutdownEvent(runner, op.event)}`); break;
@@ -3801,6 +3887,160 @@ async function runModule(tool, args, cwd) {
 					}
 					case "busEmit": bus.emit(op.channel, op.data === undefined ? null : op.data); break;
 					case "mcpList": log.push("mcpServers:" + jstr(runtime.mcpServers.list())); break;
+					// ---- tranche 6 emitters ---------------------------------
+					case "emitContext":
+						log.push("emitContext:return:" + jstr(await runner.emitContext(op.messages)));
+						break;
+					case "emitToolCall":
+						try {
+							log.push("emitToolCall:return:" + jstr(await runner.emitToolCall(op.event)));
+						} catch (e) {
+							log.push("emitToolCall!" + e.message);
+						}
+						break;
+					case "emitToolResult":
+						try {
+							log.push("emitToolResult:return:" + jstr(await runner.emitToolResult(op.event)));
+						} catch (e) {
+							log.push("emitToolResult!" + e.message);
+						}
+						break;
+					case "emitCacheWarmingDecision":
+						log.push("emitCacheWarmingDecision:return:" + jstr(await runner.emitCacheWarmingDecision(op.event)));
+						break;
+					case "emitBeforeProviderRequest":
+						log.push("emitBeforeProviderRequest:return:" + jstr(await runner.emitBeforeProviderRequest(op.payload)));
+						break;
+					case "emitBeforeProviderHeaders":
+						log.push("emitBeforeProviderHeaders:return:" + jstr(await runner.emitBeforeProviderHeaders(op.headers)));
+						break;
+					case "emitResourcesDiscover":
+						log.push("emitResourcesDiscover:return:" + jstr(await runner.emitResourcesDiscover(op.cwd, op.reason)));
+						break;
+					case "emitInput":
+						log.push("emitInput:return:" + jstr(await runner.emitInput(op.text, op.images, op.source, op.streamingBehavior)));
+						break;
+					case "emitUserBash":
+						try {
+							log.push("emitUserBash:return:" + jstr(await runner.emitUserBash(op.event)));
+						} catch (e) {
+							log.push("emitUserBash!" + e.message);
+						}
+						break;
+					case "emitBeforeAgentStart":
+						try {
+							log.push("emitBeforeAgentStart:return:" + jstr(await runner.emitBeforeAgentStart(op.trigger, op.systemPromptOptions)));
+						} catch (e) {
+							log.push("emitBeforeAgentStart!" + e.message);
+						}
+						break;
+					case "emitBoundary": {
+						// buildContext script: one step per call ({context}|{throws}).
+						let stepIndex = 0;
+						const buildContext = (entries) => {
+							const step = (op.script || [])[stepIndex++] ?? { context: { entries: entries.length } };
+							if (step.throws !== undefined) throw new Error(step.throws);
+							return step.context;
+						};
+						try {
+							log.push("emitBoundary:return:" + jstr(await runner.emitBoundary(op.baseEvent, buildContext)));
+						} catch (e) {
+							log.push("emitBoundary!" + e.message);
+						}
+						break;
+					}
+					// ---- ctx / contexts / actions ---------------------------
+					case "ctxRead":
+						try {
+							const ctx = runner.createContext();
+							const v = ctx[op.field];
+							log.push(`ctxRead:${op.field}=` + jstr(typeof v === "function" ? v() : v));
+						} catch (e) {
+							log.push(`ctxRead:${op.field}!` + e.message);
+						}
+						break;
+					case "ctxCall":
+						try {
+							const ctx = runner.createContext();
+							const v = ctx[op.method](...(op.args || []));
+							log.push(`ctxCall:${op.method}=` + jstr(v));
+						} catch (e) {
+							log.push(`ctxCall:${op.method}!` + e.message);
+						}
+						break;
+					case "toolContextTools":
+						try {
+							const ctx = runner.createToolContext(op.id, op.signal);
+							log.push("toolContext.tools=" + jstr(ctx.tools));
+						} catch (e) {
+							log.push("toolContext.tools!" + e.message);
+						}
+						break;
+					case "toolContextExecuteTool":
+						try {
+							const ctx = runner.createToolContext(op.id, op.signal);
+							log.push("toolContext.executeTool:return:" + jstr(await ctx.executeTool(op.name, op.args, op.options)));
+						} catch (e) {
+							log.push("toolContext.executeTool!" + e.message);
+						}
+						break;
+					case "commandContext": {
+						const ctx = runner.createCommandContext();
+						try {
+							const v = (op.method === "getSystemPromptOptions")
+								? ctx.getSystemPromptOptions()
+								: await ctx[op.method](...(op.args || []));
+							log.push(`commandContext.${op.method}:return:` + jstr(v));
+						} catch (e) {
+							log.push(`commandContext.${op.method}!` + e.message);
+						}
+						break;
+					}
+					case "uiSelect":
+						try {
+							log.push("uiSelect:return:" + jstr(await runner.getUIContext().select(op.title, op.options, op.opts)));
+						} catch (e) {
+							log.push("uiSelect!" + e.message);
+						}
+						break;
+					case "uiConfirm":
+						try {
+							log.push("uiConfirm:return:" + jstr(await runner.getUIContext().confirm(op.title, op.message, op.opts)));
+						} catch (e) {
+							log.push("uiConfirm!" + e.message);
+						}
+						break;
+					case "uiInput":
+						try {
+							log.push("uiInput:return:" + jstr(await runner.getUIContext().input(op.title, op.placeholder, op.opts)));
+						} catch (e) {
+							log.push("uiInput!" + e.message);
+						}
+						break;
+					case "uiEditor":
+						try {
+							log.push("uiEditor:return:" + jstr(await runner.getUIContext().editor(op.title, op.prefill)));
+						} catch (e) {
+							log.push("uiEditor!" + e.message);
+						}
+						break;
+					case "uiCustom":
+						try {
+							log.push("uiCustom:return:" + jstr(await runner.getUIContext().custom(() => {}, op.options)));
+						} catch (e) {
+							log.push("uiCustom!" + e.message);
+						}
+						break;
+					case "apiCall": {
+						const pi = captured.get(op.key);
+						try {
+							const v = await pi[op.method](...(op.args || []));
+							log.push(`apiCall:${op.method}=` + jstr(v));
+						} catch (e) {
+							log.push(`apiCall:${op.method}!` + e.message);
+						}
+						break;
+					}
 					default: throw new Error("unknown op: " + kind);
 				}
 				// Settle fire-and-forget mcp_servers_change emits.

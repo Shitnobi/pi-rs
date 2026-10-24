@@ -37,7 +37,7 @@ use pi_core::mcp_servers::{
 use serde_json::{json, Map, Value};
 
 use super::exec::{exec_command, ExecResult};
-use super::system_prompt::{build_system_prompt, content_text_raw, normalize_options_raw, DocPaths};
+use super::system_prompt::{build_system_prompt, content_text_raw, normalize_options_raw, reorder_options_raw, DocPaths};
 use super::ExtensionHost;
 
 /// TS default `invalidate()` message (loader.ts L192 / runner.ts L729).
@@ -101,6 +101,28 @@ fn js_truthy(value: &Value) -> bool {
 		Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(true),
 		Value::String(s) => !s.is_empty(),
 		_ => true,
+	}
+}
+
+/// `currentOptions.forceSystemPrompt = value` with the TS literal key order
+/// (position 2, after `customPrompt`).
+fn set_force_system_prompt(options: &mut Value, value: Value) {
+	if let Some(object) = options.as_object_mut() {
+		if object.contains_key("forceSystemPrompt") {
+			object.insert("forceSystemPrompt".to_string(), value);
+			return;
+		}
+		let mut rebuilt = Map::new();
+		for (key, current) in object.iter() {
+			if key == "selectedTools" {
+				rebuilt.insert("forceSystemPrompt".to_string(), value.clone());
+			}
+			rebuilt.insert(key.clone(), current.clone());
+		}
+		if !rebuilt.contains_key("forceSystemPrompt") {
+			rebuilt.insert("forceSystemPrompt".to_string(), value);
+		}
+		*object = rebuilt;
 	}
 }
 
@@ -2754,6 +2776,9 @@ impl ExtensionRunner {
 						if let Some(options) = returned_event.get("systemPromptOptions") {
 							if options != &current_options {
 								current_options = options.clone();
+								// TS keys keep their literal slot even when their value
+								// was undefined; re-insert newly-assigned ones in place.
+								reorder_options_raw(&mut current_options);
 							}
 						}
 						if let Some(result) = result {
@@ -2766,9 +2791,10 @@ impl ExtensionRunner {
 								// `result.systemPrompt !== undefined` — present
 								// null reassigns (probe-pinned).
 								if let Some(prompt) = result.get("systemPrompt") {
-									if let Some(object) = current_options.as_object_mut() {
-										object.insert("forceSystemPrompt".to_string(), prompt.clone());
-									}
+									// Assignment into the live object: an EXISTING key
+									// keeps its literal position (2nd); an absent one
+									// is inserted there (TS object order).
+									set_force_system_prompt(&mut current_options, prompt.clone());
 								}
 							}
 						}
@@ -3415,7 +3441,7 @@ mod tests {
 			.unwrap_err();
 		assert_eq!(
 			err,
-			"(input.selectedTools ?? [\"read\", \"bash\", \"edit\", \"write\"]) is not iterable"
+			"(input.selectedTools ?? [\"read\",\"bash\",\"edit\",\"write\"]) is not iterable"
 		);
 	}
 

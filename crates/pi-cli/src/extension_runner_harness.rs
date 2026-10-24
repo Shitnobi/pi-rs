@@ -130,6 +130,38 @@ async fn drain_engine(case: &Arc<CaseInner>) -> Result<(), String> {
 	Ok(())
 }
 
+/// The `queueMicrotask(() => void this.emit(event))` seam: the fake UI
+/// resolves synchronously on the TS side, so both prompt events run before
+/// the awaited UI call's continuation (and thus before its log line).
+async fn settle_ui_prompts(case: &Arc<CaseInner>) {
+	let runner = case.runner.lock().unwrap().clone();
+	let Some(runner) = runner else {
+		return;
+	};
+	loop {
+		let events = runner.drain_ui_prompt_events();
+		if events.is_empty() {
+			break;
+		}
+		for event in events {
+			runner.emit(event).await;
+		}
+	}
+}
+
+/// Assign `value[path…]` in place (handler `mutate` steps).
+fn set_path(value: &mut Value, path: &[String], new_value: Value) {
+	if path.len() == 1 {
+		if let Some(object) = value.as_object_mut() {
+			object.insert(path[0].clone(), new_value);
+		}
+		return;
+	}
+	if let Some(next) = value.get_mut(&path[0]) {
+		set_path(next, &path[1..], new_value);
+	}
+}
+
 fn make_handler(spec: &Value, log: &Log) -> Result<ExtensionHandler, String> {
 	if spec.get("id").and_then(Value::as_u64).is_none() {
 		return Err("missing handler id".to_string());
@@ -138,16 +170,20 @@ fn make_handler(spec: &Value, log: &Log) -> Result<ExtensionHandler, String> {
 	let returns = spec.get("returns").cloned();
 	let throws = spec.get("throws").and_then(Value::as_str).map(str::to_string);
 	let reads = str_list(spec, "reads")?;
+	let event_reads = str_list(spec, "eventReads")?;
+	let mutations = spec.get("mutate").and_then(Value::as_array).cloned().unwrap_or_default();
 	let calls = str_list(spec, "calls")?;
 	let log = Arc::clone(log);
-	Ok(Arc::new(move |event: Value, ctx: CtxView| {
+	Ok(Arc::new(move |mut event: Value, ctx: CtxView| {
 		let log = Arc::clone(&log);
 		let returns = returns.clone();
 		let throws = throws.clone();
 		let reads = reads.clone();
 		let calls = calls.clone();
+		let event_reads = event_reads.clone();
+		let mutations = mutations.clone();
 		Box::pin(async move {
-			let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+			let event_type = event.get("type").and_then(Value::as_str).unwrap_or("undefined");
 			log.lock().unwrap().push(format!("h{}:{}", id, event_type));
 			for field in &reads {
 				// TS reads auto-CALL function-valued members (`typeof v ===
@@ -162,6 +198,38 @@ fn make_handler(spec: &Value, log: &Log) -> Result<ExtensionHandler, String> {
 					Ok(_) => log.lock().unwrap().push(format!("h{}.{}:ok", id, method)),
 					Err(message) => log.lock().unwrap().push(format!("h{}.{}!{}", id, method, message)),
 				}
+			}
+			for path in &event_reads {
+				let mut value = Some(event.clone());
+				for part in path.split('.') {
+					value = match value {
+						Some(current) => current.get(part).cloned(),
+						None => None,
+					};
+				}
+				log.lock().unwrap().push(format!(
+					"h{}.event.{}={}",
+					id,
+					path,
+					jstr(&value.unwrap_or(Value::Null))
+				));
+			}
+			for change in &mutations {
+				let path: Vec<String> = match change.get("path") {
+					Some(Value::Array(parts)) => {
+						parts.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+					}
+					Some(Value::String(part)) => vec![part.clone()],
+					_ => continue,
+				};
+				if path.is_empty() {
+					continue;
+				}
+				set_path(
+					&mut event,
+					&path,
+					change.get("value").cloned().unwrap_or(Value::Null),
+				);
 			}
 			if let Some(message) = throws {
 				return Err(message);
@@ -582,6 +650,14 @@ async fn run_async(ops: &[Value]) -> Result<Value, String> {
 				let registry = Arc::new(FakeRegistry { log: Arc::clone(&case.log), throw_on, message });
 				let extensions = case.extensions.lock().unwrap().clone();
 				let runner = ExtensionRunner::new(extensions, case.runtime.clone(), "/proj", Some(registry));
+				// TS resolves the docs section paths from its own package dir
+				// (`getPackageDir()`); mirror that so the rendered prompt matches.
+				let package_dir = crate::config::get_package_dir(&crate::config::SystemEnv, &crate::config::SystemFs);
+				runner.set_doc_paths(pi_session::agent_session::system_prompt::DocPaths {
+					readme: format!("{}/README.md", package_dir),
+					docs: format!("{}/docs", package_dir),
+					examples: format!("{}/examples", package_dir),
+				});
 				*case.runner.lock().unwrap() = Some(runner);
 				case.log.lock().unwrap().push("runner:created".to_string());
 			}
@@ -797,6 +873,304 @@ async fn run_async(ops: &[Value]) -> Result<Value, String> {
 				payload.insert("errors".to_string(), Value::Array(errors));
 				case.log.lock().unwrap().push(format!("projectTrust:{}", jstr(&Value::Object(payload))));
 			}
+			"emitContext" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let messages = op.get("messages").cloned().unwrap_or(Value::Null);
+				match runner.emit_context(messages).await {
+					Ok(value) => case.log.lock().unwrap().push(format!("emitContext:return:{}", jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("emitContext!{}", message)),
+				}
+			}
+			"emitToolCall" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let event = op.get("event").cloned().unwrap_or(Value::Null);
+				match runner.emit_tool_call(event).await {
+					Ok(value) => case.log.lock().unwrap().push(format!("emitToolCall:return:{}", jstr(&value.unwrap_or(Value::Null)))),
+					// TS op catch logs `e.message`; harness handlers throw STRINGS
+					// (e.message === undefined).
+					Err(_) => case.log.lock().unwrap().push("emitToolCall!undefined".to_string()),
+				}
+			}
+			"emitToolResult" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let event = op.get("event").cloned().unwrap_or(Value::Null);
+				match runner.emit_tool_result(event).await {
+					Ok(value) => case.log.lock().unwrap().push(format!("emitToolResult:return:{}", jstr(&value.unwrap_or(Value::Null)))),
+					Err(message) => case.log.lock().unwrap().push(format!("emitToolResult!{}", message)),
+				}
+			}
+			"emitCacheWarmingDecision" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let event = op.get("event").cloned().unwrap_or(Value::Null);
+				let value = runner.emit_cache_warming_decision(event).await;
+				case.log.lock().unwrap().push(format!("emitCacheWarmingDecision:return:{}", jstr(&value)));
+			}
+			"emitBeforeProviderRequest" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let payload = op.get("payload").cloned().unwrap_or(Value::Null);
+				let value = runner.emit_before_provider_request(payload).await;
+				case.log.lock().unwrap().push(format!("emitBeforeProviderRequest:return:{}", jstr(&value)));
+			}
+			"emitBeforeProviderHeaders" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let headers = op.get("headers").cloned().unwrap_or(Value::Null);
+				let value = runner.emit_before_provider_headers(headers).await;
+				case.log.lock().unwrap().push(format!("emitBeforeProviderHeaders:return:{}", jstr(&value)));
+			}
+			"emitResourcesDiscover" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let cwd = op.get("cwd").and_then(Value::as_str).unwrap_or("").to_string();
+				let reason = op.get("reason").cloned().unwrap_or(Value::Null);
+				let value = runner.emit_resources_discover(&cwd, reason).await;
+				case.log.lock().unwrap().push(format!("emitResourcesDiscover:return:{}", jstr(&value)));
+			}
+			"emitInput" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let text = op.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+				let images = op.get("images").cloned();
+				let source = op.get("source").cloned().unwrap_or(Value::Null);
+				let streaming = op.get("streamingBehavior").cloned();
+				let value = runner.emit_input(&text, images, source, streaming).await;
+				case.log.lock().unwrap().push(format!("emitInput:return:{}", jstr(&value)));
+			}
+			"emitUserBash" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let event = op.get("event").cloned().unwrap_or(Value::Null);
+				match runner.emit_user_bash(event).await {
+					Ok(value) => case.log.lock().unwrap().push(format!("emitUserBash:return:{}", jstr(&value.unwrap_or(Value::Null)))),
+					Err(message) => {
+						// Invalid result = a real Error (message kept); a handler
+						// throw is a string (e.message === undefined).
+						let shown = if message.starts_with("Invalid user_bash handler result:") {
+							message
+						} else {
+							"undefined".to_string()
+						};
+						case.log.lock().unwrap().push(format!("emitUserBash!{}", shown));
+					}
+				}
+			}
+			"emitBeforeAgentStart" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let trigger = op.get("trigger").cloned().unwrap_or(Value::Null);
+				let options = op.get("systemPromptOptions").cloned().unwrap_or(Value::Null);
+				match runner.emit_before_agent_start(trigger, options).await {
+					Ok((messages, options)) => case.log.lock().unwrap().push(format!(
+						"emitBeforeAgentStart:return:{}",
+						jstr(&json!({"messages": messages, "systemPromptOptions": options}))
+					)),
+					Err(message) => case.log.lock().unwrap().push(format!("emitBeforeAgentStart!{}", message)),
+				}
+			}
+			"emitBoundary" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let base_event = op.get("baseEvent").cloned().unwrap_or(Value::Null);
+				let script = op.get("script").cloned().unwrap_or(json!([]));
+				let script = script.as_array().cloned().unwrap_or_default();
+				let index = Arc::new(Mutex::new(0usize));
+				let build: BoundaryBuildContext = Arc::new(move |_entries: Vec<Value>| {
+					let script = script.clone();
+					let index = Arc::clone(&index);
+					Box::pin(async move {
+						let step = {
+							let mut index = index.lock().unwrap();
+							let current = *index;
+							*index += 1;
+							script.get(current).cloned()
+						};
+						match step {
+							Some(step) => {
+								if let Some(message) = step.get("throws").and_then(Value::as_str) {
+									return Err(message.to_string());
+								}
+								Ok(step.get("context").cloned().unwrap_or(Value::Null))
+							}
+							None => Ok(json!({})),
+						}
+					})
+				});
+				match runner.emit_boundary(base_event, build).await {
+					Ok(value) => case.log.lock().unwrap().push(format!("emitBoundary:return:{}", jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("emitBoundary!{}", message)),
+				}
+			}
+			"ctxRead" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let field = op.get("field").and_then(Value::as_str).ok_or("missing field")?;
+				match runner.ctx().read_field(field) {
+					Ok(value) => case.log.lock().unwrap().push(format!("ctxRead:{}={}", field, jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("ctxRead:{}!{}", field, message)),
+				}
+			}
+			"ctxCall" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let method = op.get("method").and_then(Value::as_str).ok_or("missing method")?;
+				let args = op.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
+				match runner.ctx().call_args(method, &args) {
+					Ok(value) => case.log.lock().unwrap().push(format!("ctxCall:{}={}", method, jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("ctxCall:{}!{}", method, message)),
+				}
+			}
+			"toolContextTools" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let id = op.get("id").and_then(Value::as_str).unwrap_or("call");
+				let signal = op.get("signal").cloned().unwrap_or(Value::Null);
+				match runner.create_tool_context(id, signal).tools() {
+					Ok(value) => case.log.lock().unwrap().push(format!("toolContext.tools={}", jstr(&json!(value)))),
+					Err(message) => case.log.lock().unwrap().push(format!("toolContext.tools!{}", message)),
+				}
+			}
+			"toolContextExecuteTool" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let id = op.get("id").and_then(Value::as_str).unwrap_or("call");
+				let signal = op.get("signal").cloned().unwrap_or(Value::Null);
+				let name = op.get("name").and_then(Value::as_str).unwrap_or("tool");
+				let args = op.get("args").cloned().unwrap_or(Value::Null);
+				let options = op.get("options").cloned().unwrap_or(Value::Null);
+				match runner.create_tool_context(id, signal).execute_tool(name, args, options).await {
+					Ok(value) => case.log.lock().unwrap().push(format!("toolContext.executeTool:return:{}", jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("toolContext.executeTool!{}", message)),
+				}
+			}
+			"commandContext" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let method = op.get("method").and_then(Value::as_str).ok_or("missing method")?;
+				let args = op.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
+				let context = runner.create_command_context();
+				let first = args.first().cloned().unwrap_or(Value::Null);
+				let second = args.get(1).cloned().unwrap_or(Value::Null);
+				let result = match method {
+					"getSystemPromptOptions" => Ok(context.get_system_prompt_options()?),
+					"waitForIdle" => context.wait_for_idle().await.map(|()| Value::Null),
+					"newSession" => context.new_session(first).await,
+					"fork" => context.fork(first.as_str().unwrap_or(""), second).await,
+					"navigateTree" => context.navigate_tree(first.as_str().unwrap_or(""), second).await,
+					"switchSession" => context.switch_session(first.as_str().unwrap_or(""), second).await,
+					"reload" => context.reload().await.map(|()| Value::Null),
+					other => Err(format!("unknown command context method: {}", other)),
+				};
+				match result {
+					Ok(value) => case.log.lock().unwrap().push(format!("commandContext.{}:return:{}", method, jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("commandContext.{}!{}", method, message)),
+				}
+			}
+			"uiSelect" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let title = op.get("title").and_then(Value::as_str).unwrap_or("");
+				let options: Vec<String> = op
+					.get("options")
+					.and_then(Value::as_array)
+					.map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+					.unwrap_or_default();
+				let opts = op.get("opts").cloned().unwrap_or(Value::Null);
+				let result = runner.ui_select(title, &options, opts).await;
+				settle_ui_prompts(&case).await;
+				match result {
+					Ok(value) => case.log.lock().unwrap().push(format!("uiSelect:return:{}", jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("uiSelect!{}", message)),
+				}
+			}
+			"uiConfirm" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let title = op.get("title").and_then(Value::as_str).unwrap_or("");
+				let message = op.get("message").and_then(Value::as_str).unwrap_or("");
+				let opts = op.get("opts").cloned().unwrap_or(Value::Null);
+				let result = runner.ui_confirm(title, message, opts).await;
+				settle_ui_prompts(&case).await;
+				match result {
+					Ok(value) => case.log.lock().unwrap().push(format!("uiConfirm:return:{}", jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("uiConfirm!{}", message)),
+				}
+			}
+			"uiInput" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let title = op.get("title").and_then(Value::as_str).unwrap_or("");
+				let placeholder = op.get("placeholder").and_then(Value::as_str);
+				let opts = op.get("opts").cloned().unwrap_or(Value::Null);
+				let result = runner.ui_input(title, placeholder, opts).await;
+				settle_ui_prompts(&case).await;
+				match result {
+					Ok(value) => case.log.lock().unwrap().push(format!("uiInput:return:{}", jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("uiInput!{}", message)),
+				}
+			}
+			"uiEditor" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let title = op.get("title").and_then(Value::as_str).unwrap_or("");
+				let prefill = op.get("prefill").and_then(Value::as_str);
+				let result = runner.ui_editor(title, prefill).await;
+				settle_ui_prompts(&case).await;
+				match result {
+					Ok(value) => case.log.lock().unwrap().push(format!("uiEditor:return:{}", jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("uiEditor!{}", message)),
+				}
+			}
+			"uiCustom" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let args = op.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
+				let result = runner.ui_custom(args).await;
+				settle_ui_prompts(&case).await;
+				match result {
+					Ok(value) => case.log.lock().unwrap().push(format!("uiCustom:return:{}", jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("uiCustom!{}", message)),
+				}
+			}
+			"apiCall" => {
+				let key = op.get("key").and_then(Value::as_str).ok_or("missing key")?;
+				let api = case
+					.captured
+					.lock()
+					.unwrap()
+					.get(key)
+					.cloned()
+					.ok_or_else(|| format!("unknown api key: {}", key))?;
+				let method = op.get("method").and_then(Value::as_str).ok_or("missing method")?;
+				let args = op.get("args").and_then(Value::as_array).cloned().unwrap_or_default();
+				let first = args.first().cloned().unwrap_or(Value::Null);
+				let second = args.get(1).cloned().unwrap_or(Value::Null);
+				let result: Result<Value, String> = match method {
+					"sendMessage" => api.send_message(first, second).map(|()| Value::Null),
+					"sendUserMessage" => api.send_user_message(first, second).map(|()| Value::Null),
+					"appendEntry" => api
+						.append_entry(first.as_str().unwrap_or(""), second)
+						.map(|()| Value::Null),
+					"setSessionName" => api.set_session_name(first.as_str().unwrap_or("")).map(|()| Value::Null),
+					"getSessionName" => api.get_session_name(),
+					"setLabel" => api.set_label(first.as_str().unwrap_or(""), second).map(|()| Value::Null),
+					"getActiveTools" => api.get_active_tools().map(|tools| json!(tools)),
+					"getAllTools" => api.get_all_tools(),
+					"getSettings" => api.get_settings(),
+					"setActiveTools" => api
+						.set_active_tools(
+							&first
+								.as_array()
+								.map(|items| {
+									items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>()
+								})
+								.unwrap_or_default(),
+						)
+						.map(|()| Value::Null),
+					"refreshTools" => {
+						api.refresh_tools();
+						Ok(Value::Null)
+					}
+					"getCommands" => api.get_commands(),
+					"setModel" => api.set_model(first),
+					"getThinkingLevel" => api.get_thinking_level(),
+					"setThinkingLevel" => api.set_thinking_level(first).map(|()| Value::Null),
+					"exec" => {
+						let options = args.get(2).cloned().unwrap_or(Value::Null);
+						api.exec(first, second, options)
+							.await
+							.map(|result| serde_json::to_value(result).unwrap_or(Value::Null))
+					}
+					other => Err(format!("unknown api method: {}", other)),
+				};
+				match result {
+					Ok(value) => case.log.lock().unwrap().push(format!("apiCall:{}={}", method, jstr(&value))),
+					Err(message) => case.log.lock().unwrap().push(format!("apiCall:{}!{}", method, message)),
+				}
+			}
 			"api" => {
 				let key = op.get("key").and_then(Value::as_str).ok_or("missing key")?;
 				let steps = op.get("steps").and_then(Value::as_array).cloned().ok_or("missing steps")?;
@@ -831,11 +1205,7 @@ async fn run_async(ops: &[Value]) -> Result<Value, String> {
 		push_mcp_jobs(&case);
 		drain_engine(&case).await?;
 		// Deferred `ui_prompt_start`/`ui_prompt_end` events (queueMicrotask).
-		if let Some(runner) = case.runner.lock().unwrap().clone() {
-			for event in runner.drain_ui_prompt_events() {
-				runner.emit(event).await;
-			}
-		}
+		settle_ui_prompts(&case).await;
 	}
 	Ok(json!({
 		"result": {
