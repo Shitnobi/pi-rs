@@ -639,14 +639,29 @@ code, killed}`:
        `drain_mcp_events`; push `Res{job,0}` at mutation-apply (active) /
        commit-apply (loading) + `OpMark` at load-resolution + `Start{job}`
        at ui_prompt start/end — see Addendum B)
-- [ ] 15. Harness: all new ops + handler-spec extensions (both sides)
-- [ ] 16. Cases: ~60–80 new `exr/` (lifecycle/actions, context reads,
+- [x] 15. Harness: all new ops + handler-spec extensions (both sides)
+      **DONE**: every emitter/context/action/UI op on both sides;
+      `eventReads` (dot paths, numeric segments index arrays), `mutate`
+      (`set|push|unshift|pop|shift`), scripted UI context,
+      `bindCommandContext`, full recording action/context fakes, and
+      `PI_PACKAGE_DIR` doc paths (the dist resolves the docs section from
+      its own package dir).  See Addendum F for the conventions that had
+      to be pinned.
+- [x] 16. Cases: ~60–80 new `exr/` (lifecycle/actions, context reads,
         command context, ui prompt + engine interleave, exec, every
         emitter × result/error shapes, emitContext mutation matrix,
         before_agent_start incl. forceSystemPrompt-null + normalize V8
         errors)
-- [ ] 17. Full parity + workspace tests + clippy clean (new code)
-- [ ] 18. TRACKING.md + this doc → COMPLETE; feat commit + docs commit
+      **DONE**: 60 new cases (43 → 103 exr/).  The UI-prompt interleave is
+      covered by the op-level settle (fake UI resolves synchronously);
+      the handler-body `Start{job}` variant of Addendum B stays a
+      documented simplification (also noted at item 14).
+- [x] 17. Full parity + workspace tests + clippy clean (new code)
+      **DONE**: parity **2913/2913**; workspace **2116 passed, 0 failed**
+      (photon fixtures regenerated in the same bash call); clippy — no
+      new warnings in touched files (one pre-existing bool-assert lint in
+      `system_prompt.rs` tests).
+- [x] 18. TRACKING.md + this doc → COMPLETE; feat commit + docs commit
 
 ## Build env note
 
@@ -1152,3 +1167,52 @@ async emitBeforeAgentStart(trigger, systemPromptOptions) {
   "process" feature); `ExecSignal` seam (PreAborted/Live);
   `pi.exec` = assertActive → `execCommand(command, args,
   options?.cwd ?? loadingCwd, options)`.
+
+---
+
+## Addendum F — tranche-6 completion notes (2026-10-24)
+
+Findings from items 15–16 (the live dist is the arbiter; these supersede
+any conflicting earlier text):
+
+1. **V8 spread message has NO spaces** in the dist:
+   `(input.selectedTools ?? ["read","bash","edit","write"]) is not
+   iterable` (Addendum A/E show the spaced source text — stale).  The
+   error is rendered from the compiled expression; `hiddenTools`/
+   `promptGuidelines`/`contextFiles`/`skills`/`guidelines` texts were
+   already right.
+2. **`ctx.getSystemPromptOptions` is command-context only** (TS
+   `createContext()` has no such member; `createCommandContext()` adds
+   it).  The plain ctx port must not expose it; a stale unit assertion
+   was removed.
+3. **One event object per emitter, shared across handlers**: TS builds
+   `event`/`currentEvent` ONCE (or aliases `payload`/`message`/
+   `headers`), so in-place edits persist downstream and are observable
+   even when the handler returns nothing.  Every emitter now takes
+   `HandlerOutcome.event` back (tool_result, tool_call, message_end,
+   before_provider_request, before_provider_headers, context,
+   before_agent_start).  This is also why `mutate` steps exist on the
+   handler spec.
+4. **`normalizeBuildSystemPromptOptions` object literal always HAS all
+   12 keys** (undefined-valued ones still occupy their slot).  A handler
+   assignment into a previously-undefined field keeps that position;
+   `reorder_options_raw` restores the literal order after read-back.
+   `cwd` sits between `sections` and `contextFiles`.
+5. **`operations.exec` must be a function** (`typeof === "function"`), so
+   a JSON `{operations:{...}}` result can never validate; the modelable
+   invalid shape is `{operations:{}}`.  Valid `{result:{...}}` objects
+   are JSON-modelable.
+6. **TS harness fakes must supply every `bindCore` action/context-action**
+   — bindCore assigns them onto the class fields unconditionally, so a
+   missing key overwrites the class-field default with `undefined`
+   ("runner.xFn is not a function").  The recording fakes now mirror the
+   Rust `FakeActions`/`FakeContext` log lines 1:1.
+7. **Harness path convention**: `eventReads`/`mutate` paths use dots with
+   numeric segments indexing arrays on both sides (`messages.0.role`).
+8. **UI prompt ordering**: the fake UI resolves synchronously, so
+   `ui_prompt_start`+`ui_prompt_end` handler bodies run before the
+   awaited UI call's continuation; the harness settles the deferred queue
+   before logging the op result.
+9. **Docs section**: the dist renders paths from `getPackageDir()`
+   (`PI_PACKAGE_DIR` in parity); the Rust harness must call
+   `set_doc_paths` or every rendered prompt is short by the docs block.

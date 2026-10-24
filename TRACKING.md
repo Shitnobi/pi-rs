@@ -1,22 +1,26 @@
 # pi-rs Port Tracking
 
-## ⚠️ Current checkpoint (2026-10-22) — resume here
+## ⚠️ Current checkpoint (2026-10-24) — resume here
 
-**State: phase 4 tranche 5 (mcp-connection) COMPLETE and
-parity-green (2851/2851).** Working tree at the last checkpoint
-was mid-tranche; everything since (runtime.rs, harnesses, 52
-mcc/ cases) landed and is committed as the tranche-5 feat+docs
-pair. Full record: the "Phase 4 tranche 5" roadmap entry below +
-`docs/plans/phase4-tranche5-mcp-connection.md` (kept as the
-design/decision record — client async→sync mapping, runtime port
-design incl. the take_close_fired/process_client_close seam and
-client-id-seq model, harness protocol, case constraints).
+**State: phase 4 tranche 6 (extension-runner rest) COMPLETE and
+parity-green (2913/2913).** All 18 checklist items landed in
+`docs/plans/phase4-tranche6-extension-runner-rest.md` (read that
+plan's Addenda A–F first — they are the decision record).
+Workspace tests **2116 passed, 0 failed** (photon fixtures
+regenerated in-call); clippy has no new warnings in touched
+files.
+
+Tranche-6 commits: `396a92a` (exec), `c0973a7` (system_prompt raw),
+`acc4a07` (Addendum E), `8ed8738`..`55f9fc1` (items 3–14),
+`942c6ba`/`e7d3864`/`84ff5f7` (items 15–16: harness ops + 60 new
+exr/ cases incl. bindCommandContext, emit edge matrix, live-ref
+read-backs), plus the docs commit for this checkpoint.
 
 **Next up** (per `docs/plans/phase3-mcp-extensions.md` steps 7-10
-and the roadmap tail): extension-runner remaining slices
-(discovery, command/tool execution, real ExtensionContext), mcp
-extension wiring + mcp-section, tools/* slices, then the shared
-typebox-walker refactor.
+and the roadmap tail): mcp extension wiring + mcp-section,
+tools/* slices, then the shared typebox-walker refactor
+(extension discovery/command execution remain later-stage items
+inside tranche 7 per that plan).
 
 **Toolchain note:** bash must export
 `RUSTUP_HOME=$HOME/AI/.rustup CARGO_HOME=$HOME/AI/.cargo PATH=$HOME/AI/.cargo/bin:$PATH`
@@ -31,7 +35,7 @@ scripts/gen-photon-ground-truth.mjs — its header lists the
 parity/fixtures/ copies) AND run `cargo test -p pi-photon` in the
 SAME bash call. A plain `cargo test --workspace` from a fresh
 call fails only that test — environmental, not a regression.
-(Last full run: 2054 passed, 0 failed, fixtures in place.)
+(Last full run: 2116 passed, 0 failed, fixtures in place.)
 
 ## Previous checkpoint (2026-10-20) — superseded
 
@@ -1636,8 +1640,28 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       Suite **2851/2851** (full parity incl. filesystem
       snapshots). Clippy clean on all new code. pi-extensions
       40 unit tests; one stale expectation fixed (see above).
+- [x] **Phase 4 tranche 6 — extension-runner rest.**
+      `exec.rs` (spawn/validation/kill semantics, 29 tests);
+      `system_prompt.rs` raw normalize/build port (V8 text,
+      literal key order, DocPaths); full emitter set with
+      handler read-back (`HandlerOutcome` event copy) for the
+      TS aliasing model — emitBoundary/context/tool_call/
+      tool_result/message_end/input/user_bash/cache_warming/
+      provider request+headers/resources/before_agent_start;
+      full ctx getter/method map, tool/command contexts,
+      ContextActions/CommandContextActions seams; UI context +
+      withUIPrompt; harness microtask engine (mcp jobs + op
+      marks). Harness: all ops both sides (eventReads/mutate
+      steps incl. array ops, scripted UI, bindCommandContext,
+      ambient action fakes, PI_PACKAGE_DIR docs section).
+      **60 new exr/ cases (103 total)**: lifecycle/actions,
+      context reads, command context (+stale), exec edges, UI
+      prompts, every emitter × result/error shape, emitContext
+      matrix, before_agent_start merge/null-force/normalize
+      errors/mutation. Suite **2913/2913**; workspace 2116
+      green; pi-session/pi-cli unit tests green.
 - [ ] Remaining roadmap (see docs/plans/phase3-mcp-extensions.md
-      steps 7-10): extension-runner remaining slices
-      (discovery, command/tool execution, real
-      ExtensionContext), mcp extension wiring + mcp-section,
-      tools/* slices, typebox-walker refactor.
+      steps 7-10): mcp extension wiring + mcp-section, tools/*
+      slices, typebox-walker refactor. (Tranche 6 above closed the
+      extension-runner emitters/contexts/action-surface slices;
+      extension discovery + command/tool *execution* stay open.)
