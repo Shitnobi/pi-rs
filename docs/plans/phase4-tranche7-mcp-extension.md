@@ -39,7 +39,8 @@ its lifecycle, its tool registration, and `/mcp`.
   `McpHost`, `session_start`, `mcp_servers_change`, `before_agent_start`,
   `session_shutdown`, `/mcp` non-TUI handling; harness tool
   `mcp-extension`; `mce/` 15 cases.
-- **10d — connections + tools**: `McpServerConnection` instances per server,
+- **10d — connections + tools** (prep landed, `f6ad4af`: connections are
+  `Send`; remaining wiring below): `McpServerConnection` instances per server,
   `registerTools`/`hideTools`, `createMcpToolDefinition`, resource-tool
   exposure sync, `tool_call` waiting, startup waits (`startupWaitMs`,
   direct-server wait, `pending`), close ordering.
@@ -99,7 +100,9 @@ Two viable designs were considered:
    snapshots after releasing the lock — no re-entrancy, no thread
    invariant.
 
-**Decision: option 2.** The queue-drain is a small extension of the
+**Decision: option 2 — landed in `f6ad4af`** (connections and clients are
+`Send`; `onTools`/`onChange` carry a `McpConnectionSnapshot`). The
+queue-drain is a small extension of the
 existing `ConnEvent` pattern, and it removes a class of deadlocks
 (callbacks into state that owns the connection). The refactor lands as
 10d's first commit, before any connection is wired, with the

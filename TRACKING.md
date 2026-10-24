@@ -24,11 +24,20 @@ design/decision record and the slice list. Landed:
 Workspace tests **2129 passed, 0 failed** (photon fixtures
 regenerated in-call); clippy clean on all new code.
 
-**Next up:** 10d — refactor `McpServerConnection` to `Send`
-(`Rc<RefCell>` → `Arc<Mutex>`, callback event queue) first, then
-connections/tool registration/startup waits; 10e `/mcp` actions
-(OAuth/updateConfig seams); 10f runner adapter; 10g docs. See the
-plan's §3.3 for the `!Send`/handler-bounds decision.
+10d prep `f6ad4af` — `McpServerConnection`/`McpClient` are now
+`Send`: `Rc<RefCell>`/`Rc<Cell>` → `Arc<Mutex>`, transport/log/listener
+traits bounded by `Send`, and `onTools`/`onChange` receive a
+`McpConnectionSnapshot` (non-reentrant; the extension gets exactly the
+data it consumes). Behavior unchanged (mcc/ 52/52).
+
+**Next up:** 10d wiring — inject a connection factory, connect enabled
+servers in `session_start`/`mcp_servers_change` (TS background attempts
+map to synchronous connect in the port), `registerTools`/`hideTools`,
+`createMcpToolDefinition`, resource-exposure sync, `tool_call` waits;
+extend the `mcp-extension` harness with a scripted transport factory and
+a `settle` op (TS awaits a few macrotasks; Rust connects synchronously).
+Then 10e `/mcp` actions, 10f runner adapter, 10g docs. See the plan §3.3
+for the `!Send`/handler-bounds decision (now implemented).
 
 **Toolchain note:** bash must export
 `RUSTUP_HOME=$HOME/AI/.rustup CARGO_HOME=$HOME/AI/.cargo PATH=$HOME/AI/.cargo/bin:$PATH`
