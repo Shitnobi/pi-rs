@@ -63,7 +63,7 @@ const DEFAULT_CWD: &str = "/tmp/pi-parity-mcc";
 
 /// A `Box<dyn McpTransport>` over a shared `FakeTransport`, so the harness
 /// keeps handles to the transports the factory created (for `sent`).
-struct SharedTransport(Arc<Mutex<FakeTransport>>);
+pub(crate) struct SharedTransport(pub(crate) Arc<Mutex<FakeTransport>>);
 
 impl McpTransport for SharedTransport {
     fn start(&mut self) -> Result<(), McpErrorKind> {
@@ -174,7 +174,7 @@ fn parse_step(step: &Value) -> Result<FakeStep, String> {
 
 /// One transport script: `startSteps` (flat) + `sendSteps` (one batch per
 /// send).
-fn parse_transport(script: &Value) -> Result<(Vec<FakeStep>, Vec<Vec<FakeStep>>), String> {
+pub(crate) fn parse_transport(script: &Value) -> Result<(Vec<FakeStep>, Vec<Vec<FakeStep>>), String> {
     let obj = script
         .as_object()
         .ok_or_else(|| "transports entries must be objects".to_string())?;

@@ -1711,9 +1711,93 @@ async function runModule(tool, args, cwd) {
 				log.push("activeTools:" + JSON.stringify(names));
 			},
 		};
+		// Scripted transports for the servers the extension connects, with
+		// the same schema as the mcp-connection harness.
+		const runtimeMod = require(path.join(distDir, "extensions", "mcp", "runtime.js"));
+		const parseTransportStep = (step) => {
+			if (step === undefined || step === null || typeof step !== "object" || Array.isArray(step)) {
+				throw new Error("transport steps must be objects");
+			}
+			if (step.message !== undefined) return { kind: "message", message: step.message };
+			if (step.error !== undefined) return { kind: "error", text: typeof step.error === "string" ? step.error : "" };
+			if (step.close === true) return { kind: "close" };
+			throw new Error("transport steps must be message/error/close");
+		};
+		const scripts = (args.transports || []).map((script) => {
+			if (script === undefined || script === null || typeof script !== "object" || Array.isArray(script)) {
+				throw new Error("transports entries must be objects");
+			}
+			const startSteps = (script.startSteps ?? []).map(parseTransportStep);
+			const sendSteps = (script.sendSteps ?? []).map((batch) => {
+				if (!Array.isArray(batch)) throw new Error("sendSteps entries must be arrays");
+				return batch.map(parseTransportStep);
+			});
+			return { startSteps, sendSteps };
+		});
+		class ExtFakeTransport {
+			constructor(script) {
+				this.script = script ?? { startSteps: [], sendSteps: [] };
+				this.started = false;
+				this.closed = false;
+				this.sent = [];
+				this.listeners = { message: [], error: [], close: [] };
+			}
+			onMessage(listener) {
+				this.listeners.message.push(listener);
+				return () => {
+					const i = this.listeners.message.indexOf(listener);
+					if (i >= 0) this.listeners.message.splice(i, 1);
+				};
+			}
+			onError(listener) {
+				this.listeners.error.push(listener);
+				return () => {
+					const i = this.listeners.error.indexOf(listener);
+					if (i >= 0) this.listeners.error.splice(i, 1);
+				};
+			}
+			onClose(listener) {
+				this.listeners.close.push(listener);
+				return () => {
+					const i = this.listeners.close.indexOf(listener);
+					if (i >= 0) this.listeners.close.splice(i, 1);
+				};
+			}
+			async start() {
+				if (this.closed) throw new runtimeMod.McpConnectionClosedError();
+				const first = !this.started;
+				this.started = true;
+				if (!first) return;
+				this.#deliver(this.script.startSteps);
+			}
+			async send(message) {
+				if (!this.started || this.closed) throw new runtimeMod.McpConnectionClosedError();
+				this.sent.push(message);
+				this.#deliver(this.script.sendSteps.shift() ?? []);
+			}
+			async close() {
+				if (this.closed) return;
+				this.closed = true;
+				for (const listener of [...this.listeners.close]) listener();
+			}
+			#deliver(steps) {
+				for (const step of steps) {
+					if (step.kind === "message") {
+						for (const listener of [...this.listeners.message]) listener(step.message);
+					} else if (step.kind === "error") {
+						for (const listener of [...this.listeners.error]) listener(step.text);
+					} else {
+						this.closed = true;
+						for (const listener of [...this.listeners.close]) listener();
+					}
+				}
+			}
+		}
+		const createTransport = () => new ExtFakeTransport(scripts.shift());
 		const factory = mcp.createMcpExtension({
 			loadConfig: () => ({ servers: [], errors: [], ...(args.loadConfig ?? {}) }),
 			startupWaitMs: args.startupWaitMs ?? 10000,
+			createTransport,
 		});
 		await factory(pi);
 		const emit = async (type, event) => {
@@ -1725,6 +1809,13 @@ async function runModule(tool, args, cwd) {
 					await emit("session_start", { type: "session_start", reason: "startup" });
 					log.push("sessionStart:ok");
 					break;
+				case "settle": {
+					// Let the background startup connections (setImmediate +
+					// load runtime + fake transport awaits) finish.
+					for (let i = 0; i < 4; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+					log.push("settle:ok");
+					break;
+				}
 				case "beforeAgentStart": {
 					const event = op.event;
 					await emit("before_agent_start", event);

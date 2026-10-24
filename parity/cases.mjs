@@ -5621,6 +5621,31 @@ export const cases = [
 			type: "before_agent_start",
 			systemPromptOptions: { cwd: "/proj", sections },
 		});
+		// Scripted transports (same schema as mcc/) for the servers an
+		// enabled config connects.
+		const rpc = (id, result) => ({ message: { jsonrpc: "2.0", id, result } });
+		const rpcErr = (id, code, message) => ({
+			message: { jsonrpc: "2.0", id, error: { code, message } },
+		});
+		const initResult = (capabilities, extra) => ({
+			protocolVersion: "2025-11-25",
+			capabilities,
+			serverInfo: { name: "srv", version: "1.0" },
+			...(extra || {}),
+		});
+		const connectSends = (initRes, tools) => [
+			[rpc(1, initRes)],
+			[],
+			...(tools === null ? [] : [[rpc(2, { tools })]]),
+		];
+		const failConnect = () => ({ sendSteps: [[rpcErr(1, -32603, "boom")]] });
+		const configured = (name, config) => ({
+			name,
+			config,
+			source: "/g/mcp.json",
+			scope: "global",
+		});
+		const tool = (name, inputSchema, extra) => ({ name, inputSchema, ...(extra || {}) });
 		return [
 			mce("status-and-usage", {
 				host: host(),
@@ -5657,8 +5682,10 @@ export const cases = [
 					],
 				}),
 				loadConfig: { servers: [{ name: "d", config: cmd({ exposure: "codemode" }) }] },
+				transports: [failConnect()],
 				ops: [
 					{ op: "sessionStart" },
+					{ op: "settle" },
 					{ op: "beforeAgentStart", event: sectionEvent({ custom: "C" }) },
 					{ op: "shutdown" },
 				],
@@ -5791,8 +5818,10 @@ export const cases = [
 						{ name: "a", config: cmd({ exposure: "deferred" }) },
 					],
 				},
+				transports: [failConnect(), failConnect()],
 				ops: [
 					{ op: "sessionStart" },
+					{ op: "settle" },
 					{ op: "beforeAgentStart", event: sectionEvent({ custom: "C" }) },
 					{ op: "beforeAgentStart", event: sectionEvent({ mcp_servers: "old", custom: "C" }) },
 					{ op: "shutdown" },
@@ -5810,6 +5839,113 @@ export const cases = [
 					{ op: "completions", prefix: "login " },
 					{ op: "completions", prefix: "reconnect " },
 					{ op: "completions", prefix: "login a b" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("connect-status", {
+				host: host(),
+				loadConfig: {
+					servers: [configured("s", cmd({ description: "Srv" }))],
+				},
+				transports: [
+					{
+						sendSteps: connectSends(
+							initResult({ tools: {}, resources: {} }, { instructions: "Be nice" }),
+							[tool("greet", { type: "object" })],
+						),
+					},
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "command", args: "" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("connect-failed-report", {
+				host: host(),
+				loadConfig: { servers: [configured("s", cmd())] },
+				transports: [failConnect()],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "command", args: "" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("connect-instructions-section", {
+				host: host(),
+				loadConfig: {
+					servers: [configured("s", cmd({ exposure: "codemode" }))],
+				},
+				transports: [
+					{
+						sendSteps: connectSends(
+							initResult({ tools: {} }, { instructions: "  Use me first  \nsecond" }),
+							[tool("t", { type: "object" })],
+						),
+					},
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "beforeAgentStart", event: sectionEvent({ custom: "C" }) },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("servers-change-connect", {
+				host: host(),
+				loadConfig: { servers: [] },
+				transports: [
+					{
+						sendSteps: connectSends(initResult({ tools: {} }), [
+							tool("added", { type: "object" }),
+						]),
+					},
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "setRegistered", servers: [
+						{ name: "r", config: cmd(), extensionPath: "/ext/r.js" },
+					] },
+					{ op: "serversChange" },
+					{ op: "command", args: "" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("servers-change-remove-closes", {
+				host: host({
+					registeredServers: [
+						{ name: "r", config: cmd(), extensionPath: "/ext/r.js" },
+					],
+				}),
+				loadConfig: { servers: [] },
+				transports: [
+					{
+						sendSteps: connectSends(initResult({ tools: {} }), [
+							tool("t", { type: "object" }),
+						]),
+					},
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "command", args: "" },
+					{ op: "setRegistered", servers: [] },
+					{ op: "serversChange" },
+					{ op: "command", args: "" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("shutdown-after-connect", {
+				host: host(),
+				loadConfig: { servers: [configured("s", cmd())] },
+				transports: [
+					{ sendSteps: connectSends(initResult({ tools: {} }), [tool("t", { type: "object" })]) },
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
 					{ op: "shutdown" },
 				],
 			}),

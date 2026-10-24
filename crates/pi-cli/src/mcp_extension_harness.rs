@@ -14,8 +14,10 @@
 //!   },
 //!   "loadConfig": { "servers": [McpServerEntry], "errors": [str],
 //!                   "projectConfig"?: str, "autoEnableCodemode"?: bool },
+//!   "transports": [ { "startSteps": [...], "sendSteps": [[...]] } ],
 //!   "ops": [
 //!     { "op": "sessionStart" },
+//!     { "op": "settle" },
 //!     { "op": "beforeAgentStart", "event": json },
 //!     { "op": "setRegistered", "servers": [...] },
 //!     { "op": "serversChange" },
@@ -33,12 +35,14 @@
 //! `activeTools:<json>`, and one line per op — byte-identical to the TS
 //! harness.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
 use pi_core::mcp_servers::{validate_mcp_server_config, RegisteredMcpServer};
 use pi_extensions::mcp::extension::{McpExtension, McpExtensionOptions, McpHost};
+use pi_extensions::mcp::transport::{FakeTransport, McpTransport};
 use pi_session::mcp_config::{LoadedMcpConfig, McpConfigScope, McpServerEntry};
 
 #[derive(Default)]
@@ -181,9 +185,41 @@ pub fn run(input: &Value) -> Result<Value, String> {
     }));
     let host = HarnessHost(Arc::clone(&state));
     let loaded = load_config(input.get("loadConfig"))?;
+    // One scripted transport per connection the extension creates, like the
+    // `mcp-connection` harness (same script schema).
+    let mut scripts = VecDeque::new();
+    for script in input
+        .get("transports")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        scripts.push_back(crate::mcp_connection_harness::parse_transport(script)?);
+    }
+    let factory_scripts = Arc::new(Mutex::new(scripts));
+    let factory = Box::new(
+        move |_entry: &pi_extensions::mcp::runtime::McpServerEntry,
+              _cwd: &str,
+              _auth: Option<&pi_extensions::mcp::runtime::McpAuthProvider>|
+              -> Box<dyn McpTransport> {
+            let (start_steps, send_batches) = factory_scripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            let mut transport = FakeTransport::new();
+            transport.start_steps = start_steps;
+            transport.send_steps = VecDeque::from(send_batches);
+            Box::new(crate::mcp_connection_harness::SharedTransport(Arc::new(
+                Mutex::new(transport),
+            )))
+        },
+    );
     let options = McpExtensionOptions {
         load_config: Arc::new(move |_host: &dyn McpHost| loaded.clone()),
         startup_wait_ms: input.get("startupWaitMs").and_then(Value::as_u64).unwrap_or(10_000),
+        create_transport: Some(Arc::new(Mutex::new(factory))),
+        sleep: Arc::new(|ms| std::thread::sleep(std::time::Duration::from_millis(ms))),
     };
     let mut extension = McpExtension::new(options);
 
@@ -194,6 +230,10 @@ pub fn run(input: &Value) -> Result<Value, String> {
             "sessionStart" => {
                 extension.session_start(&host);
                 "sessionStart:ok".to_string()
+            }
+            "settle" => {
+                extension.settle(&host);
+                "settle:ok".to_string()
             }
             "beforeAgentStart" => {
                 let mut event = op.get("event").cloned().unwrap_or(Value::Null);

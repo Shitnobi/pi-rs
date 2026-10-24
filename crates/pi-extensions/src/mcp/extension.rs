@@ -17,21 +17,29 @@
 //!   need a live connection yet.
 //! - `/mcp` command: non-TUI status and argument completions.
 //!
+//! Connections live in the state machine as `Arc<Mutex<McpServerConnection>>`
+//! (they are `Send`; see the plan §3.3). Their `onTools`/`onChange` hooks only
+//! enqueue snapshots into a shared queue, which the state machine drains at
+//! the next deterministic boundary (`settle`, a command, a prompt, shutdown):
+//! a callback cannot borrow the extension that owns the connection.
+//!
 //! Deferred to the next slices (see `docs/plans/phase4-tranche7-mcp-extension.md`):
-//! connections + tool registration, the TUI manager/sign-in, and the runner
-//! adapter. The state machine is intentionally a plain `&mut self` object:
-//! [`McpServerConnection`](super::runtime::McpServerConnection) is `!Send`
-//! (it holds `Rc`/`RefCell`), while `ExtensionRunner` handlers must be
-//! `Send + Sync`; the adapter design is recorded in the plan.
+//! tool registration (10d-2), `/mcp` actions (10e), the TUI manager/sign-in,
+//! and the runner adapter (10f).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use pi_core::js_string::js_trim;
 use pi_core::mcp_servers::{mcp_namespace, McpExposure, RegisteredMcpServer};
 use pi_session::mcp_config::{LoadedMcpConfig, McpConfigScope, McpServerEntry};
 use serde_json::Value;
 
+use super::runtime::{
+    McpConnectionSnapshot, McpCredentialStore, McpServerConnection, McpServerConnectionOptions,
+    ServerState, TransportFactory,
+};
 use super::section::{configured_exposures, exposure_of, has_direct_tools, is_enabled, render_servers_section, McpServerListing, MCP_SERVERS_SECTION};
+use super::transport::SleepFn;
 use super::status::{
     argument_completions, describe_state, format_status, McpCompletion, McpConnectionStatus,
     McpServerSnapshot, MCP_USAGE,
@@ -73,14 +81,30 @@ pub trait McpHost: Send + Sync {
 /// The `loadConfig` seam (`McpExtensionOptions.loadConfig`).
 pub type LoadConfigFn = Arc<dyn Fn(&dyn McpHost) -> LoadedMcpConfig + Send + Sync>;
 
+/// A connection callback, forwarded out of the connection (`onTools` /
+/// `onChange`). The state machine drains these at its next boundary.
+#[derive(Debug, Clone)]
+pub enum ConnectionEvent {
+    /// `onTools(connection)`: the server connected or refreshed its tools.
+    Tools(McpConnectionSnapshot),
+    /// `onChange(connection)`: the connection state changed.
+    Changed(McpConnectionSnapshot),
+}
+
 /// `McpExtensionOptions` (L69) — the subset this slice needs.
 #[derive(Clone)]
 pub struct McpExtensionOptions {
     /// `loadConfig`: defaults to `loadMcpConfig({agentDir, cwd, projectTrusted})`
     /// in the real adapter; the harness injects the result directly.
     pub load_config: LoadConfigFn,
-    /// `startupWaitMs ?? 10_000` — used once direct-server waits are wired.
+    /// `startupWaitMs ?? 10_000`.
     pub startup_wait_ms: u64,
+    /// `options.createTransport` (the TS option is one function shared by
+    /// every connection). `None` leaves connections unstarted; the runner
+    /// adapter supplies the default stdio/HTTP transport.
+    pub create_transport: Option<Arc<Mutex<TransportFactory>>>,
+    /// Timers (connect retries, request timeouts).
+    pub sleep: SleepFn,
 }
 
 impl Default for McpExtensionOptions {
@@ -88,23 +112,28 @@ impl Default for McpExtensionOptions {
         McpExtensionOptions {
             load_config: Arc::new(|_| LoadedMcpConfig::default()),
             startup_wait_ms: DEFAULT_STARTUP_WAIT_MS,
+            create_transport: None,
+            sleep: Arc::new(|ms| std::thread::sleep(std::time::Duration::from_millis(ms))),
         }
     }
 }
 
-/// A configured server (`McpServer`, L108). Connections, attempts, and the
-/// closing/ready promises belong to the connection slice; `None` here always
-/// means "no connection yet", which is also the TS state before
-/// `startConnection` runs.
-#[derive(Debug, Clone)]
+/// A configured server (`McpServer`, L108).
+#[derive(Clone)]
 pub struct McpServerState {
     pub entry: McpServerEntry,
     /// `registeredConfig` for extension-registered servers.
     pub registered_config: Option<String>,
     /// Result of the last `/mcp` action that failed.
     pub message: Option<String>,
-    /// Connection status once the connection slice lands.
+    /// Display state, synced from the connection's snapshots.
     pub connection: Option<McpConnectionStatus>,
+    /// The live connection, once `startConnection` created it.
+    handle: Option<Arc<Mutex<McpServerConnection>>>,
+    /// `server.ready` exists (the TS attempt started; the port connects
+    /// inline, so an existing handle is settled unless `pending_start`
+    /// still names it).
+    ready: bool,
 }
 
 impl McpServerState {
@@ -137,6 +166,12 @@ pub struct McpExtension {
     session_cwd: String,
     /// Lifetime of the current session (`session.aborted` after shutdown).
     aborted: bool,
+    /// Snapshot queue filled by the connection callbacks.
+    connection_events: Arc<Mutex<Vec<ConnectionEvent>>>,
+    /// Enabled servers whose `startConnection` the TS launches in the
+    /// background from `session_start`; the port connects them at the next
+    /// boundary (`settle`, a command, a prompt, shutdown).
+    pending_start: Vec<String>,
 }
 
 impl McpExtension {
@@ -153,6 +188,8 @@ impl McpExtension {
             waited_for_startup: false,
             session_cwd: String::new(),
             aborted: true,
+            connection_events: Arc::new(Mutex::new(Vec::new())),
+            pending_start: Vec::new(),
         }
     }
 
@@ -214,6 +251,8 @@ impl McpExtension {
                 registered_config,
                 message: None,
                 connection: None,
+                handle: None,
+                ready: false,
             });
         }
         (registered, overridden)
@@ -241,38 +280,168 @@ impl McpExtension {
                 registered_config: None,
                 message: None,
                 connection: None,
+                handle: None,
+                ready: false,
             })
             .chain(registered)
             .collect();
         // Codemode or tool_search is activated from the config: the first
         // prompt does not wait for servers whose tools are not declared.
         self.ensure_discovery_active(host);
-        // Connections start here in the full port (10d); the TS reports
-        // startup problems once those attempts settle, so with enabled
-        // servers the report is deferred. With none it happens now.
-        let has_enabled = self.servers.iter().any(|server| is_enabled(&server.entry));
-        if !has_enabled {
+        self.connection_events.lock().unwrap().clear();
+        self.pending_start.clear();
+        // The TS starts the connections in the background (after one event
+        // loop turn) and reports problems once they settle. The port queues
+        // them and connects at the next boundary: `settle`, a command, or a
+        // prompt. With no enabled server the report happens now.
+        let enabled: Vec<String> = self
+            .servers
+            .iter()
+            .filter(|server| is_enabled(&server.entry))
+            .map(|server| server.entry.name.clone())
+            .collect();
+        if enabled.is_empty() {
             self.report_problems(host, None);
+        } else if self.options.create_transport.is_some() {
+            self.pending_start = enabled;
+        }
+    }
+
+    /// Connect the servers `session_start` queued and report problems. The
+    /// harness calls this after `sessionStart`; commands and prompts call it
+    /// themselves (they `await pending` in the TS). A no-op without queued
+    /// attempts, so it never adds observable lines on its own.
+    pub fn settle(&mut self, host: &dyn McpHost) {
+        self.flush_pending(host);
+    }
+
+    fn flush_pending(&mut self, host: &dyn McpHost) {
+        if self.pending_start.is_empty() {
+            return;
+        }
+        let names = std::mem::take(&mut self.pending_start);
+        if self.aborted {
+            return;
+        }
+        for name in names {
+            if let Some(index) = self
+                .servers
+                .iter()
+                .position(|server| server.entry.name == name)
+            {
+                if is_enabled(&self.servers[index].entry) {
+                    self.start_connection(index);
+                }
+            }
+        }
+        self.drain_connection_events();
+        if !self.aborted {
+            self.report_problems(host, None);
+        }
+    }
+
+    /// `createConnection` + `getClient()` for the server at `index`
+    /// (`startConnection`, L560). The connection's hooks only enqueue
+    /// snapshots; the caller drains them.
+    fn start_connection(&mut self, index: usize) {
+        let Some(factory) = self.options.create_transport.clone() else {
+            return;
+        };
+        if self.servers[index].handle.is_some() {
+            return;
+        }
+        let entry = self.servers[index].entry.clone();
+        let cwd = self.session_cwd.clone();
+        let events = Arc::clone(&self.connection_events);
+        let tools_events = Arc::clone(&events);
+        let on_tools = Box::new(move |snapshot: &McpConnectionSnapshot| {
+            tools_events
+                .lock()
+                .unwrap()
+                .push(ConnectionEvent::Tools(snapshot.clone()));
+        });
+        let change_events = Arc::clone(&events);
+        let on_change = Box::new(move |snapshot: &McpConnectionSnapshot| {
+            change_events
+                .lock()
+                .unwrap()
+                .push(ConnectionEvent::Changed(snapshot.clone()));
+        });
+        let create_transport: TransportFactory = Box::new(move |entry, cwd, auth| {
+            (factory.lock().unwrap())(entry, cwd, auth)
+        });
+        let mut connection = McpServerConnection::new(McpServerConnectionOptions {
+            entry: super::runtime::McpServerEntry {
+                name: entry.name.clone(),
+                config: entry.config,
+            },
+            cwd,
+            create_transport,
+            credentials: Box::new(()) as Box<dyn McpCredentialStore>,
+            on_tools,
+            on_change: Some(on_change),
+            log: None,
+            sleep: Arc::clone(&self.options.sleep),
+        });
+        let _ = connection.connect();
+        self.servers[index].handle = Some(Arc::new(Mutex::new(connection)));
+        self.servers[index].ready = true;
+    }
+
+    /// Apply a connection snapshot to the server's display state.
+    fn apply_snapshot(&mut self, snapshot: &McpConnectionSnapshot) {
+        let Some(server) = self
+            .servers
+            .iter_mut()
+            .find(|server| server.entry.name == snapshot.name)
+        else {
+            return;
+        };
+        server.connection = Some(McpConnectionStatus {
+            state: snapshot.state,
+            tools: snapshot.tools.len(),
+            has_resources: snapshot.has_resources,
+            error: snapshot.error.clone(),
+            oauth_url: snapshot.oauth_url.clone(),
+        });
+    }
+
+    /// Drain the snapshot queue. `onTools` registration lands in 10d-2; for
+    /// now both events only update the display state.
+    fn drain_connection_events(&mut self) {
+        let events: Vec<ConnectionEvent> = std::mem::take(&mut *self.connection_events.lock().unwrap());
+        for event in events {
+            let snapshot = match event {
+                ConnectionEvent::Tools(snapshot) | ConnectionEvent::Changed(snapshot) => snapshot,
+            };
+            self.apply_snapshot(&snapshot);
         }
     }
 
     /// `pi.on("before_agent_start")` (L1178): inject or remove the
     /// `mcp_servers` section on the event's `systemPromptOptions.sections`.
     pub fn before_agent_start(&mut self, host: &dyn McpHost, event: &mut Value) {
-        // `await waitForDirectServers(ctx)` — without connections there is
-        // nothing to wait for; the flag still flips like the TS.
-        if !self.waited_for_startup {
-            self.waited_for_startup = true;
-            // 10d: wait for servers with direct tools, bounded by
-            // `startup_wait_ms`, and notify when still connecting.
-            let _ = &self.options.startup_wait_ms;
-        }
+        // `await waitForDirectServers(ctx)`: the port connects inline, so
+        // flushing the queued attempts settles everything the wait covers.
+        self.flush_pending(host);
+        self.waited_for_startup = true;
+        let instructions: Vec<Option<String>> = self
+            .servers
+            .iter()
+            .map(|server| {
+                server.handle.as_ref().and_then(|handle| {
+                    let snapshot = handle.lock().unwrap().snapshot();
+                    snapshot.instructions
+                })
+            })
+            .collect();
         let listings: Vec<McpServerListing<'_>> = self
             .servers
             .iter()
-            .map(|server| McpServerListing {
+            .zip(&instructions)
+            .map(|(server, instructions)| McpServerListing {
                 entry: &server.entry,
-                instructions: None,
+                instructions: instructions.as_deref(),
             })
             .collect();
         let section = render_servers_section(&listings);
@@ -290,15 +459,14 @@ impl McpExtension {
                 sections.shift_remove(MCP_SERVERS_SECTION);
             }
         }
-        let _ = host;
     }
 
-    /// `pi.on("tool_call")` (L1191): wait for the servers the tool may reach.
-    /// Without connections every `ready` is absent, so this returns
-    /// immediately; the routing logic (reachesTools/owner/resource tools)
-    /// lands with tool registration.
+    /// `pi.on("tool_call")` (L1191): wait for the servers the tool may
+    /// reach. The port connects inline, so flushing the queued startups is
+    /// the wait; the routing (owners/resource tools) lands with tool
+    /// registration.
     pub fn tool_call(&mut self, host: &dyn McpHost, event: &Value) {
-        let _ = host;
+        self.flush_pending(host);
         let _ = event;
     }
 
@@ -331,24 +499,69 @@ impl McpExtension {
             })
             .map(|server| server.entry.name.clone())
             .collect();
+        let removed_servers: Vec<McpServerState> = self
+            .servers
+            .iter()
+            .filter(|server| removed.contains(&server.entry.name))
+            .cloned()
+            .collect();
         self.servers.retain(|server| !removed.contains(&server.entry.name));
-        // 10d: `hideTools` for removed servers.
+        // 10d-2: `hideTools(removed name)`.
         let added: Vec<McpServerState> = registered
             .into_iter()
             .filter(|server| self.find_server(&server.entry.name).is_none())
             .collect();
+        let added_names: Vec<String> = added
+            .iter()
+            .map(|server| server.entry.name.clone())
+            .collect();
         self.servers.extend(added);
         self.ensure_discovery_active(host);
-        // 10d: close removed connections, start added enabled servers, and
-        // report problems for them once their attempts settle.
+        // Close the dropped connections, then connect the added enabled
+        // servers (the TS awaits both).
+        for server in &removed_servers {
+            if let Some(handle) = &server.handle {
+                handle.lock().unwrap().close();
+            }
+        }
+        self.drain_connection_events();
+        let connecting: Vec<usize> = self
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, server)| {
+                added_names.contains(&server.entry.name) && is_enabled(&server.entry)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if self.aborted || connecting.is_empty() {
+            return;
+        }
+        for index in connecting {
+            self.start_connection(index);
+        }
+        self.drain_connection_events();
+        if !self.aborted {
+            self.report_problems(host, Some(&added_names));
+        }
     }
 
     /// `pi.on("session_shutdown")` (L1252).
     pub fn session_shutdown(&mut self, host: &dyn McpHost) {
         let _ = host;
         self.aborted = true;
-        // 10d: close every connection after the tracked background actions.
+        // A queued attempt is dropped: the TS aborts the session signal.
+        self.pending_start.clear();
+        let handles: Vec<Arc<Mutex<McpServerConnection>>> = self
+            .servers
+            .iter()
+            .filter_map(|server| server.handle.clone())
+            .collect();
         self.servers.clear();
+        self.connection_events.lock().unwrap().clear();
+        for handle in handles {
+            handle.lock().unwrap().close();
+        }
     }
 
     /// `ensureDiscoveryActive` (L500): activate codemode/tool_search from the
@@ -440,7 +653,7 @@ impl McpExtension {
             };
             if matches!(
                 connection.state,
-                super::runtime::ServerState::NeedsAuth | super::runtime::ServerState::Failed
+                ServerState::NeedsAuth | ServerState::Failed
             ) {
                 lines.push(format!(
                     "{}: {}",
@@ -492,14 +705,18 @@ impl McpExtension {
         let name = parts.get(1).cloned();
         let extra = parts.len().saturating_sub(2);
         let Some(action) = action else {
-            // `ctx.mode === "tui"` opens the manager; otherwise the status.
+            // `ctx.mode === "tui"` opens the manager; otherwise
+            // `await pending` and the status.
+            self.flush_pending(host);
             host.notify(&self.status_text(host), "info");
             return;
         };
         if extra > 0 {
+            // The TS checks the extra arguments before awaiting `pending`.
             host.notify(MCP_USAGE, "warning");
             return;
         }
+        self.flush_pending(host);
         match action.as_str() {
             "login" | "logout" => {
                 let picked = self.pick_server(
@@ -516,12 +733,11 @@ impl McpExtension {
                 let picked = self.pick_server(
                     name.as_deref(),
                     host,
-                    &|server| server.connection.is_some(),
+                    &|server| server.handle.is_some(),
                     &|server| {
                         matches!(
                             server.connection.as_ref().map(|connection| connection.state),
-                            Some(super::runtime::ServerState::Failed)
-                                | Some(super::runtime::ServerState::Disconnected)
+                            Some(ServerState::Failed) | Some(ServerState::Disconnected)
                         )
                     },
                     "No enabled MCP server to reconnect.",

@@ -521,6 +521,12 @@ impl McpServerConnection {
         }
     }
 
+    /// `getClient().catch(() => undefined)` for the extension's
+    /// `startConnection`: connect if needed, discarding the client handle.
+    pub fn connect(&mut self) -> Result<(), McpErrorKind> {
+        self.get_client().map(|_| ())
+    }
+
     /// `getClient` — the connected client, opening one when needed.
     fn get_client(&mut self) -> Result<u64, McpErrorKind> {
         if self.shutdown {
