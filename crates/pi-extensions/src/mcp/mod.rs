@@ -2,6 +2,7 @@
 //! (client + connection over the transport seam).
 
 pub mod client;
+pub mod extension;
 pub mod log;
 pub mod runtime;
 pub mod section;

@@ -5595,6 +5595,235 @@ export const cases = [
 			]),
 		];
 	})(),
+	// ----------------------------------------------- mcp-extension (module)
+	// extensions/mcp/index.ts createMcpExtension: session lifecycle, config
+	// vs registered-server merge, discovery activation, mcp_servers section,
+	// /mcp status/usage/picker messages, argument completions, shutdown.
+	// Cases avoid enabled servers where a later op would await `pending`
+	// (connections arrive with the next slice).
+	...(() => {
+		const mce = (name, args) => ({ tool: "mcp-extension", name: "mce/" + name, args });
+		const cmd = (extra = {}) => ({ command: "node", ...extra });
+		const disabled = (name, config = cmd()) => ({
+			name,
+			config: { ...cmd(), ...config, enabled: false },
+			source: "/g/mcp.json",
+			scope: "global",
+		});
+		const host = (extra = {}) => ({
+			cwd: "/proj",
+			agentDir: "/home/u/.pi",
+			projectTrusted: true,
+			activeTools: ["read"],
+			...extra,
+		});
+		const sectionEvent = (sections) => ({
+			type: "before_agent_start",
+			systemPromptOptions: { cwd: "/proj", sections },
+		});
+		return [
+			mce("status-and-usage", {
+				host: host(),
+				loadConfig: {
+					servers: [
+						disabled("off"),
+						disabled("gone", { url: "https://example.test/mcp" }),
+					],
+					errors: ["bad file"],
+					projectConfig: "/proj/.pi/mcp.json",
+				},
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "command", args: "" },
+					{ op: "command", args: "bogus" },
+					{ op: "command", args: "login" },
+					{ op: "command", args: "logout" },
+					{ op: "command", args: "reconnect" },
+					{ op: "command", args: "login missing" },
+					{ op: "command", args: "reconnect x" },
+					{ op: "command", args: "login a b" },
+					{ op: "command", args: "   " },
+					{ op: "turnStart" },
+					{ op: "toolCall", event: { type: "tool_call", toolName: "read", input: {} } },
+					{ op: "shutdown" },
+					{ op: "command", args: "" },
+				],
+			}),
+			mce("discovery-codemode", {
+				host: host({
+					tools: [
+						{ name: "codemode", reachesTools: true },
+						{ name: "tool_search", reachesTools: true },
+					],
+				}),
+				loadConfig: { servers: [{ name: "d", config: cmd({ exposure: "codemode" }) }] },
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "beforeAgentStart", event: sectionEvent({ custom: "C" }) },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("discovery-tool-search", {
+				host: host({
+					tools: [
+						{ name: "codemode", reachesTools: true },
+						{ name: "tool_search", reachesTools: true },
+					],
+				}),
+				loadConfig: { servers: [{ name: "d", config: cmd({ exposure: "deferred" }) }] },
+				ops: [{ op: "sessionStart" }, { op: "shutdown" }],
+			}),
+			mce("discovery-both", {
+				host: host({
+					tools: [
+						{ name: "codemode", reachesTools: true },
+						{ name: "tool_search", reachesTools: true },
+					],
+				}),
+				loadConfig: {
+					servers: [
+						{ name: "a", config: cmd({ exposure: "deferred" }) },
+						{ name: "b", config: cmd({ exposure: "codemode" }) },
+					],
+				},
+				ops: [{ op: "sessionStart" }, { op: "shutdown" }],
+			}),
+			mce("discovery-already-active", {
+				host: host({
+					activeTools: ["codemode", "read"],
+					tools: [{ name: "codemode", reachesTools: true }],
+				}),
+				loadConfig: { servers: [{ name: "d", config: cmd() }] },
+				ops: [{ op: "sessionStart" }, { op: "shutdown" }],
+			}),
+			mce("discovery-warning-autoenable-off", {
+				host: host({
+					activeTools: [],
+					tools: [{ name: "codemode", reachesTools: true }],
+				}),
+				loadConfig: {
+					autoEnableCodemode: false,
+					servers: [{ name: "d", config: cmd() }],
+				},
+				ops: [{ op: "sessionStart" }, { op: "shutdown" }],
+			}),
+			mce("discovery-warning-no-reaching-tool", {
+				host: host({
+					activeTools: [],
+					tools: [
+						{ name: "codemode" },
+						{ name: "tool_search", reachesTools: true },
+					],
+				}),
+				loadConfig: { servers: [{ name: "d", config: cmd() }] },
+				ops: [{ op: "sessionStart" }, { op: "shutdown" }],
+			}),
+			mce("discovery-warning-once", {
+				host: host({ activeTools: [], tools: [{ name: "codemode" }] }),
+				loadConfig: {
+					servers: [
+						{ name: "a", config: cmd() },
+						{ name: "b", config: cmd() },
+					],
+				},
+				ops: [{ op: "sessionStart" }, { op: "serversChange" }, { op: "shutdown" }],
+			}),
+			mce("registered-merge-and-override", {
+				host: host({
+					registeredServers: [
+						{ name: "reg", config: { ...cmd(), enabled: false }, extensionPath: "/ext/a.js" },
+						{ name: "cfg", config: { ...cmd(), enabled: false }, extensionPath: "/ext/b.js" },
+						{ name: "my-srv", config: { ...cmd(), enabled: false }, extensionPath: "/ext/c.js" },
+					],
+				}),
+				loadConfig: {
+					servers: [
+						{ name: "cfg", config: { ...cmd(), enabled: false }, source: "/g/mcp.json", scope: "global" },
+						{ name: "my_srv", config: { ...cmd(), enabled: false }, source: "/g/mcp.json", scope: "global" },
+					],
+				},
+				ops: [{ op: "sessionStart" }, { op: "command", args: "" }, { op: "shutdown" }],
+			}),
+			mce("servers-change-lifecycle", {
+				host: host({
+					registeredServers: [
+						{ name: "a", config: { ...cmd({ exposure: "direct" }), enabled: false }, extensionPath: "/ext/a.js" },
+					],
+				}),
+				loadConfig: { servers: [] },
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "command", args: "" },
+					{ op: "setRegistered", servers: [
+						{ name: "a", config: { ...cmd({ exposure: "deferred" }), enabled: false }, extensionPath: "/ext/a.js" },
+					] },
+					{ op: "serversChange" },
+					{ op: "command", args: "" },
+					{ op: "setRegistered", servers: [] },
+					{ op: "serversChange" },
+					{ op: "command", args: "" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("servers-change-ignores-configured", {
+				host: host({
+					registeredServers: [
+						{ name: "cfg", config: { ...cmd(), enabled: false }, extensionPath: "/ext/b.js" },
+					],
+				}),
+				loadConfig: { servers: [disabled("cfg")] },
+				ops: [{ op: "sessionStart" }, { op: "serversChange" }, { op: "command", args: "" }, { op: "shutdown" }],
+			}),
+			mce("section-remove-when-none", {
+				host: host(),
+				loadConfig: { servers: [disabled("direct", { exposure: "direct" })] },
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "beforeAgentStart", event: sectionEvent({ mcp_servers: "stale", custom: "C" }) },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("section-insert-and-order", {
+				host: host(),
+				loadConfig: {
+					servers: [
+						{ name: "b", config: cmd({ description: "Bee" }) },
+						{ name: "a", config: cmd({ exposure: "deferred" }) },
+					],
+				},
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "beforeAgentStart", event: sectionEvent({ custom: "C" }) },
+					{ op: "beforeAgentStart", event: sectionEvent({ mcp_servers: "old", custom: "C" }) },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("completions", {
+				host: host(),
+				loadConfig: { servers: [] },
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "completions", prefix: "" },
+					{ op: "completions", prefix: "lo" },
+					{ op: "completions", prefix: "  login" },
+					{ op: "completions", prefix: "logi n" },
+					{ op: "completions", prefix: "login " },
+					{ op: "completions", prefix: "reconnect " },
+					{ op: "completions", prefix: "login a b" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("shutdown-clears-status", {
+				host: host(),
+				loadConfig: { servers: [disabled("off")] },
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "shutdown" },
+					{ op: "command", args: "" },
+				],
+			}),
+		];
+	})(),
 	// ------------------------------------------------ mcp-resources (module)
 	// extensions/mcp/resources.ts: list_mcp_resources,
 	// list_mcp_resource_templates, read_mcp_resource over scripted fake

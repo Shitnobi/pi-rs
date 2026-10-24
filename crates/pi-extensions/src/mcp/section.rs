@@ -197,12 +197,10 @@ pub fn render_servers_section(servers: &[McpServerListing<'_>]) -> Option<String
         kept -= 1;
     }
     // Each description also takes a ": " separator.
-    let per_server = if kept == 0 {
-        0
-    } else {
-        let room = MAX_SERVERS_SECTION_CHARS.saturating_sub(size(kept)) / kept;
-        MAX_SERVER_DESCRIPTION_CHARS.min(room.saturating_sub(2))
-    };
+    let per_server = (MAX_SERVERS_SECTION_CHARS.saturating_sub(size(kept)) / kept.max(1))
+        .saturating_sub(2)
+        .min(MAX_SERVER_DESCRIPTION_CHARS);
+    let per_server = if kept == 0 { 0 } else { per_server };
     let lines: Vec<String> = listed[..kept]
         .iter()
         .zip(&heads)

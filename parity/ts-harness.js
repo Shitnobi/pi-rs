@@ -1662,6 +1662,108 @@ async function runModule(tool, args, cwd) {
 		}));
 		return { result: mcp.renderServersSection(servers) ?? null };
 	}
+	if (tool === "mcp-extension") {
+		const mcp = require(path.join(distDir, "extensions", "mcp", "index.js"));
+		const hostArg = args.host || {};
+		// formatStatus resolves the agent dir through getAgentDir().
+		process.env.PI_CODING_AGENT_DIR = hostArg.agentDir ?? "/home/u/.pi";
+		const host = {
+			registeredServers: hostArg.registeredServers || [],
+			cwd: hostArg.cwd ?? "/proj",
+			agentDir: hostArg.agentDir ?? "/home/u/.pi",
+			projectTrusted: hostArg.projectTrusted ?? false,
+			tools: hostArg.tools || [],
+			activeTools: hostArg.activeTools || [],
+			selectChoice: hostArg.selectChoice,
+		};
+		const log = [];
+		const ctx = {
+			cwd: host.cwd,
+			modelRegistry: undefined,
+			isProjectTrusted: () => host.projectTrusted,
+			mode: "print",
+			hasUI: false,
+			ui: {
+				notify: (message, level) => log.push("notify:" + level + ":" + message),
+				select: async (title, items) => {
+					log.push("select:" + title + ":" + JSON.stringify(items));
+					return host.selectChoice;
+				},
+			},
+		};
+		const handlers = {};
+		let command;
+		const pi = {
+			on(type, handler) {
+				(handlers[type] ||= []).push(handler);
+				return () => {};
+			},
+			registerTool() {},
+			registerToolRenderer() {},
+			registerCommand(_name, options) {
+				command = options;
+			},
+			getMcpServers: () => host.registeredServers,
+			getAllTools: () => host.tools,
+			getActiveTools: () => host.activeTools,
+			setActiveTools(names) {
+				host.activeTools = names;
+				log.push("activeTools:" + JSON.stringify(names));
+			},
+		};
+		const factory = mcp.createMcpExtension({
+			loadConfig: () => ({ servers: [], errors: [], ...(args.loadConfig ?? {}) }),
+			startupWaitMs: args.startupWaitMs ?? 10000,
+		});
+		await factory(pi);
+		const emit = async (type, event) => {
+			for (const handler of handlers[type] || []) await handler(event, ctx);
+		};
+		for (const op of args.ops || []) {
+			switch (op.op) {
+				case "sessionStart":
+					await emit("session_start", { type: "session_start", reason: "startup" });
+					log.push("sessionStart:ok");
+					break;
+				case "beforeAgentStart": {
+					const event = op.event;
+					await emit("before_agent_start", event);
+					log.push("beforeAgentStart:" + JSON.stringify(event));
+					break;
+				}
+				case "setRegistered":
+					host.registeredServers = op.servers || [];
+					log.push("setRegistered:ok");
+					break;
+				case "serversChange":
+					await emit("mcp_servers_change", { type: "mcp_servers_change" });
+					log.push("serversChange:ok");
+					break;
+				case "turnStart":
+					await emit("turn_start", { type: "turn_start" });
+					log.push("turnStart:ok");
+					break;
+				case "toolCall":
+					await emit("tool_call", op.event);
+					log.push("toolCall:ok");
+					break;
+				case "command":
+					await command.handler(op.args ?? "", ctx);
+					log.push("command:" + (op.args ?? "") + ":ok");
+					break;
+				case "completions":
+					log.push("completions:" + JSON.stringify(command.getArgumentCompletions(op.prefix ?? "") ?? null));
+					break;
+				case "shutdown":
+					await emit("session_shutdown", { type: "session_shutdown" });
+					log.push("shutdown:ok");
+					break;
+				default:
+					throw new Error("unknown mcp-extension op: " + op.op);
+			}
+		}
+		return { log };
+	}
 	if (tool === "mcp-tools") {
 		const mt = require(path.join(distDir, "extensions", "mcp", "tools.js"));
 		// Deterministic fake output saver, mirrored by the Rust harness.

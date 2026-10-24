@@ -39,6 +39,7 @@ mod mcp_config_harness;
 mod mcp_connection_harness;
 mod mcp_log_harness;
 mod mcp_resources_harness;
+mod mcp_extension_harness;
 mod mcp_section_harness;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -215,6 +216,7 @@ fn run_tool_input(name: &str, cwd: &str, input: Value) -> Result<Value, String> 
         "mcp-log" => return mcp_log_harness::run_mcp_log_harness(&input),
         "mcp-connection" => return mcp_connection_harness::run_mcp_connection_harness(&input),
         "mcp-section" => return mcp_section_harness::run(&input),
+        "mcp-extension" => return mcp_extension_harness::run(&input),
         "agent-session-events" => return session_harness::run_agent_session_events_harness(&input),
         "agent-session-tools" => {
             return session_tools_harness::run_agent_session_tools_harness(&input)
