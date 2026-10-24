@@ -3796,6 +3796,33 @@ async function runModule(tool, args, cwd) {
 						);
 						break;
 					}
+					case "bindCommandContext": {
+						if (!op.actions) {
+							runner.bindCommandContext();
+							break;
+						}
+						runner.bindCommandContext({
+							waitForIdle: async () => { log.push("commandActions.waitForIdle"); },
+							newSession: async (options) => {
+								log.push("commandActions.newSession:" + jstr([options]));
+								return { cancelled: true };
+							},
+							fork: async (entryId, options) => {
+								log.push("commandActions.fork:" + jstr([entryId, options]));
+								return { cancelled: false };
+							},
+							navigateTree: async (targetId, options) => {
+								log.push("commandActions.navigateTree:" + jstr([targetId, options]));
+								return { cancelled: false };
+							},
+							switchSession: async (sessionPath, options) => {
+								log.push("commandActions.switchSession:" + jstr([sessionPath, options]));
+								return { cancelled: true };
+							},
+							reload: async () => { log.push("commandActions.reload"); },
+						});
+						break;
+					}
 					case "onError": {
 						const id = nextErrorId++;
 						errorUnsubs.push(runner.onError((error) => {

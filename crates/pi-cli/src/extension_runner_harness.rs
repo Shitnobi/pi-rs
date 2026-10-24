@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use pi_agent::types::BoxFuture;
 use pi_core::event_bus::{create_event_bus_with_sink, EventBusController};
 use pi_session::agent_session::extension_runner::*;
 use serde_json::{json, Value};
@@ -569,6 +570,59 @@ impl ContextActions for FakeContext {
 	}
 }
 
+/// `bindCommandContext` target: records every call and returns the
+/// scripted cancelled flag (true for newSession/switchSession).
+struct FakeCommandActions {
+	log: Log,
+}
+
+impl CommandContextActions for FakeCommandActions {
+	fn wait_for_idle(&self) -> BoxFuture<'static, ()> {
+		let log = Arc::clone(&self.log);
+		Box::pin(async move {
+			log.lock().unwrap().push("commandActions.waitForIdle".to_string());
+		})
+	}
+	fn new_session(&self, options: Value) -> BoxFuture<'static, Value> {
+		let log = Arc::clone(&self.log);
+		Box::pin(async move {
+			log.lock().unwrap().push(format!("commandActions.newSession:{}", jstr(&json!([options]))));
+			json!({"cancelled": true})
+		})
+	}
+	fn fork(&self, entry_id: String, options: Value) -> BoxFuture<'static, Value> {
+		let log = Arc::clone(&self.log);
+		Box::pin(async move {
+			log.lock().unwrap().push(format!("commandActions.fork:{}", jstr(&json!([entry_id, options]))));
+			json!({"cancelled": false})
+		})
+	}
+	fn navigate_tree(&self, target_id: String, options: Value) -> BoxFuture<'static, Value> {
+		let log = Arc::clone(&self.log);
+		Box::pin(async move {
+			log.lock()
+				.unwrap()
+				.push(format!("commandActions.navigateTree:{}", jstr(&json!([target_id, options]))));
+			json!({"cancelled": false})
+		})
+	}
+	fn switch_session(&self, session_path: String, options: Value) -> BoxFuture<'static, Value> {
+		let log = Arc::clone(&self.log);
+		Box::pin(async move {
+			log.lock()
+				.unwrap()
+				.push(format!("commandActions.switchSession:{}", jstr(&json!([session_path, options]))));
+			json!({"cancelled": true})
+		})
+	}
+	fn reload(&self) -> BoxFuture<'static, ()> {
+		let log = Arc::clone(&self.log);
+		Box::pin(async move {
+			log.lock().unwrap().push("commandActions.reload".to_string());
+		})
+	}
+}
+
 fn pa_hook(
 	log: &Log,
 	method: &'static str,
@@ -757,6 +811,16 @@ async fn run_async(ops: &[Value]) -> Result<Value, String> {
 					}
 				}
 				runner.bind_core(actions, context, hooks);
+			}
+			"bindCommandContext" => {
+				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
+				let actions = match op.get("actions") {
+					None | Some(Value::Null) => None,
+					Some(Value::Object(_)) => Some(Arc::new(FakeCommandActions { log: Arc::clone(&case.log) })
+						as Arc<dyn CommandContextActions>),
+					Some(_) => return Err("bad actions".to_string()),
+				};
+				runner.bind_command_context(actions);
 			}
 			"onError" => {
 				let runner = case.runner.lock().unwrap().clone().ok_or("runner not created")?;
@@ -1081,7 +1145,7 @@ async fn run_async(ops: &[Value]) -> Result<Value, String> {
 				let first = args.first().cloned().unwrap_or(Value::Null);
 				let second = args.get(1).cloned().unwrap_or(Value::Null);
 				let result = match method {
-					"getSystemPromptOptions" => Ok(context.get_system_prompt_options()?),
+					"getSystemPromptOptions" => context.get_system_prompt_options(),
 					"waitForIdle" => context.wait_for_idle().await.map(|()| Value::Null),
 					"newSession" => context.new_session(first).await,
 					"fork" => context.fork(first.as_str().unwrap_or(""), second).await,
