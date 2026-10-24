@@ -4,4 +4,5 @@
 pub mod client;
 pub mod log;
 pub mod runtime;
+pub mod section;
 pub mod transport;

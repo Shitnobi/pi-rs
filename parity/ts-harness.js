@@ -1648,6 +1648,20 @@ async function runModule(tool, args, cwd) {
 				throw new Error("unknown mcp-servers fn: " + args.fn);
 		}
 	}
+	if (tool === "mcp-section") {
+		const mcp = require(path.join(distDir, "extensions", "mcp", "index.js"));
+		const servers = (args.servers || []).map((server) => ({
+			entry: {
+				name: server.name,
+				config: server.config,
+				source: server.source ?? "mcp.json",
+				...(server.scope !== undefined ? { scope: server.scope } : {}),
+				...(server.override !== undefined ? { override: server.override } : {}),
+			},
+			...(server.instructions !== undefined ? { connection: { instructions: server.instructions } } : {}),
+		}));
+		return { result: mcp.renderServersSection(servers) ?? null };
+	}
 	if (tool === "mcp-tools") {
 		const mt = require(path.join(distDir, "extensions", "mcp", "tools.js"));
 		// Deterministic fake output saver, mirrored by the Rust harness.

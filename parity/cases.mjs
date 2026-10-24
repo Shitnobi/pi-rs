@@ -5536,6 +5536,65 @@ export const cases = [
 		},
 	},
 
+	// ------------------------------------------------- mcp-section (module)
+	// extensions/mcp/index.ts renderServersSection: the `mcp_servers`
+	// system-prompt section (filtering, sorting, description budget,
+	// omission lines, UTF-16 truncation).
+	...(() => {
+		const ms = (name, servers) => ({ tool: "mcp-section", name: "mcs/" + name, args: { servers } });
+		const cmd = (extra = {}) => ({ command: "node", ...extra });
+		const long = (n) => "z".repeat(n);
+		const manyDescriptions = Array.from({ length: 20 }, (_, i) => ({
+			name: String.fromCharCode(97 + i),
+			config: cmd({ description: "d".repeat(240) + i }),
+		}));
+		return [
+			ms("empty", []),
+			ms("direct-only", [{ name: "a", config: cmd({ exposure: "direct" }) }]),
+			ms("disabled-only", [{ name: "a", config: cmd({ enabled: false }) }]),
+			ms("hidden-only", [{ name: "a", config: cmd({ exposure: "hidden" }) }]),
+			ms("sorted-mixed", [
+				{ name: "beta", config: cmd({ description: "  Second\nmore " }) },
+				{ name: "alpha", config: cmd({ exposure: "deferred", description: "First" }) },
+				{ name: "gamma", config: { url: "https://example.test/mcp" }, instructions: "Remote" },
+			]),
+			ms("instructions-fallback", [
+				{ name: "a", config: cmd({ description: "   " }), instructions: "Instr\nsecond" },
+				{ name: "b", config: cmd(), instructions: "\nleading newline" },
+			]),
+			ms("tool-exposure-indirect", [
+				{ name: "a", config: cmd({ exposure: "direct", toolExposure: { t: "codemode" } }) },
+				{ name: "b", config: cmd({ exposure: "hidden", toolExposure: { t: "deferred" } }) },
+			]),
+			ms("multiline-description", [
+				{ name: "a", config: cmd({ description: "First line\nsecond line" }) },
+			]),
+			ms("crlf-description", [{ name: "a", config: cmd({ description: "First\r\nsecond" }) }]),
+			ms("long-description", [{ name: "a", config: cmd({ description: "d".repeat(400) }) }]),
+			ms("emoji-description", [
+				{ name: "a", config: cmd({ description: "d".repeat(249) + "🔥tail" }) },
+			]),
+			ms("one-omitted", [
+				{ name: "a", config: cmd() },
+				{ name: long(4000), config: cmd() },
+			]),
+			ms("all-omitted", [
+				{ name: "0" + long(4000), config: cmd() },
+				{ name: "1" + long(4000), config: cmd() },
+				{ name: "2" + long(4000), config: cmd() },
+			]),
+			ms("description-budget-shared", manyDescriptions),
+			ms("scope-and-override", [
+				{
+					name: "a",
+					config: cmd({ description: "Project" }),
+					source: "/proj/.pi/mcp.json",
+					scope: "global",
+					override: "/proj/.pi/mcp.json",
+				},
+			]),
+		];
+	})(),
 	// ------------------------------------------------ mcp-resources (module)
 	// extensions/mcp/resources.ts: list_mcp_resources,
 	// list_mcp_resource_templates, read_mcp_resource over scripted fake

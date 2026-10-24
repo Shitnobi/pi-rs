@@ -7,5 +7,6 @@ repository.workspace = true
 
 [dependencies]
 pi-core = { path = "../pi-core" }
+pi-session = { path = "../pi-session" }
 serde = { workspace = true }
 serde_json = { workspace = true }
