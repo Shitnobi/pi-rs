@@ -13591,6 +13591,191 @@ cases.push(
 		{ op: "ctxRead", field: "cwd" },
 		{ op: "ctxRead", field: "thinkingLevel" },
 	]),
+	// ---- tranche 6: emitter edge matrix (batch 2) ----------------------
+	exr("emit-tool-result-null-replaces", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "tool_result", handler: { id: 1, returns: { content: null, structuredContent: null, details: null, isError: null } } },
+			{ step: "on", event: "tool_result", handler: { id: 2, eventReads: ["content", "structuredContent", "details", "isError"], returns: { usage: null } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitToolResult", event: { type: "tool_result", toolCallId: "c1", content: [{ type: "text", text: "old" }], details: { d: 1 }, structuredContent: { s: 1 }, isError: false, usage: { tokens: 1 } } },
+	]),
+	exr("emit-tool-result-in-place", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "tool_result", handler: { id: 1, mutate: [{ path: ["content"], value: "MUT" }] } },
+			{ step: "on", event: "tool_result", handler: { id: 2, eventReads: ["content"], returns: { details: { d: 2 } } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitToolResult", event: { type: "tool_result", content: [{ type: "text", text: "old" }], details: { d: 1 } } },
+	]),
+	exr("emit-tool-result-throw-continues", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "tool_result", handler: { id: 1, throws: "tr boom" } },
+			{ step: "on", event: "tool_result", handler: { id: 2, returns: { isError: true } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "emitToolResult", event: { type: "tool_result", content: [] } },
+	]),
+	exr("emit-tool-call-merge", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "tool_call", handler: { id: 1, returns: { block: false, description: "d1" } } },
+			{ step: "on", event: "tool_call", handler: { id: 2, eventReads: ["type", "toolName"], returns: { args: { a: 1 } } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitToolCall", event: { type: "tool_call", toolName: "read" } },
+	]),
+	exr("emit-tool-call-in-place", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "tool_call", handler: { id: 1, mutate: [{ path: ["toolName"], value: "bash" }] } },
+			{ step: "on", event: "tool_call", handler: { id: 2, eventReads: ["toolName"] } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitToolCall", event: { type: "tool_call", toolName: "read" } },
+	]),
+	exr("emit-message-end-role-mismatch", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "message_end", handler: { id: 1, returns: { message: { role: "assistant", content: "x" } } } },
+			{ step: "on", event: "message_end", handler: { id: 2, eventReads: ["message.content"], returns: { message: { role: "user", content: "y" } } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "emitMessageEnd", event: { type: "message_end", message: { role: "user", content: "orig" } } },
+	]),
+	exr("emit-message-end-in-place", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "message_end", handler: { id: 1, mutate: [{ path: ["message", "content"], value: "MUT" }] } },
+			{ step: "on", event: "message_end", handler: { id: 2, eventReads: ["message.content"], returns: { message: { role: "user", content: "final" } } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitMessageEnd", event: { type: "message_end", message: { role: "user", content: "orig" } } },
+	]),
+	exr("emit-provider-request-null-replace", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "before_provider_request", handler: { id: 1, returns: null } },
+			{ step: "on", event: "before_provider_request", handler: { id: 2, eventReads: ["payload"], returns: { second: true } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitBeforeProviderRequest", payload: { p: 0 } },
+	]),
+	exr("emit-provider-request-in-place", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "before_provider_request", handler: { id: 1, mutate: [{ path: ["payload", "p"], value: 9 }] } },
+			{ step: "on", event: "before_provider_request", handler: { id: 2, eventReads: ["payload.p"] } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitBeforeProviderRequest", payload: { p: 0 } },
+	]),
+	exr("emit-provider-headers-chain", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "before_provider_headers", handler: { id: 1, mutate: [{ path: ["headers", "authorization"], value: "a" }] } },
+			{ step: "on", event: "before_provider_headers", handler: { id: 2, eventReads: ["headers.authorization"], mutate: [{ path: ["headers", "accept"], value: "b" }], returns: { ignored: true } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitBeforeProviderHeaders", headers: { accept: "old" } },
+	]),
+	exr("emit-boundary-continue", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "session_before_compact", handler: { id: 1, returns: { entries: [{ a: 1 }], continue: true } } },
+			{ step: "on", event: "session_before_compact", handler: { id: 2, eventReads: ["entries", "continue", "context"], returns: { entries: [] } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitBoundary", baseEvent: { type: "session_before_compact" }, script: [{ context: { c: 0 } }, { context: { c: 1 } }, { context: { c: 2 } }] },
+	]),
+	exr("emit-boundary-invalid", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "session_before_compact", handler: { id: 1, returns: { entries: [{ a: 1 }] } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "emitBoundary", baseEvent: { type: "session_before_compact" }, script: [{ context: { c: 0 } }, { throws: "bad entries" }] },
+	]),
+	exr("emit-input-handled", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "input", handler: { id: 1, eventReads: ["text", "images", "streamingBehavior"], returns: { action: "handled", text: "x" } } },
+			{ step: "on", event: "input", handler: { id: 2, returns: { action: "transform", text: "ignored" } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitInput", text: "hi", images: [{ data: "old" }], source: "user", streamingBehavior: "queued" },
+	]),
+	exr("emit-input-unchanged", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "input", handler: { id: 1, returns: { action: "transform", text: "hi" } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitInput", text: "hi", source: "rpc" },
+	]),
+	exr("emit-input-images-transform", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "input", handler: { id: 1, eventReads: ["images"], returns: { action: "transform", images: [{ data: "x" }] } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitInput", text: "hi", images: [{ data: "old" }], source: "user" },
+	]),
+	exr("emit-user-bash-result-valid", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "user_bash", handler: { id: 1, returns: { result: { output: "o", exitCode: 0, cancelled: false, truncated: false } } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitUserBash", event: { command: "ls" } },
+	]),
+	// `operations.exec` must be a FUNCTION in TS (JSON cannot carry one), so
+	// an empty object is the modelable invalid shape.
+	exr("emit-user-bash-invalid-operations", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "user_bash", handler: { id: 1, returns: { operations: {} } } },
+		] },
+		{ op: "createRunner" },
+		{ op: "onError" },
+		{ op: "bindCore" },
+		{ op: "emitUserBash", event: { command: "ls" } },
+	]),
+	exr("emit-context-in-place", [
+		{ op: "load", path: "/ext/a.js", script: [
+			{ step: "on", event: "context", handler: { id: 1, mutate: [{ path: ["messages"], op: "push", value: { role: "user", content: "m" } }] } },
+			{ step: "on", event: "context_with_system", handler: { id: 2, eventReads: ["messages.0.role", "messages.1.content", "messages.2.content"] } },
+		] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "emitContext", messages: [{ role: "system", content: "S", timestamp: 1 }, { role: "user", content: "old" }] },
+	]),
+	exr("api-actions-more", [
+		{ op: "load", path: "/ext/a.js", script: [{ step: "captureApi", key: "a" }] },
+		{ op: "createRunner" },
+		{ op: "bindCore" },
+		{ op: "apiCall", key: "a", method: "getCommands" },
+		{ op: "apiCall", key: "a", method: "getAllTools" },
+		{ op: "apiCall", key: "a", method: "getSettings" },
+		{ op: "apiCall", key: "a", method: "setLabel", args: ["e1", "lbl"] },
+		{ op: "apiCall", key: "a", method: "appendEntry", args: ["ct", { d: 1 }] },
+		{ op: "apiCall", key: "a", method: "sendUserMessage", args: ["hi", {}] },
+		{ op: "apiCall", key: "a", method: "setThinkingLevel", args: ["low"] },
+		{ op: "apiCall", key: "a", method: "getSessionName" },
+	]),
+	exr("ctx-reads-model", [
+		{ op: "load", path: "/ext/a.js", script: [] },
+		{ op: "createRunner" },
+		{ op: "bindCore", contextActions: { isIdle: true, isProjectTrusted: true, model: { provider: "p", id: "m" } } },
+		{ op: "ctxRead", field: "getModel" },
+		{ op: "ctxRead", field: "isIdle" },
+		{ op: "commandContext", method: "getSystemPromptOptions" },
+	]),
 	exr("mcp-pre-bind-report", [
 		{
 			op: "load",

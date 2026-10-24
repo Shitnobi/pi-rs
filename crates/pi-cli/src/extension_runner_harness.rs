@@ -150,15 +150,54 @@ async fn settle_ui_prompts(case: &Arc<CaseInner>) {
 }
 
 /// Assign `value[path…]` in place (handler `mutate` steps).
-fn set_path(value: &mut Value, path: &[String], new_value: Value) {
-	if path.len() == 1 {
-		if let Some(object) = value.as_object_mut() {
-			object.insert(path[0].clone(), new_value);
-		}
-		return;
+/// One path segment: object key, or array index (`"0"`), like JS `v[part]`.
+fn get_part<'a>(value: &'a Value, part: &str) -> Option<&'a Value> {
+	match value {
+		Value::Array(items) => part.parse::<usize>().ok().and_then(|index| items.get(index)),
+		_ => value.get(part),
 	}
-	if let Some(next) = value.get_mut(&path[0]) {
-		set_path(next, &path[1..], new_value);
+}
+
+fn get_part_mut<'a>(value: &'a mut Value, part: &str) -> Option<&'a mut Value> {
+	match value {
+		Value::Array(items) => part
+			.parse::<usize>()
+			.ok()
+			.and_then(move |index| items.get_mut(index)),
+		_ => value.get_mut(part),
+	}
+}
+
+/// One handler `mutate` step: `set` (default) or the array in-place ops
+/// (`push`/`unshift`/`pop`/`shift`) used to model TS array edits.
+fn apply_mutation(event: &mut Value, path: &[String], op: &str, new_value: Value) {
+	let (last, parents) = match path.split_last() {
+		Some(parts) => parts,
+		None => return,
+	};
+	let mut target = event;
+	for part in parents {
+		match get_part_mut(target, part) {
+			Some(next) => target = next,
+			None => return,
+		}
+	}
+	match (op, get_part_mut(target, last)) {
+		("set", Some(slot)) => *slot = new_value,
+		("set", None) => {
+			if let Some(object) = target.as_object_mut() {
+				object.insert(last.clone(), new_value);
+			}
+		}
+		("push", Some(Value::Array(items))) => items.push(new_value),
+		("unshift", Some(Value::Array(items))) => items.insert(0, new_value),
+		("pop", Some(Value::Array(items))) => {
+			items.pop();
+		}
+		("shift", Some(Value::Array(items))) => {
+			items.remove(0);
+		}
+		_ => {}
 	}
 }
 
@@ -203,7 +242,7 @@ fn make_handler(spec: &Value, log: &Log) -> Result<ExtensionHandler, String> {
 				let mut value = Some(event.clone());
 				for part in path.split('.') {
 					value = match value {
-						Some(current) => current.get(part).cloned(),
+						Some(current) => get_part(&current, part).cloned(),
 						None => None,
 					};
 				}
@@ -225,9 +264,11 @@ fn make_handler(spec: &Value, log: &Log) -> Result<ExtensionHandler, String> {
 				if path.is_empty() {
 					continue;
 				}
-				set_path(
+				let op = change.get("op").and_then(Value::as_str).unwrap_or("set");
+				apply_mutation(
 					&mut event,
 					&path,
+					op,
 					change.get("value").cloned().unwrap_or(Value::Null),
 				);
 			}

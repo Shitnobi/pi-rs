@@ -3603,7 +3603,14 @@ async function runModule(tool, args, cwd) {
 					const path = Array.isArray(change.path) ? change.path : [change.path];
 					let target = event;
 					for (const part of path.slice(0, -1)) target = target[part];
-					target[path[path.length - 1]] = change.value;
+					const key = path[path.length - 1];
+					switch (change.op || "set") {
+						case "push": target[key].push(change.value); break;
+						case "unshift": target[key].unshift(change.value); break;
+						case "pop": target[key].pop(); break;
+						case "shift": target[key].shift(); break;
+						default: target[key] = change.value;
+					}
 				}
 				if (spec.throws !== undefined) throw spec.throws;
 				return spec.returns;

@@ -2106,13 +2106,6 @@ impl ExtensionRunner {
 				.as_ref()
 				.map(|actions| actions.get_system_prompt())
 				.unwrap_or_default())),
-			"getSystemPromptOptions" => Ok(actions
-				.as_ref()
-				.and_then(|actions| actions.get_system_prompt_options())
-				.unwrap_or_else(|| {
-					normalize_options_raw(&json!({"cwd": self.shared.cwd}))
-						.unwrap_or_else(|_| json!({}))
-				})),
 			_ => Ok(Value::Null),
 		}
 	}
@@ -2194,9 +2187,18 @@ impl ExtensionRunner {
 		for (extension_path, handlers) in self.snapshot_handlers("tool_result") {
 			for (_, handler) in handlers {
 				match handler(current_event.clone(), ctx.clone()).await {
-					Ok(HandlerOutcome { result: Some(handler_result), .. })
-						if js_truthy(&handler_result) =>
-					{
+					Ok(HandlerOutcome { event: returned_event, result }) => {
+						// TS passes the SAME `currentEvent` object to every
+						// handler: in-place edits are visible downstream and in
+						// the merged result even when the handler returns
+						// nothing.
+						current_event = returned_event;
+						let Some(handler_result) = result else {
+							continue;
+						};
+						if !js_truthy(&handler_result) {
+							continue;
+						}
 						if let Some(content) = handler_result.get("content") {
 							set_field(&mut current_event, "content", content.clone());
 							if handler_result.get("structuredContent").is_none() {
@@ -2223,7 +2225,6 @@ impl ExtensionRunner {
 							modified = true;
 						}
 					}
-					Ok(_) => {}
 					Err(error) => {
 						self.emit_error(&json!({
 							"extensionPath": extension_path,
@@ -2250,10 +2251,12 @@ impl ExtensionRunner {
 	/// truthy `block` short-circuits; handler throws are NOT caught.
 	pub async fn emit_tool_call(&self, event: Value) -> Result<Option<Value>, String> {
 		let ctx = CtxView::Runner(Arc::clone(&self.shared));
+		let mut current_event = event;
 		let mut result: Option<Value> = None;
 		for (_, handlers) in self.snapshot_handlers("tool_call") {
 			for (_, handler) in handlers {
-				let outcome = handler(event.clone(), ctx.clone()).await?;
+				let outcome = handler(current_event.clone(), ctx.clone()).await?;
+				current_event = outcome.event;
 				if let Some(handler_result) = outcome.result {
 					if js_truthy(&handler_result) {
 						if handler_result.get("block").map(js_truthy).unwrap_or(false) {
@@ -2276,8 +2279,16 @@ impl ExtensionRunner {
 			for (_, handler) in handlers {
 				let event = json!({"type": "before_provider_request", "payload": current.clone()});
 				match handler(event, ctx.clone()).await {
-					Ok(HandlerOutcome { result: Some(result), .. }) => current = result,
-					Ok(_) => {}
+					Ok(HandlerOutcome { event: returned, result }) => {
+						// `event.payload` aliases `currentPayload`: in-place
+						// edits persist; a non-undefined result replaces it.
+						if let Some(payload) = returned.get("payload") {
+							current = payload.clone();
+						}
+						if let Some(result) = result {
+							current = result;
+						}
+					}
 					Err(error) => {
 						self.emit_error(&json!({
 							"extensionPath": extension_path,
@@ -2670,14 +2681,21 @@ impl ExtensionRunner {
 					object.insert("message".to_string(), current_message.clone());
 				}
 				match handler(current_event, ctx.clone()).await {
-					Ok(HandlerOutcome { result: handler_result, .. }) => {
+					Ok(HandlerOutcome { event: returned, result: handler_result }) => {
+						// `event.message` aliases `currentMessage`: in-place
+						// edits persist even when the handler returns nothing.
+						let in_place = returned.get("message").cloned().unwrap_or_else(|| current_message.clone());
 						let replacement = handler_result
 							.as_ref()
 							.and_then(|result| result.get("message"))
 							.filter(|message| js_truthy(message))
-						 .cloned();
-						let Some(replacement) = replacement else { continue };
+							.cloned();
+						let Some(replacement) = replacement else {
+							current_message = in_place;
+							continue;
+						};
 						if replacement.get("role") != current_message.get("role") {
+							current_message = in_place;
 							self.emit_error(&json!({
 								"extensionPath": extension_path,
 								"event": "message_end",
@@ -4098,9 +4116,8 @@ mod tests {
 		assert_eq!(runner.ctx_read("nope").unwrap(), Value::Null);
 		// thinkingLevel = the loader stub pre-bind.
 		assert_eq!(runner.ctx_read("thinkingLevel").unwrap_err(), NOT_INITIALIZED);
-		// getSystemPromptOptions falls back to normalize({cwd}).
-		let options = runner.ctx_call_args("getSystemPromptOptions", &[]).unwrap();
-		assert_eq!(options["cwd"], json!("/proj"));
+		// `getSystemPromptOptions` is command-context-only (TS createContext
+		// has no such member; covered by the command-context test).
 
 		// post-bind delegation.
 		runner.bind_core(
