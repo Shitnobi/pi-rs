@@ -2,25 +2,33 @@
 
 ## ⚠️ Current checkpoint (2026-10-24) — resume here
 
-**State: phase 4 tranche 6 (extension-runner rest) COMPLETE and
-parity-green (2913/2913).** All 18 checklist items landed in
-`docs/plans/phase4-tranche6-extension-runner-rest.md` (read that
-plan's Addenda A–F first — they are the decision record).
-Workspace tests **2116 passed, 0 failed** (photon fixtures
-regenerated in-call); clippy has no new warnings in touched
-files.
+**State: phase 4 tranche 7 (built-in MCP extension) IN PROGRESS;
+10a–10c landed, parity-green (2943/2943).** Read
+`docs/plans/phase4-tranche7-mcp-extension.md` first — it is the
+design/decision record and the slice list. Landed:
 
-Tranche-6 commits: `396a92a` (exec), `c0973a7` (system_prompt raw),
-`acc4a07` (Addendum E), `8ed8738`..`55f9fc1` (items 3–14),
-`942c6ba`/`e7d3864`/`84ff5f7` (items 15–16: harness ops + 60 new
-exr/ cases incl. bindCommandContext, emit edge matrix, live-ref
-read-backs), plus the docs commit for this checkpoint.
+- 10a `5860e20` — `mcp/section.rs` (`render_servers_section`,
+  exposure predicates, UTF-16 budgets/truncation, omission lines);
+  `mcp-section` harness; 15 `mcs/` cases.
+- 10b `8f906a7` — `mcp/status.rs` (`describe_state`,
+  `attention_rank`/`sort_for_menu`, `describe_transport`,
+  `format_status`, `argument_completions`, `MCP_USAGE`); unit tests.
+- 10c `f6d944d` — `mcp/extension.rs` state machine + `McpHost`
+  seam (`session_start`, config-vs-registered merge by namespace,
+  discovery activation + warnings, `mcp_servers_change`,
+  `before_agent_start` section injection, `session_shutdown`,
+  `/mcp` status/usage/picker paths, completions); new
+  `mcp-extension` harness (TS drives the real factory with a fake
+  pi/ctx); 15 `mce/` cases.
 
-**Next up** (per `docs/plans/phase3-mcp-extensions.md` steps 7-10
-and the roadmap tail): mcp extension wiring + mcp-section,
-tools/* slices, then the shared typebox-walker refactor
-(extension discovery/command execution remain later-stage items
-inside tranche 7 per that plan).
+Workspace tests **2129 passed, 0 failed** (photon fixtures
+regenerated in-call); clippy clean on all new code.
+
+**Next up:** 10d — refactor `McpServerConnection` to `Send`
+(`Rc<RefCell>` → `Arc<Mutex>`, callback event queue) first, then
+connections/tool registration/startup waits; 10e `/mcp` actions
+(OAuth/updateConfig seams); 10f runner adapter; 10g docs. See the
+plan's §3.3 for the `!Send`/handler-bounds decision.
 
 **Toolchain note:** bash must export
 `RUSTUP_HOME=$HOME/AI/.rustup CARGO_HOME=$HOME/AI/.cargo PATH=$HOME/AI/.cargo/bin:$PATH`
@@ -35,7 +43,7 @@ scripts/gen-photon-ground-truth.mjs — its header lists the
 parity/fixtures/ copies) AND run `cargo test -p pi-photon` in the
 SAME bash call. A plain `cargo test --workspace` from a fresh
 call fails only that test — environmental, not a regression.
-(Last full run: 2116 passed, 0 failed, fixtures in place.)
+(Last full run: 2129 passed, 0 failed, fixtures in place.)
 
 ## Previous checkpoint (2026-10-20) — superseded
 
@@ -1661,7 +1669,20 @@ pure logic: `mcp-servers.ts`, mcp tools/resources, tool-search), `phase3-agent-s
       errors/mutation. Suite **2913/2913**; workspace 2116
       green; pi-session/pi-cli unit tests green.
 - [ ] Remaining roadmap (see docs/plans/phase3-mcp-extensions.md
-      steps 7-10): mcp extension wiring + mcp-section, tools/*
-      slices, typebox-walker refactor. (Tranche 6 above closed the
-      extension-runner emitters/contexts/action-surface slices;
-      extension discovery + command/tool *execution* stay open.)
+      steps 7-10): mcp extension wiring (tranche 7, in progress),
+      tools/* slices, typebox-walker refactor. (Tranche 6 above
+      closed the extension-runner emitters/contexts/action-surface
+      slices; extension discovery + command/tool *execution* stay
+      open.)
+- [~] **Phase 4 tranche 7 — built-in MCP extension** (step 10).
+      Plan/decision record: `docs/plans/phase4-tranche7-mcp-extension.md`.
+      10a section (pure render, `mcs/` 15), 10b status/completions
+      (unit-tested), 10c lifecycle state machine + `McpHost` +
+      `mcp-extension` harness (`mce/` 15) are landed. Remaining:
+      10d Send refactor of `McpServerConnection` then
+      connections/`registerTools`/`createMcpToolDefinition`/
+      resource-exposure sync/startup waits; 10e `/mcp`
+      login/logout/reconnect/enable/exposure + `updateConfig` seam;
+      10f `ExtensionApi` runner adapter; 10g docs. Deferred:
+      real transports, OAuth flows, TUI manager, tool renderers.
+      Suite **2943/2943**; workspace 2129 green.
