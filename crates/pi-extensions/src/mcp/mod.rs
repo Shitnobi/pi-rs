@@ -5,4 +5,5 @@ pub mod client;
 pub mod log;
 pub mod runtime;
 pub mod section;
+pub mod status;
 pub mod transport;
