@@ -38,7 +38,7 @@ design/decision record and the slice list. Landed:
   instructions section, tools/namespaces/annotations, collisions,
   resources, servers-change add/remove/hide, shutdown).
 
-Workspace tests **2129 passed, 0 failed** (photon fixtures
+Workspace tests **2130 passed, 0 failed** (photon fixtures
 regenerated in-call); clippy clean on all new code.
 
 **Next up:** 10e `/mcp` actions with connections — `login`/`logout`
@@ -65,7 +65,7 @@ scripts/gen-photon-ground-truth.mjs — its header lists the
 parity/fixtures/ copies) AND run `cargo test -p pi-photon` in the
 SAME bash call. A plain `cargo test --workspace` from a fresh
 call fails only that test — environmental, not a regression.
-(Last full run: 2129 passed, 0 failed, fixtures in place.)
+(Last full run: 2130 passed, 0 failed, fixtures in place.)
 
 ## Previous checkpoint (2026-10-20) — superseded
 
