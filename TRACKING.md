@@ -3,7 +3,7 @@
 ## ⚠️ Current checkpoint (2026-10-24) — resume here
 
 **State: phase 4 tranche 7 (built-in MCP extension) IN PROGRESS;
-10a–10d landed, parity-green (2953/2953).** Read
+10a–10e (non-TUI) landed, parity-green (2957/2957).** Read
 `docs/plans/phase4-tranche7-mcp-extension.md` first — it is the
 design/decision record and the slice list. Landed:
 
@@ -29,7 +29,7 @@ design/decision record and the slice list. Landed:
   display state, `mcp_servers_change` close/connect, shutdown close
   ordering, `before_agent_start` instructions + flush,
   `tool_call` routing, `/mcp` pending flushes.
-- 10d tools (this commit) — `McpToolRegistration`
+- 10d tools `36c638e` — `McpToolRegistration`
   (`createMcpToolDefinition` pure fields) via
   `McpHost::register_tool`, `register_tools`/`hide_tools`
   (owners, name collisions, configured exposures, hidden
@@ -37,26 +37,28 @@ design/decision record and the slice list. Landed:
   logging in the harness; mce/ 25 cases (connect, failure report,
   instructions section, tools/namespaces/annotations, collisions,
   resources, servers-change add/remove/hide, shutdown).
+- 10e (this commit) — `/mcp login` has-UI gate, `logout` no-store
+  message, `reconnect` (reconnect + tool re-registration +
+  `ensureDiscoveryActive` + state notify, error messages); `McpHost::has_ui`;
+  mce/ 29 cases. Enable/disable/exposure/`updateConfig` stay with the TUI
+  manager.
 
 Workspace tests **2130 passed, 0 failed** (photon fixtures
 regenerated in-call); clippy clean on all new code.
 
-**Next up:** 10e `/mcp` actions with connections — `login`/`logout`
-(OAuth seams), `reconnect` (then `ensureDiscoveryActive` + the
-"Reconnected…" notify), enable/disable (project overrides,
-`hide_tools`, close ordering), exposure changes (`register_tools`
-re-run, `syncResourceTools`, active-tool filtering), `updateConfig`
-seam; TUI manager stays out. Then 10f runner adapter (`ExtensionApi`
-adapter: `on`, `register_command`, `register_tool` from
-`McpToolRegistration` incl. execute via `convertMcpResult` +
-`get_client`, `getMcpServers`, UI, default transports/config/log/
-credentials) and 10g docs. See plan §3.3/§3.5.
+**Next up:** 10f runner adapter (`ExtensionApi` adapter: `on`,
+`register_command`, `register_tool` from `McpToolRegistration` incl.
+execute via `convertMcpResult` + the connection's `call_tool`,
+`getMcpServers`, UI, default transports/config/log/credentials), so
+`pi-cli` can load the built-in extension; then 10g docs. Manager-only
+actions (enable/disable/exposure/`updateConfig`) and OAuth/TUI stay
+deferred with `ui.ts`. See plan §3.3–§3.6.
 
 **Toolchain note:** bash must export
 `RUSTUP_HOME=$HOME/AI/.rustup CARGO_HOME=$HOME/AI/.cargo PATH=$HOME/AI/.cargo/bin:$PATH`
 (cargo lives in ~/AI, not ~/.cargo, because of sandbox access guards).
 Parity: `node parity/run-parity.mjs` (PI_REPO default
-`/home/shinobi/AI/pi-repo`). Full run: 2953/2953.
+`/home/shinobi/AI/pi-repo`). Full run: 2957/2957.
 
 **Sandbox note (bwrap):** every bash call gets a FRESH private
 /tmp. The pi-photon `ground_truth_byte_parity` test reads

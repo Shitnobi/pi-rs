@@ -6043,6 +6043,88 @@ export const cases = [
 					{ op: "shutdown" },
 				],
 			}),
+			mce("reconnect", {
+				host: host(),
+				loadConfig: {
+					servers: [configured("r", cmd({ exposure: "direct" }))],
+				},
+				transports: [
+					{
+						sendSteps: connectSends(initResult({ tools: {} }), [
+							tool("one", { type: "object" }),
+						]),
+					},
+					{
+						sendSteps: connectSends(initResult({ tools: {} }), [
+							tool("one", { type: "object" }),
+							tool("two", { type: "object" }),
+						]),
+					},
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "command", args: "reconnect" },
+					{ op: "command", args: "" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("reconnect-failed", {
+				host: host(),
+				loadConfig: {
+					servers: [configured("r", cmd({ exposure: "direct" }))],
+				},
+				transports: [
+					{
+						sendSteps: connectSends(initResult({ tools: {} }), [
+							tool("one", { type: "object" }),
+						]),
+					},
+					{ sendSteps: [[rpcErr(1, -32603, "boom")]] },
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "command", args: "reconnect" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("login-requires-ui", {
+				host: host(),
+				loadConfig: {
+					servers: [configured("web", { url: "https://example.test/mcp" })],
+				},
+				transports: [
+					{
+						sendSteps: connectSends(initResult({ tools: {} }), []),
+					},
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "command", args: "login" },
+					{ op: "command", args: "shutdown" },
+				],
+			}),
+			mce("logout-no-stored-credentials", {
+				// `signOut` constructs the OAuth credential store, which
+				// creates the agent dir in the TS distribution.
+				host: host({ agentDir: "/tmp/mce-agent" }),
+				loadConfig: {
+					servers: [configured("web", { url: "https://example.test/mcp" })],
+				},
+				transports: [
+					{
+						sendSteps: connectSends(initResult({ tools: {} }), []),
+					},
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "command", args: "logout" },
+					{ op: "shutdown" },
+				],
+			}),
 			mce("shutdown-clears-status", {
 				host: host(),
 				loadConfig: { servers: [disabled("off")] },

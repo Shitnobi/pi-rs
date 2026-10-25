@@ -56,6 +56,7 @@ struct HostState {
     tools: Vec<Value>,
     active_tools: Vec<String>,
     select_choice: Option<String>,
+    has_ui: bool,
     log: Vec<String>,
 }
 
@@ -91,6 +92,9 @@ impl McpHost for HarnessHost {
             .unwrap()
             .log
             .push(format!("notify:{level}:{message}"));
+    }
+    fn has_ui(&self) -> bool {
+        self.0.lock().unwrap().has_ui
     }
     fn register_tool(&self, definition: &McpToolRegistration) {
         self.0.lock().unwrap().log.push(format!(
@@ -189,6 +193,7 @@ pub fn run(input: &Value) -> Result<Value, String> {
             .map(|names| names.iter().filter_map(Value::as_str).map(str::to_string).collect())
             .unwrap_or_default(),
         select_choice: host_args.get("selectChoice").and_then(Value::as_str).map(str::to_string),
+        has_ui: host_args.get("hasUI").and_then(Value::as_bool).unwrap_or(false),
         log: Vec::new(),
     }));
     let host = HarnessHost(Arc::clone(&state));

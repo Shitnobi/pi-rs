@@ -1675,6 +1675,7 @@ async function runModule(tool, args, cwd) {
 			tools: hostArg.tools || [],
 			activeTools: hostArg.activeTools || [],
 			selectChoice: hostArg.selectChoice,
+			hasUI: hostArg.hasUI ?? false,
 		};
 		const log = [];
 		const ctx = {
@@ -1682,7 +1683,7 @@ async function runModule(tool, args, cwd) {
 			modelRegistry: undefined,
 			isProjectTrusted: () => host.projectTrusted,
 			mode: "print",
-			hasUI: false,
+			hasUI: host.hasUI,
 			ui: {
 				notify: (message, level) => log.push("notify:" + level + ":" + message),
 				select: async (title, items) => {

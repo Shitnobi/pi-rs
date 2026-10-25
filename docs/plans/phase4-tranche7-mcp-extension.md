@@ -23,7 +23,7 @@ its lifecycle, its tool registration, and `/mcp`.
 | `tool_call` reach/owner/resource waiting | 1191–1211 | connections, tool owners | **10d** |
 | `turn_start` sign-in retry, `mcp_servers_change`, `session_shutdown` close ordering | 1212–1259 | connections, credentials | **10d** (sign-in retry stays with 10e/OAuth) |
 | `registerTools` / `hideTools` / resource-tool exposure sync | 387–530 | `createMcpToolDefinition`, resource defs, registry | **10d** (`McpToolRegistration`; execution in 10f) |
-| `/mcp` command: status, picker, login/logout/reconnect, enable/exposure, manager | 1040–1350, `ui.ts` | OAuth, updateConfig, TUI | 10e (non-TUI empty/usage paths done in 10c) |
+| `/mcp` command: status, picker, login/logout/reconnect, enable/exposure, manager | 1040–1350, `ui.ts` | OAuth, updateConfig, TUI | **10e** non-TUI done (login/logout/reconnect); enable/disable/exposure/updateConfig are manager-only → deferred with `ui.ts` |
 | Tool renderers (`registerToolRenderer`) | 383 | TUI | deferred (renderers are TUI-only in this port) |
 
 ## 2. Slices
@@ -45,9 +45,11 @@ its lifecycle, its tool registration, and `/mcp`.
   startups, `registerTools`/`hideTools`/`createMcpToolDefinition` pure fields
   (`McpToolRegistration`), resource-tool exposure sync, `tool_call` routing,
   close ordering.
-- **10e — `/mcp` actions**: picker with connections, `login`/`logout`
-  (OAuth seams), `reconnect`, enable/disable (+ project overrides),
-  exposure changes, `updateConfig`; the TUI manager (`ui.ts`) stays out.
+- **10e — `/mcp` actions** (non-TUI landed): picker with connections,
+  `login` (has-UI gate), `logout` (no-store message), `reconnect` (reconnect
+  + re-register tools + `ensureDiscoveryActive` + state notify), tests.
+  Enable/disable, exposure changes and `updateConfig` are called only from
+  the TUI manager, so they stay out with `ui.ts`; OAuth sign-in flows too.
 - **10f — runner adapter**: register the factory with `ExtensionApi`
   (`on`, `register_command`, `get_mcp_servers`, runtime actions, UI), so
   `pi-cli` can load the built-in extension.
@@ -128,6 +130,26 @@ does nothing where the TS launches background work:
 The harness cases were written against those boundaries; 10d replaced them
 with a scripted transport factory plus a `settle` op, so enabled servers and
 connection state are now covered too.
+
+### 3.6 10e findings
+
+- `reconnect` is synchronous: call `McpServerConnection::reconnect()`, drain
+  the snapshot queue (re-registers tools, hidden re-registrations for
+  dropped ones), then `ensureDiscoveryActive` and the
+  `Reconnected to MCP server "x" (connected · N tools).` notify; errors are
+  `McpErrorKind::message()` (`MCP server "x" failed to connect: …`), the
+  same string the TS rejects with.
+- `login` needs `ctx.hasUI`; `McpHost` gained `has_ui()`. Without a UI the
+  TS notifies `Signing in to MCP server "x" requires interactive mode.`
+  before any OAuth work. With a UI both branches (manager / `signIn`) are
+  deferred.
+- `logout` constructs the OAuth credential store in the TS, which creates
+  the agent directory; the parity case pins `agentDir` under `/tmp` so the
+  TS side can run. With no store the TS removes nothing and notifies
+  `No stored credentials for MCP server "x".`
+- Enable/disable/exposure (`setEnabled`/`setExposure`) and `updateConfig`
+  are only reachable from the manager; they are not ported yet (the state
+  helpers `saveConfig` included).
 
 ### 3.5 10d findings
 

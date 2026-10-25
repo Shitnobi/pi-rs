@@ -92,6 +92,8 @@ pub trait McpHost: Send + Sync {
     fn select(&self, title: &str, items: &[String]) -> Option<String>;
     /// `pi.registerTool(definition)`.
     fn register_tool(&self, definition: &McpToolRegistration);
+    /// `ctx.hasUI`.
+    fn has_ui(&self) -> bool;
 }
 
 /// The `loadConfig` seam (`McpExtensionOptions.loadConfig`).
@@ -1072,7 +1074,7 @@ impl McpExtension {
         }
         self.flush_pending(host);
         match action.as_str() {
-            "login" | "logout" => {
+            "login" => {
                 let picked = self.pick_server(
                     name.as_deref(),
                     host,
@@ -1080,8 +1082,21 @@ impl McpExtension {
                     &|_| false,
                     "No enabled MCP server uses OAuth. Only HTTP servers without an Authorization header do.",
                 );
-                // The sign-in/sign-out flow needs the connection slice.
-                let _ = picked;
+                if let Some(name) = picked {
+                    self.login_command(&name, host);
+                }
+            }
+            "logout" => {
+                let picked = self.pick_server(
+                    name.as_deref(),
+                    host,
+                    &|server| uses_oauth(server),
+                    &|_| false,
+                    "No enabled MCP server uses OAuth. Only HTTP servers without an Authorization header do.",
+                );
+                if let Some(name) = picked {
+                    self.sign_out(&name, host);
+                }
             }
             "reconnect" => {
                 let picked = self.pick_server(
@@ -1096,10 +1111,67 @@ impl McpExtension {
                     },
                     "No enabled MCP server to reconnect.",
                 );
-                let _ = picked;
+                let Some(name) = picked else {
+                    return;
+                };
+                match self.reconnect(host, &name) {
+                    Some(failure) => host.notify(&failure, "error"),
+                    None => {
+                        self.ensure_discovery_active(host);
+                        let Some(server) = self.find_server(&name) else {
+                            return;
+                        };
+                        let state = describe_state(&server.snapshot(), true);
+                        host.notify(
+                            &format!("Reconnected to MCP server \"{name}\" ({state})."),
+                            "info",
+                        );
+                    }
+                }
             }
             _ => host.notify(MCP_USAGE, "warning"),
         }
+    }
+
+    /// `reconnect(server)` (L665): reconnect a live connection. Returns the
+    /// JS-visible error message on failure.
+    fn reconnect(&mut self, host: &dyn McpHost, name: &str) -> Option<String> {
+        let handle = self
+            .find_server(name)
+            .and_then(|server| server.handle.clone());
+        let Some(handle) = handle else {
+            return Some(format!("MCP server \"{name}\" is disabled."));
+        };
+        let result = handle.lock().unwrap().reconnect();
+        self.drain_connection_events(host);
+        result.err().map(|error| error.message())
+    }
+
+    /// `loginCommand` (L1087), non-TUI paths: without a UI the sign-in
+    /// cannot start. Interactive/OAuth flows are deferred with the manager.
+    fn login_command(&mut self, name: &str, host: &dyn McpHost) {
+        if !host.has_ui() {
+            host.notify(
+                &format!("Signing in to MCP server \"{name}\" requires interactive mode."),
+                "error",
+            );
+        }
+        // With a UI, `ctx.mode === "tui"` opens the manager and the other
+        // branch runs the OAuth flow (`signIn`), both deferred to the
+        // OAuth/TUI slices.
+    }
+
+    /// `signOut(server)` (L655) with no credential store: the flow only
+    /// applies to OAuth servers, and nothing was stored.
+    fn sign_out(&mut self, name: &str, host: &dyn McpHost) {
+        let is_oauth = self.find_server(name).is_some_and(uses_oauth);
+        if !is_oauth {
+            return;
+        }
+        host.notify(
+            &format!("No stored credentials for MCP server \"{name}\"."),
+            "info",
+        );
     }
 
     /// `pickServer` (L1070): resolve a subcommand's server, asking when the
