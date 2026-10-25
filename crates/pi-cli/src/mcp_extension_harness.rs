@@ -41,7 +41,9 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use pi_core::mcp_servers::{validate_mcp_server_config, RegisteredMcpServer};
-use pi_extensions::mcp::extension::{McpExtension, McpExtensionOptions, McpHost};
+use pi_extensions::mcp::extension::{
+    McpExtension, McpExtensionOptions, McpHost, McpToolRegistration,
+};
 use pi_extensions::mcp::transport::{FakeTransport, McpTransport};
 use pi_session::mcp_config::{LoadedMcpConfig, McpConfigScope, McpServerEntry};
 
@@ -89,6 +91,12 @@ impl McpHost for HarnessHost {
             .unwrap()
             .log
             .push(format!("notify:{level}:{message}"));
+    }
+    fn register_tool(&self, definition: &McpToolRegistration) {
+        self.0.lock().unwrap().log.push(format!(
+            "registerTool:{}",
+            serde_json::to_string(&definition.to_json()).unwrap()
+        ));
     }
     fn select(&self, title: &str, items: &[String]) -> Option<String> {
         let mut state = self.0.lock().unwrap();

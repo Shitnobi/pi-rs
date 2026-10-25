@@ -5949,6 +5949,100 @@ export const cases = [
 					{ op: "shutdown" },
 				],
 			}),
+			mce("connect-registers-tools", {
+				host: host({ activeTools: ["read"] }),
+				loadConfig: {
+					servers: [
+						configured(
+							"s",
+							cmd({ toolExposure: { plain: "direct", hiddenTool: "hidden" } }),
+						),
+					],
+				},
+				transports: [
+					{
+						sendSteps: connectSends(initResult({ tools: {} }), [
+							{
+								name: "greet",
+								description: "  Say hi  ",
+								inputSchema: {
+									type: "object",
+									properties: { who: { type: "string" } },
+									required: ["who"],
+								},
+								annotations: { readOnlyHint: true, openWorldHint: false },
+							},
+							{ name: "plain", title: "Plain title" },
+							{ name: "hiddenTool", description: "Hidden" },
+							{ name: "bare" },
+						]),
+					},
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "command", args: "" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("connect-name-collisions", {
+				host: host(),
+				loadConfig: { servers: [configured("s", cmd())] },
+				transports: [
+					{
+						sendSteps: connectSends(initResult({ tools: {} }), [
+							{ name: "a-b" },
+							{ name: "a_b" },
+							{ name: "a b" },
+							{ name: "a-b", description: "again" },
+						]),
+					},
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("connect-resources-exposure", {
+				host: host(),
+				loadConfig: {
+					servers: [configured("s", cmd({ exposure: "deferred" }))],
+				},
+				transports: [
+					{
+						sendSteps: connectSends(initResult({ tools: {}, resources: {} }), [
+							tool("t", { type: "object" }),
+						]),
+					},
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "shutdown" },
+				],
+			}),
+			mce("servers-change-remove-hides-tools", {
+				host: host({
+					registeredServers: [{ name: "r", config: cmd(), extensionPath: "/ext/r.js" }],
+				}),
+				loadConfig: { servers: [] },
+				transports: [
+					{
+						sendSteps: connectSends(initResult({ tools: {} }), [
+							tool("one", { type: "object" }),
+							tool("two", { type: "object" }),
+						]),
+					},
+				],
+				ops: [
+					{ op: "sessionStart" },
+					{ op: "settle" },
+					{ op: "setRegistered", servers: [] },
+					{ op: "serversChange" },
+					{ op: "shutdown" },
+				],
+			}),
 			mce("shutdown-clears-status", {
 				host: host(),
 				loadConfig: { servers: [disabled("off")] },

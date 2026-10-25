@@ -13,8 +13,9 @@
 //!   unregistered or re-registered with a new config are dropped (and their
 //!   tools hidden — tool registration lands with the connection slice).
 //! - `before_agent_start`: render/remove the `mcp_servers` prompt section.
-//! - `turn_start` / `tool_call` / `session_shutdown`: the parts that do not
-//!   need a live connection yet.
+//! - `tool_call`: flush queued startups; route by `reachesTools`, resource
+//!   tool names, or tool owner (the synchronous waits are already settled).
+//! - `turn_start` / `session_shutdown`.
 //! - `/mcp` command: non-TUI status and argument completions.
 //!
 //! Connections live in the state machine as `Arc<Mutex<McpServerConnection>>`
@@ -23,14 +24,27 @@
 //! the next deterministic boundary (`settle`, a command, a prompt, shutdown):
 //! a callback cannot borrow the extension that owns the connection.
 //!
+//! Tool registration (`registerTools`/`hideTools`/resource exposure sync) is
+//! modeled as a [`McpToolRegistration`] handed to [`McpHost::register_tool`];
+//! the runner adapter (10f) turns it into the real tool (execute/renderers).
+//!
 //! Deferred to the next slices (see `docs/plans/phase4-tranche7-mcp-extension.md`):
-//! tool registration (10d-2), `/mcp` actions (10e), the TUI manager/sign-in,
-//! and the runner adapter (10f).
+//! `/mcp` actions (10e), the TUI manager/sign-in, and the runner adapter (10f).
 
 use std::sync::{Arc, Mutex};
 
+use std::collections::HashMap;
+
 use pi_core::js_string::js_trim;
-use pi_core::mcp_servers::{mcp_namespace, McpExposure, RegisteredMcpServer};
+use pi_core::mcp_resources::{create_mcp_resource_tool_definitions, McpResourceToolOptions};
+use pi_core::mcp_servers::{
+    get_mcp_tool_exposure, mcp_namespace, McpExposure, RegisteredMcpServer,
+    LIST_MCP_RESOURCE_TEMPLATES_TOOL, LIST_MCP_RESOURCES_TOOL, READ_MCP_RESOURCE_TOOL,
+};
+use pi_core::mcp_tools::{
+    create_mcp_result_schema, create_mcp_tool_name, to_parameters, to_tool_annotations,
+    to_tool_exposure, McpTool, ToolAnnotations, ToolExposure,
+};
 use pi_session::mcp_config::{LoadedMcpConfig, McpConfigScope, McpServerEntry};
 use serde_json::Value;
 
@@ -76,10 +90,73 @@ pub trait McpHost: Send + Sync {
     /// `ctx.ui.select(title, items)` — the interactive picker used when a
     /// `/mcp` subcommand's server is ambiguous.
     fn select(&self, title: &str, items: &[String]) -> Option<String>;
+    /// `pi.registerTool(definition)`.
+    fn register_tool(&self, definition: &McpToolRegistration);
 }
 
 /// The `loadConfig` seam (`McpExtensionOptions.loadConfig`).
 pub type LoadConfigFn = Arc<dyn Fn(&dyn McpHost) -> LoadedMcpConfig + Send + Sync>;
+
+/// One registered MCP tool (`createMcpToolDefinition`, tools.ts L312), as
+/// far as the extension builds it: the pure definition fields plus the
+/// execution context the runner adapter needs (`server`, `tool`, timeout).
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpToolRegistration {
+    pub name: String,
+    pub label: String,
+    pub description: String,
+    pub parameters: Value,
+    pub output_schema: Value,
+    pub exposure: ToolExposure,
+    /// `ToolNamespace` — absent for the resource tools.
+    pub namespace: Option<Value>,
+    pub annotations: Option<ToolAnnotations>,
+    /// The server the tool came from (`connection.entry.name`).
+    pub server: String,
+    /// The server's tool name.
+    pub tool: String,
+    pub timeout_ms: u64,
+    /// One of the resource tools (`list_mcp_resources`, …) instead of a
+    /// server tool.
+    pub is_resource: bool,
+}
+
+impl McpToolRegistration {
+    /// `{ ...definition, exposure: "hidden" }` for a withdrawn tool.
+    pub fn hidden(&self) -> McpToolRegistration {
+        let mut definition = self.clone();
+        definition.exposure = ToolExposure::Hidden;
+        definition
+    }
+
+    /// The definition as `pi.registerTool` sees it, in the TS object's key
+    /// order (renderers/execute are not JSON).
+    pub fn to_json(&self) -> Value {
+        let mut object = serde_json::Map::new();
+        object.insert("name".to_string(), Value::String(self.name.clone()));
+        object.insert("label".to_string(), Value::String(self.label.clone()));
+        object.insert(
+            "description".to_string(),
+            Value::String(self.description.clone()),
+        );
+        object.insert("parameters".to_string(), self.parameters.clone());
+        object.insert("outputSchema".to_string(), self.output_schema.clone());
+        object.insert(
+            "exposure".to_string(),
+            Value::String(self.exposure.as_str().to_string()),
+        );
+        if let Some(namespace) = &self.namespace {
+            object.insert("namespace".to_string(), namespace.clone());
+        }
+        if let Some(annotations) = &self.annotations {
+            object.insert(
+                "annotations".to_string(),
+                serde_json::to_value(annotations).unwrap_or(Value::Null),
+            );
+        }
+        Value::Object(object)
+    }
+}
 
 /// A connection callback, forwarded out of the connection (`onTools` /
 /// `onChange`). The state machine drains these at its next boundary.
@@ -172,6 +249,14 @@ pub struct McpExtension {
     /// background from `session_start`; the port connects them at the next
     /// boundary (`settle`, a command, a prompt, shutdown).
     pending_start: Vec<String>,
+    /// pi tool name → `<server>\0<tool>` it was assigned to.
+    tool_owners: HashMap<String, String>,
+    /// Tool names currently offered by each server.
+    server_tools: HashMap<String, Vec<String>>,
+    /// Last definition registered under each tool name.
+    definitions: HashMap<String, McpToolRegistration>,
+    /// Exposure the resource tools were last registered with.
+    resource_tools_exposure: Option<McpExposure>,
 }
 
 impl McpExtension {
@@ -190,6 +275,10 @@ impl McpExtension {
             aborted: true,
             connection_events: Arc::new(Mutex::new(Vec::new())),
             pending_start: Vec::new(),
+            tool_owners: HashMap::new(),
+            server_tools: HashMap::new(),
+            definitions: HashMap::new(),
+            resource_tools_exposure: None,
         }
     }
 
@@ -334,7 +423,7 @@ impl McpExtension {
                 }
             }
         }
-        self.drain_connection_events();
+        self.drain_connection_events(host);
         if !self.aborted {
             self.report_problems(host, None);
         }
@@ -406,15 +495,235 @@ impl McpExtension {
         });
     }
 
-    /// Drain the snapshot queue. `onTools` registration lands in 10d-2; for
-    /// now both events only update the display state.
-    fn drain_connection_events(&mut self) {
+    /// Drain the snapshot queue: update the display state and register the
+    /// tools of servers that just connected.
+    fn drain_connection_events(&mut self, host: &dyn McpHost) {
         let events: Vec<ConnectionEvent> = std::mem::take(&mut *self.connection_events.lock().unwrap());
         for event in events {
-            let snapshot = match event {
-                ConnectionEvent::Tools(snapshot) | ConnectionEvent::Changed(snapshot) => snapshot,
+            match event {
+                ConnectionEvent::Tools(snapshot) => {
+                    self.apply_snapshot(&snapshot);
+                    self.register_tools(host, &snapshot);
+                }
+                ConnectionEvent::Changed(snapshot) => self.apply_snapshot(&snapshot),
+            }
+        }
+    }
+
+    /// `registerTools(connection)` (L387).
+    fn register_tools(&mut self, host: &dyn McpHost, snapshot: &McpConnectionSnapshot) {
+        let server = snapshot.name.clone();
+        let Some(index) = self
+            .servers
+            .iter()
+            .position(|state| state.entry.name == server)
+        else {
+            return;
+        };
+        let entry = self.servers[index].entry.clone();
+        let description = entry
+            .config
+            .fields
+            .get("description")
+            .and_then(Value::as_str)
+            .map(js_trim)
+            .filter(|description| !description.is_empty())
+            .map(str::to_string);
+        let mut namespace = serde_json::Map::new();
+        namespace.insert(
+            "name".to_string(),
+            Value::String(mcp_namespace(&server).to_string()),
+        );
+        namespace.insert("aliases".to_string(), serde_json::json!([server]));
+        if let Some(description) = &description {
+            namespace.insert(
+                "description".to_string(),
+                Value::String(description.clone()),
+            );
+        }
+        if let Some(instructions) = snapshot
+            .instructions
+            .as_deref()
+            .filter(|instructions| !instructions.is_empty())
+        {
+            namespace.insert(
+                "instructions".to_string(),
+                Value::String(instructions.to_string()),
+            );
+        }
+        let namespace = Value::Object(namespace);
+        let previous: Vec<String> = self
+            .server_tools
+            .get(&server)
+            .cloned()
+            .unwrap_or_default();
+        let mut current: Vec<String> = Vec::new();
+        // Like Codex, all tools whose names sanitize to the same name get the
+        // hash suffix, so which one keeps the plain name does not depend on
+        // the order of the list.
+        let mut unique: Vec<&str> = Vec::new();
+        for tool in &snapshot.tools {
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                if !unique.contains(&name) {
+                    unique.push(name);
+                }
+            }
+        }
+        let plain: Vec<String> = unique
+            .iter()
+            .map(|tool| create_mcp_tool_name(&server, tool, |_| false))
+            .collect();
+        let owners = self.tool_owners.clone();
+        for tool_value in &snapshot.tools {
+            let Some(tool_name) = tool_value.get("name").and_then(Value::as_str) else {
+                continue;
             };
-            self.apply_snapshot(&snapshot);
+            let owner = format!("{server}\0{tool_name}");
+            let is_taken = |candidate: &str| {
+                let existing = owners.get(candidate);
+                (existing.is_some() && existing != Some(&owner))
+                    || current.iter().any(|name| name == candidate)
+                    || plain.iter().filter(|name| name.as_str() == candidate).count() > 1
+            };
+            let name = create_mcp_tool_name(&server, tool_name, is_taken);
+            self.tool_owners.insert(name.clone(), owner);
+            current.push(name.clone());
+            let tool = McpTool::from(
+                tool_value
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            let title = tool
+                .title()
+                .map(str::to_string)
+                .or_else(|| {
+                    tool.annotations()
+                        .and_then(|annotations| annotations.get("title"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                });
+            let description = tool
+                .description()
+                .map(js_trim)
+                .filter(|description| !description.is_empty())
+                .map(str::to_string)
+                .or(title)
+                .unwrap_or_else(|| format!("MCP tool {tool_name} from server {server}"));
+            let definition = McpToolRegistration {
+                name: name.clone(),
+                label: format!("{server}/{tool_name}"),
+                description,
+                parameters: to_parameters(tool.input_schema()),
+                output_schema: create_mcp_result_schema(tool.output_schema()),
+                exposure: to_tool_exposure(get_mcp_tool_exposure(&entry.config, tool_name)),
+                namespace: Some(namespace.clone()),
+                annotations: to_tool_annotations(&tool),
+                server: server.clone(),
+                tool: tool_name.to_string(),
+                timeout_ms: snapshot.timeout_ms,
+                is_resource: false,
+            };
+            self.definitions.insert(name.clone(), definition.clone());
+            host.register_tool(&definition);
+        }
+        self.server_tools.insert(server.clone(), current.clone());
+        // Tools cannot be unregistered, so tools the server dropped are
+        // re-registered as hidden.
+        for name in previous {
+            if !current.contains(&name) {
+                if let Some(definition) = self.definitions.get(&name) {
+                    let hidden = definition.hidden();
+                    host.register_tool(&hidden);
+                }
+            }
+        }
+        self.sync_resource_tools(host);
+    }
+
+    /// `hideTools(server)` (L448).
+    fn hide_tools(&mut self, host: &dyn McpHost, server: &str) {
+        for name in self.server_tools.get(server).cloned().unwrap_or_default() {
+            if let Some(definition) = self.definitions.get(&name) {
+                let hidden = definition.hidden();
+                host.register_tool(&hidden);
+            }
+        }
+        self.server_tools.insert(server.to_string(), Vec::new());
+        self.sync_resource_tools(host);
+    }
+
+    /// Enabled servers with resources whose exposure is not `hidden`.
+    fn servers_with_resources(&self) -> Vec<&McpServerState> {
+        self.servers
+            .iter()
+            .filter(|server| {
+                server
+                    .connection
+                    .as_ref()
+                    .is_some_and(|connection| connection.has_resources)
+                    && is_enabled(&server.entry)
+                    && exposure_of(&server.entry) != McpExposure::Hidden
+            })
+            .collect()
+    }
+
+    /// `syncResourceTools` (L458): register the resource tools with the
+    /// widest exposure of the servers they reach.
+    fn sync_resource_tools(&mut self, host: &dyn McpHost) {
+        let exposures: Vec<McpExposure> = self
+            .servers_with_resources()
+            .iter()
+            .map(|server| exposure_of(&server.entry))
+            .collect();
+        let next = [McpExposure::Direct, McpExposure::Codemode, McpExposure::Deferred]
+            .into_iter()
+            .find(|candidate| exposures.contains(candidate))
+            .unwrap_or(McpExposure::Hidden);
+        if self.resource_tools_exposure == Some(next)
+            || (self.resource_tools_exposure.is_none() && next == McpExposure::Hidden)
+        {
+            return;
+        }
+        let was_direct = self.resource_tools_exposure == Some(McpExposure::Direct);
+        self.resource_tools_exposure = Some(next);
+        fn no_servers<'a>() -> Vec<&'a dyn pi_core::mcp_resources::McpResourceServer> {
+            Vec::new()
+        }
+        let save_output = |_: pi_core::mcp_tools::OutputData, _: &str| {
+            Ok::<String, String>("/tmp/pi-mcp-out".to_string())
+        };
+        let options = McpResourceToolOptions {
+            exposure: next,
+            servers: &no_servers,
+            save_output: &save_output,
+        };
+        let definitions = create_mcp_resource_tool_definitions(&options);
+        let mut names: Vec<String> = Vec::new();
+        for definition in &definitions {
+            names.push(definition.name.to_string());
+            host.register_tool(&McpToolRegistration {
+                name: definition.name.to_string(),
+                label: definition.label.clone(),
+                description: definition.description.clone(),
+                parameters: definition.parameters.clone(),
+                output_schema: definition.output_schema.clone(),
+                exposure: definition.exposure,
+                namespace: None,
+                annotations: Some(definition.annotations),
+                server: "*".to_string(),
+                tool: definition.name.to_string(),
+                timeout_ms: 0,
+                is_resource: true,
+            });
+        }
+        if was_direct {
+            let active: Vec<String> = host
+                .active_tools()
+                .into_iter()
+                .filter(|name| !names.contains(name))
+                .collect();
+            host.set_active_tools(active);
         }
     }
 
@@ -463,11 +772,54 @@ impl McpExtension {
 
     /// `pi.on("tool_call")` (L1191): wait for the servers the tool may
     /// reach. The port connects inline, so flushing the queued startups is
-    /// the wait; the routing (owners/resource tools) lands with tool
-    /// registration.
+    /// the wait itself; the routing decides which servers the TS would wait
+    /// for (and so which tools are registered before the call runs).
     pub fn tool_call(&mut self, host: &dyn McpHost, event: &Value) {
         self.flush_pending(host);
-        let _ = event;
+        let tool_name = match event.get("toolName").and_then(Value::as_str) {
+            Some(name) => name,
+            None => return,
+        };
+        let tools = host.all_tools();
+        let Some(tool) = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+        else {
+            return;
+        };
+        // Readiness can be pending while the display state is still
+        // connected; here every handle exists only after `connect()`.
+        let ready: Vec<&McpServerState> = self
+            .servers
+            .iter()
+            .filter(|server| is_enabled(&server.entry) && server.handle.is_some())
+            .collect();
+        if ready.is_empty() {
+            return;
+        }
+        let waiting: Vec<&str> = if let Some(reach) = tool.get("reachesTools") {
+            ready
+                .iter()
+                .filter(|server| reaches_server(reach, &server.entry.name))
+                .map(|server| server.entry.name.as_str())
+                .collect()
+        } else if is_resource_tool(tool_name) {
+            ready.iter().map(|server| server.entry.name.as_str()).collect()
+        } else {
+            let owner = self
+                .tool_owners
+                .get(tool_name)
+                .and_then(|owner| owner.split('\0').next())
+                .unwrap_or_default();
+            ready
+                .iter()
+                .filter(|server| server.entry.name == owner)
+                .map(|server| server.entry.name.as_str())
+                .collect()
+        };
+        // Synchronous connections: a `ready` for each of these is already
+        // settled, so `waitForServers` returns immediately.
+        let _ = waiting;
     }
 
     /// `pi.on("turn_start")` (L1212): retry servers that got sign-ins
@@ -506,7 +858,9 @@ impl McpExtension {
             .cloned()
             .collect();
         self.servers.retain(|server| !removed.contains(&server.entry.name));
-        // 10d-2: `hideTools(removed name)`.
+        for name in &removed {
+            self.hide_tools(host, name);
+        }
         let added: Vec<McpServerState> = registered
             .into_iter()
             .filter(|server| self.find_server(&server.entry.name).is_none())
@@ -524,7 +878,7 @@ impl McpExtension {
                 handle.lock().unwrap().close();
             }
         }
-        self.drain_connection_events();
+        self.drain_connection_events(host);
         let connecting: Vec<usize> = self
             .servers
             .iter()
@@ -540,7 +894,7 @@ impl McpExtension {
         for index in connecting {
             self.start_connection(index);
         }
-        self.drain_connection_events();
+        self.drain_connection_events(host);
         if !self.aborted {
             self.report_problems(host, Some(&added_names));
         }
@@ -840,6 +1194,36 @@ fn js_split_whitespace_trim(text: &str) -> Vec<String> {
         parts.push(current);
     }
     parts
+}
+
+/// `RESOURCE_TOOL_NAMES.has(name)`.
+fn is_resource_tool(name: &str) -> bool {
+    [
+        LIST_MCP_RESOURCES_TOOL,
+        LIST_MCP_RESOURCE_TEMPLATES_TOOL,
+        READ_MCP_RESOURCE_TOOL,
+    ]
+    .contains(&name)
+}
+
+/// `reachesServer(reach, server)` (L224): `"all"`, or a word containing the
+/// server's namespace. The harness models a JavaScript `reachesTools`
+/// function as `"all"` or an array of words.
+fn reaches_server(reach: &Value, server: &str) -> bool {
+    match reach {
+        Value::String(reach) => reach == "all",
+        Value::Array(words) => {
+            let namespace = mcp_namespace(server);
+            words
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|word| word.contains(&namespace))
+        }
+        // A truthy non-array function result (`reachesTools` modeled as a
+        // boolean in fixtures) reaches every tool.
+        Value::Bool(true) => true,
+        _ => false,
+    }
 }
 
 fn uses_oauth(server: &McpServerState) -> bool {

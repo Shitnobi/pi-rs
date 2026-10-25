@@ -18,11 +18,11 @@ its lifecycle, its tool registration, and `/mcp`.
 | Option/type surface (`McpExtensionOptions`, `McpServer`) | 69–122 | config types, connection | types ported in 10c (`McpExtensionOptions`, `McpServerState`) |
 | `renderServersSection` + exposure predicates + section budgets | 124–255 | pure | **done** (10a, `mcp/section.rs`, `mcs/` 15 cases) |
 | `describeState` / `attentionRank` / `describeTransport` / `formatStatus` / completions | 257–310, 1050–1100, 1264–1310 | pure | **done** (10b, `mcp/status.rs`, unit-tested; status/completions also parity-tested through the extension) |
-| Extension factory state + session lifecycle (`session_start`, `registeredServers`, `ensureDiscoveryActive`, `reportProblems`, `startConnection`, `waitForServers`) | 279–700, 1114–1175 | runner API, runtime, config | **10c done** (state machine + `McpHost` seam, connections deferred) |
+| Extension factory state + session lifecycle (`session_start`, `registeredServers`, `ensureDiscoveryActive`, `reportProblems`, `startConnection`, `waitForServers`) | 279–700, 1114–1175 | runner API, runtime, config | **10c + 10d** (state machine, `McpHost` seam, inline connections + `settle`) |
 | `before_agent_start` section injection | 1178–1190 | section | **10c done** |
-| `tool_call` reach/owner/resource waiting | 1191–1211 | connections, tool owners | 10d |
-| `turn_start` sign-in retry, `mcp_servers_change`, `session_shutdown` close ordering | 1212–1259 | connections, credentials | bookkeeping done in 10c; connection halves 10d |
-| `registerTools` / `hideTools` / resource-tool exposure sync | 387–530 | `createMcpToolDefinition`, resource defs, registry | 10d |
+| `tool_call` reach/owner/resource waiting | 1191–1211 | connections, tool owners | **10d** |
+| `turn_start` sign-in retry, `mcp_servers_change`, `session_shutdown` close ordering | 1212–1259 | connections, credentials | **10d** (sign-in retry stays with 10e/OAuth) |
+| `registerTools` / `hideTools` / resource-tool exposure sync | 387–530 | `createMcpToolDefinition`, resource defs, registry | **10d** (`McpToolRegistration`; execution in 10f) |
 | `/mcp` command: status, picker, login/logout/reconnect, enable/exposure, manager | 1040–1350, `ui.ts` | OAuth, updateConfig, TUI | 10e (non-TUI empty/usage paths done in 10c) |
 | Tool renderers (`registerToolRenderer`) | 383 | TUI | deferred (renderers are TUI-only in this port) |
 
@@ -39,11 +39,12 @@ its lifecycle, its tool registration, and `/mcp`.
   `McpHost`, `session_start`, `mcp_servers_change`, `before_agent_start`,
   `session_shutdown`, `/mcp` non-TUI handling; harness tool
   `mcp-extension`; `mce/` 15 cases.
-- **10d — connections + tools** (prep landed, `f6ad4af`: connections are
-  `Send`; remaining wiring below): `McpServerConnection` instances per server,
-  `registerTools`/`hideTools`, `createMcpToolDefinition`, resource-tool
-  exposure sync, `tool_call` waiting, startup waits (`startupWaitMs`,
-  direct-server wait, `pending`), close ordering.
+- **10d — connections + tools** (landed: prep `f6ad4af`, wiring `ad068d9`,
+  tools below): `McpServerConnection` per server (`Arc<Mutex<…>>`, `Send`
+  snapshot callbacks), `settle`/flush boundaries for the TS background
+  startups, `registerTools`/`hideTools`/`createMcpToolDefinition` pure fields
+  (`McpToolRegistration`), resource-tool exposure sync, `tool_call` routing,
+  close ordering.
 - **10e — `/mcp` actions**: picker with connections, `login`/`logout`
   (OAuth seams), `reconnect`, enable/disable (+ project overrides),
   exposure changes, `updateConfig`; the TUI manager (`ui.ts`) stays out.
@@ -124,8 +125,41 @@ does nothing where the TS launches background work:
 - `/mcp` covers status/usage/picker messages; sign-in flows stay stubs
   until OAuth.
 
-The harness cases are written against those boundaries (no op that would
-await `pending` after an enabled server).
+The harness cases were written against those boundaries; 10d replaced them
+with a scripted transport factory plus a `settle` op, so enabled servers and
+connection state are now covered too.
+
+### 3.5 10d findings
+
+- **Background attempts → inline connect + `settle`.** The TS starts
+  connections from `session_start` after one event-loop turn and reports
+  problems in a `pending.then`. The port queues enabled servers
+  (`pending_start`) and connects at the next boundary: the harness's
+  `settle` op, a command (which does `await pending`), a prompt
+  (`waitForDirectServers`), or a tool call. `settle` is a no-op without a
+  queue, so existing cases gained no lines; the TS side of `settle` waits a
+  few timers. Ordering therefore matches: `sessionStart:ok` → connection
+  reports → `settle:ok`.
+- **Callbacks enqueue snapshots, never re-enter.** `onTools`/`onChange`
+  push `ConnectionEvent`s into a shared queue; the state machine drains them
+  after connecting/closing and applies display state plus tool registration.
+  The harness factory is one shared `TransportFactory` (the TS option is one
+  function), shifted per connection like `mcc/`.
+- **Definition surface.** `createMcpToolDefinition`'s pure fields
+  (name/label/description/parameters/outputSchema/exposure/namespace/
+  annotations) are a `McpToolRegistration`; `to_json` mirrors the TS object's
+  key order so the harness can log `registerTool:<json>` on both sides.
+  `execute`/renderers belong to the runner adapter (10f).
+- **Resource tools have no `namespace`.** `JSON.stringify` drops the
+  undefined field; the Rust registration uses `Option<Value>` (first parity
+  failure of the slice). Their execute closure needs the live server list and
+  the temp-file saver; registration only carries the definition.
+- **Harness limits.** A `tools/list_changed` refresh that happens during the
+  connect handshake is discarded by the connection (TS behavior, covered by
+  `mcc/`); the mce harness has no post-connect `emit` op, so the
+  drop-tool→hidden path is exercised through server removal
+  (`servers-change-remove-hides-tools`) and unit-level behavior rather than a
+  refresh in this tool.
 
 ## 4. `mcp-extension` harness protocol
 

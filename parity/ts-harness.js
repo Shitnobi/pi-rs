@@ -1698,7 +1698,9 @@ async function runModule(tool, args, cwd) {
 				(handlers[type] ||= []).push(handler);
 				return () => {};
 			},
-			registerTool() {},
+			registerTool(definition) {
+				log.push("registerTool:" + JSON.stringify(definition));
+			},
 			registerToolRenderer() {},
 			registerCommand(_name, options) {
 				command = options;

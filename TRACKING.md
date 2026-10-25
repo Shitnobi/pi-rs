@@ -3,7 +3,7 @@
 ## ⚠️ Current checkpoint (2026-10-24) — resume here
 
 **State: phase 4 tranche 7 (built-in MCP extension) IN PROGRESS;
-10a–10c landed, parity-green (2943/2943).** Read
+10a–10d landed, parity-green (2953/2953).** Read
 `docs/plans/phase4-tranche7-mcp-extension.md` first — it is the
 design/decision record and the slice list. Landed:
 
@@ -20,30 +20,43 @@ design/decision record and the slice list. Landed:
   `/mcp` status/usage/picker paths, completions); new
   `mcp-extension` harness (TS drives the real factory with a fake
   pi/ctx); 15 `mce/` cases.
+- 10d prep `f6ad4af` — `McpServerConnection`/`McpClient` are `Send`
+  (`Rc<RefCell>`→`Arc<Mutex>`, `Send` transport/log traits;
+  `onTools`/`onChange` receive a `McpConnectionSnapshot`).
+- 10d wiring `ad068d9` — `start_connection` (inline `connect()`, one
+  shared scripted `TransportFactory`), `pending_start` + `settle`
+  boundary for the TS background attempts, snapshot queue →
+  display state, `mcp_servers_change` close/connect, shutdown close
+  ordering, `before_agent_start` instructions + flush,
+  `tool_call` routing, `/mcp` pending flushes.
+- 10d tools (this commit) — `McpToolRegistration`
+  (`createMcpToolDefinition` pure fields) via
+  `McpHost::register_tool`, `register_tools`/`hide_tools`
+  (owners, name collisions, configured exposures, hidden
+  re-registration), resource-tool exposure sync, `registerTool:`
+  logging in the harness; mce/ 25 cases (connect, failure report,
+  instructions section, tools/namespaces/annotations, collisions,
+  resources, servers-change add/remove/hide, shutdown).
 
 Workspace tests **2129 passed, 0 failed** (photon fixtures
 regenerated in-call); clippy clean on all new code.
 
-10d prep `f6ad4af` — `McpServerConnection`/`McpClient` are now
-`Send`: `Rc<RefCell>`/`Rc<Cell>` → `Arc<Mutex>`, transport/log/listener
-traits bounded by `Send`, and `onTools`/`onChange` receive a
-`McpConnectionSnapshot` (non-reentrant; the extension gets exactly the
-data it consumes). Behavior unchanged (mcc/ 52/52).
-
-**Next up:** 10d wiring — inject a connection factory, connect enabled
-servers in `session_start`/`mcp_servers_change` (TS background attempts
-map to synchronous connect in the port), `registerTools`/`hideTools`,
-`createMcpToolDefinition`, resource-exposure sync, `tool_call` waits;
-extend the `mcp-extension` harness with a scripted transport factory and
-a `settle` op (TS awaits a few macrotasks; Rust connects synchronously).
-Then 10e `/mcp` actions, 10f runner adapter, 10g docs. See the plan §3.3
-for the `!Send`/handler-bounds decision (now implemented).
+**Next up:** 10e `/mcp` actions with connections — `login`/`logout`
+(OAuth seams), `reconnect` (then `ensureDiscoveryActive` + the
+"Reconnected…" notify), enable/disable (project overrides,
+`hide_tools`, close ordering), exposure changes (`register_tools`
+re-run, `syncResourceTools`, active-tool filtering), `updateConfig`
+seam; TUI manager stays out. Then 10f runner adapter (`ExtensionApi`
+adapter: `on`, `register_command`, `register_tool` from
+`McpToolRegistration` incl. execute via `convertMcpResult` +
+`get_client`, `getMcpServers`, UI, default transports/config/log/
+credentials) and 10g docs. See plan §3.3/§3.5.
 
 **Toolchain note:** bash must export
 `RUSTUP_HOME=$HOME/AI/.rustup CARGO_HOME=$HOME/AI/.cargo PATH=$HOME/AI/.cargo/bin:$PATH`
 (cargo lives in ~/AI, not ~/.cargo, because of sandbox access guards).
 Parity: `node parity/run-parity.mjs` (PI_REPO default
-`/home/shinobi/AI/pi-repo`).
+`/home/shinobi/AI/pi-repo`). Full run: 2953/2953.
 
 **Sandbox note (bwrap):** every bash call gets a FRESH private
 /tmp. The pi-photon `ground_truth_byte_parity` test reads
