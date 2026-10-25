@@ -52,7 +52,7 @@ its lifecycle, its tool registration, and `/mcp`.
   the TUI manager, so they stay out with `ui.ts`; OAuth sign-in flows too.
 - **10f — runner adapter**: register the factory with `ExtensionApi`
   (`on`, `register_command`, `get_mcp_servers`, runtime actions, UI), so
-  `pi-cli` can load the built-in extension.
+  `pi-cli` can load the built-in extension. **Blocked** — see §7.
 - **10g — docs/tracking**: PARITY/TRACKING updates, deferred list refresh.
 
 ## 3. Decisions
@@ -206,6 +206,35 @@ option returns; `startupWaitMs` defaults to 10000.
 TS pins `process.env.PI_CODING_AGENT_DIR` to the case's `agentDir`, because
 `formatStatus` resolves the agent dir through `getAgentDir()` and the dist
 has no injection point for it.
+
+## 7. Why 10f waits
+
+The adapter itself is small (an `McpHost` over `ExtensionApi` + `CtxView`,
+the default `loadMcpConfig` with `RealMcpConfigFs`, handlers/commands via
+`load_extension_from_factory`). Three prerequisites are missing, and wiring
+the extension into `pi-cli` before them would make it visibly wrong:
+
+1. **Real transports.** `createDefaultTransport` (stdio process +
+   JSON-lines framing, HTTP/SSE, `expandHome`, env/header resolution) is
+   still a seam. With `create_transport: None` the port deliberately leaves
+   connections unstarted, so every configured server would render as
+   `starting` forever.
+2. **Extension tool execution.** `ExtensionApi::register_tool` stores the
+   definition JSON; the session tool pipeline wraps registered definitions
+   (`wrap_registered_tools`), but the `execute` behind a JSON definition is
+   a JavaScript-runtime concern that is not ported. MCP tools registered by
+   the extension would be declared but not callable. The definition fields
+   (`McpToolRegistration`) and the conversion to model results
+   (`convertMcpResult`) exist; the executor does not.
+3. **Command completions.** `RegisteredCommand` carries name/description/
+   handler only; `/mcp` argument completions (`getArgumentCompletions`) need
+   the command-execution tranche's seam. The pure helper
+   (`argument_completions`) is ready.
+
+Additionally the manager actions (enable/disable/exposure/`updateConfig`)
+and OAuth sign-in are TUI/runtime work, and `McpHost::select` is synchronous
+while the real UI select is async — the adapter should resolve toolkit
+selection through the command-context future seam, not the state machine.
 
 ## 5. Deferred (with seams)
 

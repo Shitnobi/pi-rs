@@ -46,13 +46,19 @@ design/decision record and the slice list. Landed:
 Workspace tests **2130 passed, 0 failed** (photon fixtures
 regenerated in-call); clippy clean on all new code.
 
-**Next up:** 10f runner adapter (`ExtensionApi` adapter: `on`,
-`register_command`, `register_tool` from `McpToolRegistration` incl.
-execute via `convertMcpResult` + the connection's `call_tool`,
-`getMcpServers`, UI, default transports/config/log/credentials), so
-`pi-cli` can load the built-in extension; then 10g docs. Manager-only
-actions (enable/disable/exposure/`updateConfig`) and OAuth/TUI stay
-deferred with `ui.ts`. See plan §3.3–§3.6.
+**Next up:** tranche 7 is complete through 10e. 10f (runner adapter) is
+**blocked** on real MCP transports (`createDefaultTransport`), extension
+tool execution behind JSON definitions, and the command-completions seam;
+the adapter shape and the missing pieces are written up in plan §7. Manager
+actions (enable/disable/exposure/`updateConfig`), OAuth and the TUI
+manager stay deferred with `ui.ts`.
+
+Suggested next tranche: **MCP default transports** (stdio JSON-lines +
+HTTP/SSE with env/header/home expansion) behind the existing
+`TransportFactory`, parity-tested with a stub MCP server process/HTTP
+fixture; then the 10f adapter (including tool execute via
+`convertMcpResult` + the connection's `call_tool`) and the pi-cli loading
+hook.
 
 **Toolchain note:** bash must export
 `RUSTUP_HOME=$HOME/AI/.rustup CARGO_HOME=$HOME/AI/.cargo PATH=$HOME/AI/.cargo/bin:$PATH`
